@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM python:3.10-bookworm
+FROM python:3.9-bullseye
 
 RUN apt-get -qq update && \
     apt-get -qq install -y --no-install-recommends \
@@ -21,16 +21,17 @@ RUN apt-get -qq update && \
       curl \
       vim \
       unzip \
-      openjdk-17-jdk \
+      openjdk-11-jdk \
       build-essential \
       software-properties-common \
       ssh && \
     apt-get -qq clean && \
     rm -rf /var/lib/apt/lists/*
 
-ENV SPARK_HOME=/opt/spark
-ENV HADOOP_HOME=/opt/hadoop
-ENV PYTHONPATH=$SPARK_HOME/python:$SPARK_HOME/python/lib/py4j-0.10.9.7-src.zip
+# Optional env variables
+ENV SPARK_HOME=${SPARK_HOME:-"/opt/spark"}
+ENV HADOOP_HOME=${HADOOP_HOME:-"/opt/hadoop"}
+ENV PYTHONPATH=$SPARK_HOME/python:$SPARK_HOME/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
 
 RUN mkdir -p ${HADOOP_HOME} && mkdir -p ${SPARK_HOME} && mkdir -p /home/iceberg/spark-events
 WORKDIR ${SPARK_HOME}
@@ -39,7 +40,7 @@ ENV SPARK_VERSION=3.4.2
 ENV ICEBERG_SPARK_RUNTIME_VERSION=3.4_2.12
 ENV ICEBERG_VERSION=1.4.3
 ENV AWS_SDK_VERSION=2.20.18
-ENV PYICEBERG_VERSION=0.11.0
+ENV PYICEBERG_VERSION=0.5.1
 
 RUN curl --retry 3 -s -C - https://daft-public-data.s3.us-west-2.amazonaws.com/distribution/spark-${SPARK_VERSION}-bin-hadoop3.tgz -o spark-${SPARK_VERSION}-bin-hadoop3.tgz \
  && tar xzf spark-${SPARK_VERSION}-bin-hadoop3.tgz --directory /opt/spark --strip-components 1 \
@@ -62,12 +63,9 @@ RUN chmod u+x /opt/spark/sbin/* && \
 RUN pip3 install -q ipython
 
 RUN pip3 install "pyiceberg[s3fs]==${PYICEBERG_VERSION}"
-RUN pip3 install "pydantic==2.11.0"
 
 COPY entrypoint.sh .
-
-# Mount provision.py into the container instead of baking it in
-# COPY provision.py .
+COPY provision.py .
 
 ENTRYPOINT ["./entrypoint.sh"]
 CMD ["notebook"]

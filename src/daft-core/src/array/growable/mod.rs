@@ -1,11 +1,17 @@
 use common_error::DaftResult;
 
 use crate::{
-    array::{FixedSizeListArray, ListArray, StructArray, UnionArray, prelude::*},
-    datatypes::{FileArray, prelude::*},
-    file::DaftMediaType,
-    series::Series,
-    with_match_daft_types,
+    array::{FixedSizeListArray, ListArray, StructArray},
+    datatypes::{
+        logical::{
+            DateArray, Decimal128Array, DurationArray, EmbeddingArray, FixedShapeImageArray,
+            FixedShapeTensorArray, ImageArray, MapArray, TensorArray, TimeArray, TimestampArray,
+        },
+        BinaryArray, BooleanArray, ExtensionArray, Float32Array, Float64Array, Int128Array,
+        Int16Array, Int32Array, Int64Array, Int8Array, NullArray, UInt16Array, UInt32Array,
+        UInt64Array, UInt8Array, Utf8Array,
+    },
+    with_match_daft_types, DataType, Series,
 };
 
 mod arrow_growable;
@@ -13,12 +19,12 @@ mod bitmap_growable;
 mod fixed_size_list_growable;
 mod list_growable;
 mod logical_growable;
-mod map_growable;
 mod struct_growable;
-mod union_growable;
 
 #[cfg(feature = "python")]
 mod python_growable;
+#[cfg(feature = "python")]
+use crate::datatypes::PythonArray;
 
 /// This function creates a [`Box<dyn Growable>`] when provided with a [`DataType`] and a [`Vec<&Series>`].
 ///
@@ -33,11 +39,11 @@ mod python_growable;
 /// * `dtype` - [`DataType`] of the built [`Series`]. **NOTE: This must match the dtype of each Series**
 /// * `series` - A vector of `&Series` references to the [`Series`] that this [`Growable`] copies data from
 /// * `use_validity` - Whether or not the [`Growable`] will need to grow a validity mask. Setting this to `false` will
-///   lead to performance gains, but give bad answers if you try to call [`Growable::add_nulls`].
+///     lead to performance gains, but give bad answers if you try to call [`Growable::add_nulls`].
 /// * `capacity` - Helps pre-allocate memory to the [`Growable`] by providing a capacity up-front. Note that variable-length types
-///   such as [`ListArray`] only understands this as the "top-level" capacity, but the capacity of nested children arrays cannot be specified
-///   through this [`make_growable`] API. Instead, you may wish to instantiate and use the [`nested_growable::ListGrowable`] directly if
-///   this is important to your use-case.
+///     such as [`ListArray`] only understands this as the "top-level" capacity, but the capacity of nested children arrays cannot be specified
+///     through this [`make_growable`] API. Instead, you may wish to instantiate and use the [`nested_growable::ListGrowable`] directly if
+///     this is important to your use0-case.
 pub fn make_growable<'a>(
     name: &str,
     dtype: &DataType,
@@ -59,7 +65,6 @@ pub fn make_growable<'a>(
 /// Describes a struct that can be extended from slices of other pre-existing Series.
 /// This is very useful for abstracting many "physical" operations such as takes, broadcasts,
 /// filters and more.
-#[allow(clippy::len_without_is_empty)]
 pub trait Growable {
     /// Extends this [`Growable`] with elements from the bounded [`Array`] at index `index` from
     /// a slice starting at `start` and length `len`.
@@ -70,15 +75,8 @@ pub trait Growable {
     /// Extends this [`Growable`] with null elements
     fn add_nulls(&mut self, additional: usize);
 
-    /// Extends this [`Growable`] with null elements (same as add_nulls with arrow naming convention).
-    fn extend_nulls(&mut self, len: usize) {
-        self.add_nulls(len);
-    }
-
     /// Builds an array from the [`Growable`]
     fn build(&mut self) -> DaftResult<Series>;
-
-    fn len(&self) -> usize;
 }
 
 /// Trait that an Array type can implement to provide a Growable factory method
@@ -97,7 +95,7 @@ pub trait GrowableArray {
 }
 
 impl GrowableArray for NullArray {
-    type GrowableType<'a> = arrow_growable::ArrowNullGrowable;
+    type GrowableType<'a> = arrow_growable::ArrowNullGrowable<'a>;
 
     fn make_growable<'a>(
         name: &str,
@@ -106,7 +104,22 @@ impl GrowableArray for NullArray {
         _use_validity: bool,
         _capacity: usize,
     ) -> Self::GrowableType<'a> {
-        arrow_growable::ArrowNullGrowable::new(name, dtype)
+        Self::GrowableType::new(name, dtype)
+    }
+}
+
+#[cfg(feature = "python")]
+impl GrowableArray for PythonArray {
+    type GrowableType<'a> = python_growable::PythonGrowable<'a>;
+
+    fn make_growable<'a>(
+        name: &str,
+        dtype: &DataType,
+        arrays: Vec<&'a Self>,
+        _use_validity: bool,
+        capacity: usize,
+    ) -> Self::GrowableType<'a> {
+        python_growable::PythonGrowable::new(name, dtype, arrays, capacity)
     }
 }
 
@@ -153,32 +166,21 @@ impl GrowableArray for ListArray {
     }
 }
 
-impl_growable_array!(BooleanArray, arrow_growable::ArrowGrowable<'a, BooleanType>);
-impl_growable_array!(Int8Array, arrow_growable::ArrowGrowable<'a, Int8Type>);
-impl_growable_array!(Int16Array, arrow_growable::ArrowGrowable<'a, Int16Type>);
-impl_growable_array!(Int32Array, arrow_growable::ArrowGrowable<'a, Int32Type>);
-impl_growable_array!(Int64Array, arrow_growable::ArrowGrowable<'a, Int64Type>);
-impl_growable_array!(
-    Decimal128Array,
-    arrow_growable::ArrowGrowable<'a, Decimal128Type>
-);
-impl_growable_array!(UInt8Array, arrow_growable::ArrowGrowable<'a, UInt8Type>);
-impl_growable_array!(UInt16Array, arrow_growable::ArrowGrowable<'a, UInt16Type>);
-impl_growable_array!(UInt32Array, arrow_growable::ArrowGrowable<'a, UInt32Type>);
-impl_growable_array!(UInt64Array, arrow_growable::ArrowGrowable<'a, UInt64Type>);
-impl_growable_array!(Float16Array, arrow_growable::ArrowGrowable<'a, Float16Type>);
-impl_growable_array!(Float32Array, arrow_growable::ArrowGrowable<'a, Float32Type>);
-impl_growable_array!(Float64Array, arrow_growable::ArrowGrowable<'a, Float64Type>);
-impl_growable_array!(BinaryArray, arrow_growable::ArrowGrowable<'a, BinaryType>);
-impl_growable_array!(
-    FixedSizeBinaryArray,
-    arrow_growable::ArrowGrowable<'a, FixedSizeBinaryType>
-);
-impl_growable_array!(Utf8Array, arrow_growable::ArrowGrowable<'a, Utf8Type>);
-impl_growable_array!(
-    ExtensionArray,
-    arrow_growable::ArrowGrowable<'a, ExtensionType>
-);
+impl_growable_array!(BooleanArray, arrow_growable::ArrowBooleanGrowable<'a>);
+impl_growable_array!(Int8Array, arrow_growable::ArrowInt8Growable<'a>);
+impl_growable_array!(Int16Array, arrow_growable::ArrowInt16Growable<'a>);
+impl_growable_array!(Int32Array, arrow_growable::ArrowInt32Growable<'a>);
+impl_growable_array!(Int64Array, arrow_growable::ArrowInt64Growable<'a>);
+impl_growable_array!(Int128Array, arrow_growable::ArrowInt128Growable<'a>);
+impl_growable_array!(UInt8Array, arrow_growable::ArrowUInt8Growable<'a>);
+impl_growable_array!(UInt16Array, arrow_growable::ArrowUInt16Growable<'a>);
+impl_growable_array!(UInt32Array, arrow_growable::ArrowUInt32Growable<'a>);
+impl_growable_array!(UInt64Array, arrow_growable::ArrowUInt64Growable<'a>);
+impl_growable_array!(Float32Array, arrow_growable::ArrowFloat32Growable<'a>);
+impl_growable_array!(Float64Array, arrow_growable::ArrowFloat64Growable<'a>);
+impl_growable_array!(BinaryArray, arrow_growable::ArrowBinaryGrowable<'a>);
+impl_growable_array!(Utf8Array, arrow_growable::ArrowUtf8Growable<'a>);
+impl_growable_array!(ExtensionArray, arrow_growable::ArrowExtensionGrowable<'a>);
 impl_growable_array!(
     FixedSizeListArray,
     fixed_size_list_growable::FixedSizeListGrowable<'a>
@@ -189,15 +191,8 @@ impl_growable_array!(
     logical_growable::LogicalTimestampGrowable<'a>
 );
 impl_growable_array!(DurationArray, logical_growable::LogicalDurationGrowable<'a>);
-
-impl_growable_array!(
-    IntervalArray,
-    arrow_growable::ArrowGrowable<'a, IntervalType>
-);
-
 impl_growable_array!(DateArray, logical_growable::LogicalDateGrowable<'a>);
 impl_growable_array!(TimeArray, logical_growable::LogicalTimeGrowable<'a>);
-impl_growable_array!(UuidArray, logical_growable::LogicalUuidGrowable<'a>);
 impl_growable_array!(
     EmbeddingArray,
     logical_growable::LogicalEmbeddingGrowable<'a>
@@ -210,34 +205,10 @@ impl_growable_array!(
     FixedShapeTensorArray,
     logical_growable::LogicalFixedShapeTensorGrowable<'a>
 );
-impl_growable_array!(
-    SparseTensorArray,
-    logical_growable::LogicalSparseTensorGrowable<'a>
-);
-impl_growable_array!(
-    FixedShapeSparseTensorArray,
-    logical_growable::LogicalFixedShapeSparseTensorGrowable<'a>
-);
 impl_growable_array!(ImageArray, logical_growable::LogicalImageGrowable<'a>);
 impl_growable_array!(TensorArray, logical_growable::LogicalTensorGrowable<'a>);
-impl_growable_array!(MapArray, map_growable::MapGrowable<'a>);
-impl<T> GrowableArray for FileArray<T>
-where
-    T: DaftMediaType,
-{
-    type GrowableType<'a> = logical_growable::LogicalFileGrowable<'a, T>;
-    fn make_growable<'a>(
-        name: &str,
-        dtype: &DataType,
-        arrays: Vec<&'a Self>,
-        use_validity: bool,
-        capacity: usize,
-    ) -> Self::GrowableType<'a> {
-        Self::GrowableType::new(name, dtype, arrays, use_validity, capacity)
-    }
-}
-
-#[cfg(feature = "python")]
-impl_growable_array!(PythonArray, python_growable::PythonGrowable<'a>);
-
-impl_growable_array!(UnionArray, union_growable::UnionGrowable<'a>);
+impl_growable_array!(
+    Decimal128Array,
+    logical_growable::LogicalDecimal128Growable<'a>
+);
+impl_growable_array!(MapArray, logical_growable::LogicalMapGrowable<'a>);

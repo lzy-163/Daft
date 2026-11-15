@@ -1,33 +1,15 @@
-use arrow::buffer::OffsetBuffer;
+use crate::array::ListArray;
+use crate::count_mode::CountMode;
+use crate::series::IntoSeries;
+use crate::{array::ops::GroupIndices, series::Series, with_match_physical_daft_types};
+use arrow2::array::PrimitiveArray;
 use common_error::{DaftError, DaftResult};
-use itertools::Itertools;
 
-use crate::{
-    array::{
-        ListArray,
-        growable::make_growable,
-        ops::{
-            DaftApproxSketchAggable, DaftBoolAggable, DaftConcatAggable, DaftCountAggable,
-            DaftHllMergeAggable, DaftMeanAggable, DaftMergeSketchAggable, DaftPercentileAggable,
-            DaftProductAggable, DaftSetAggable, DaftSkewAggable, DaftStddevAggable, DaftSumAggable,
-            DaftVarianceAggable, GroupIndices,
-        },
-    },
-    count_mode::CountMode,
-    datatypes::*,
-    series::{Series, array_impl::IntoSeries},
-    utils::stats,
-    with_match_physical_daft_types,
-};
-
-fn deduplicate_indices(series: &Series) -> DaftResult<Vec<u64>> {
-    let probe_table = series.build_probe_table_without_nulls()?;
-    let unique_indices: Vec<u64> = probe_table.keys().map(|k| k.idx).collect();
-    Ok(unique_indices)
-}
+use crate::datatypes::*;
 
 impl Series {
-    pub fn count(&self, groups: Option<&GroupIndices>, mode: CountMode) -> DaftResult<Self> {
+    pub fn count(&self, groups: Option<&GroupIndices>, mode: CountMode) -> DaftResult<Series> {
+        use crate::array::ops::DaftCountAggable;
         let s = self.as_physical()?;
         with_match_physical_daft_types!(s.data_type(), |$T| {
             match groups {
@@ -37,11 +19,14 @@ impl Series {
         })
     }
 
-    pub fn sum(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
+    pub fn sum(&self, groups: Option<&GroupIndices>) -> DaftResult<Series> {
+        use crate::array::ops::DaftSumAggable;
+        use crate::datatypes::DataType::*;
+
         match self.data_type() {
             // intX -> int64 (in line with numpy)
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                let casted = self.cast(&DataType::Int64)?;
+            Int8 | Int16 | Int32 | Int64 => {
+                let casted = self.cast(&Int64)?;
                 match groups {
                     Some(groups) => {
                         Ok(DaftSumAggable::grouped_sum(&casted.i64()?, groups)?.into_series())
@@ -50,8 +35,8 @@ impl Series {
                 }
             }
             // uintX -> uint64 (in line with numpy)
-            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                let casted = self.cast(&DataType::UInt64)?;
+            UInt8 | UInt16 | UInt32 | UInt64 => {
+                let casted = self.cast(&UInt64)?;
                 match groups {
                     Some(groups) => {
                         Ok(DaftSumAggable::grouped_sum(&casted.u64()?, groups)?.into_series())
@@ -60,18 +45,7 @@ impl Series {
                 }
             }
             // floatX -> floatX (in line with numpy)
-            DataType::Float16 => {
-                let casted = self.cast(&DataType::Float32)?;
-                let result = match groups {
-                    Some(groups) => {
-                        DaftSumAggable::grouped_sum(&casted.downcast::<Float32Array>()?, groups)?
-                            .into_series()
-                    }
-                    None => DaftSumAggable::sum(&casted.downcast::<Float32Array>()?)?.into_series(),
-                };
-                result.cast(&DataType::Float16)
-            }
-            DataType::Float32 => match groups {
+            Float32 => match groups {
                 Some(groups) => Ok(DaftSumAggable::grouped_sum(
                     &self.downcast::<Float32Array>()?,
                     groups,
@@ -79,7 +53,7 @@ impl Series {
                 .into_series()),
                 None => Ok(DaftSumAggable::sum(&self.downcast::<Float32Array>()?)?.into_series()),
             },
-            DataType::Float64 => match groups {
+            Float64 => match groups {
                 Some(groups) => Ok(DaftSumAggable::grouped_sum(
                     &self.downcast::<Float64Array>()?,
                     groups,
@@ -87,21 +61,6 @@ impl Series {
                 .into_series()),
                 None => Ok(DaftSumAggable::sum(&self.downcast::<Float64Array>()?)?.into_series()),
             },
-            DataType::Decimal128(_, _) => {
-                let casted = self.cast(&try_sum_supertype(self.data_type())?)?;
-
-                match groups {
-                    Some(groups) => Ok(DaftSumAggable::grouped_sum(
-                        &casted.downcast::<Decimal128Array>()?,
-                        groups,
-                    )?
-                    .into_series()),
-                    None => {
-                        Ok(DaftSumAggable::sum(&casted.downcast::<Decimal128Array>()?)?
-                            .into_series())
-                    }
-                }
-            }
             other => Err(DaftError::TypeError(format!(
                 "Numeric sum is not implemented for type {}",
                 other
@@ -109,466 +68,102 @@ impl Series {
         }
     }
 
-    pub fn product(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
+    pub fn mean(&self, groups: Option<&GroupIndices>) -> DaftResult<Series> {
+        use crate::array::ops::DaftMeanAggable;
+        use crate::datatypes::DataType::*;
+
+        // Upcast all numeric types to float64 and use f64 mean kernel.
         match self.data_type() {
-            // intX -> int64 (in line with numpy)
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                let casted = self.cast(&DataType::Int64)?;
+            Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float32 | Float64 => {
+                let casted = self.cast(&Float64)?;
                 match groups {
                     Some(groups) => {
-                        Ok(DaftProductAggable::grouped_product(&casted.i64()?, groups)?
-                            .into_series())
+                        Ok(DaftMeanAggable::grouped_mean(&casted.f64()?, groups)?.into_series())
                     }
-                    None => Ok(DaftProductAggable::product(&casted.i64()?)?.into_series()),
-                }
-            }
-            // uintX -> uint64 (in line with numpy)
-            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                let casted = self.cast(&DataType::UInt64)?;
-                match groups {
-                    Some(groups) => {
-                        Ok(DaftProductAggable::grouped_product(&casted.u64()?, groups)?
-                            .into_series())
-                    }
-                    None => Ok(DaftProductAggable::product(&casted.u64()?)?.into_series()),
-                }
-            }
-            // floatX -> floatX (in line with numpy)
-            DataType::Float16 => {
-                let casted = self.cast(&DataType::Float32)?;
-                let result = match groups {
-                    Some(groups) => DaftProductAggable::grouped_product(
-                        &casted.downcast::<Float32Array>()?,
-                        groups,
-                    )?
-                    .into_series(),
-                    None => DaftProductAggable::product(&casted.downcast::<Float32Array>()?)?
-                        .into_series(),
-                };
-                result.cast(&DataType::Float16)
-            }
-            DataType::Float32 => match groups {
-                Some(groups) => Ok(DaftProductAggable::grouped_product(
-                    &self.downcast::<Float32Array>()?,
-                    groups,
-                )?
-                .into_series()),
-                None => Ok(
-                    DaftProductAggable::product(&self.downcast::<Float32Array>()?)?.into_series(),
-                ),
-            },
-            DataType::Float64 => match groups {
-                Some(groups) => Ok(DaftProductAggable::grouped_product(
-                    &self.downcast::<Float64Array>()?,
-                    groups,
-                )?
-                .into_series()),
-                None => Ok(
-                    DaftProductAggable::product(&self.downcast::<Float64Array>()?)?.into_series(),
-                ),
-            },
-            DataType::Decimal128(_, _) => {
-                let casted = self.cast(&try_product_supertype(self.data_type())?)?;
-
-                match groups {
-                    Some(groups) => Ok(DaftProductAggable::grouped_product(
-                        &casted.downcast::<Decimal128Array>()?,
-                        groups,
-                    )?
-                    .into_series()),
-                    None => Ok(DaftProductAggable::product(
-                        &casted.downcast::<Decimal128Array>()?,
-                    )?
-                    .into_series()),
+                    None => Ok(DaftMeanAggable::mean(&casted.f64()?)?.into_series()),
                 }
             }
             other => Err(DaftError::TypeError(format!(
-                "Numeric product is not implemented for type {}",
+                "Numeric mean is not implemented for type {}",
                 other
             ))),
         }
     }
 
-    pub fn approx_sketch(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
-        // Upcast all numeric types to float64 and compute approx_sketch.
-        match self.data_type() {
-            dt if dt.is_numeric() => {
-                let casted = self.cast(&DataType::Float64)?;
-                match groups {
-                    Some(groups) => Ok(DaftApproxSketchAggable::grouped_approx_sketch(
-                        &casted.f64()?,
-                        groups,
-                    )?
-                    .into_series()),
-                    None => {
-                        Ok(DaftApproxSketchAggable::approx_sketch(&casted.f64()?)?.into_series())
-                    }
-                }
-            }
-            other => Err(DaftError::TypeError(format!(
-                "Approx sketch is not implemented for type {}",
-                other
-            ))),
-        }
-    }
-
-    pub fn merge_sketch(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
-        match self.data_type() {
-            DataType::Struct(_) => match groups {
-                Some(groups) => Ok(DaftMergeSketchAggable::grouped_merge_sketch(
-                    &self.struct_()?,
-                    groups,
-                )?
-                .into_series()),
-                None => Ok(DaftMergeSketchAggable::merge_sketch(&self.struct_()?)?.into_series()),
-            },
-            other => Err(DaftError::TypeError(format!(
-                "Merge sketch is not implemented for type {}",
-                other
-            ))),
-        }
-    }
-
-    pub fn hll_merge(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
-        let downcasted_self = self.downcast::<FixedSizeBinaryArray>()?;
-        let series = match groups {
-            Some(groups) => downcasted_self.grouped_hll_merge(groups),
-            None => downcasted_self.hll_merge(),
-        }?
-        .into_series();
-        Ok(series)
-    }
-
-    pub fn mean(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
-        let target_type = try_mean_aggregation_supertype(self.data_type())?;
-        match target_type {
-            DataType::Float64 => {
-                let casted = self.cast(&DataType::Float64)?;
-                let casted = casted.f64()?;
-                let series = groups
-                    .map_or_else(|| casted.mean(), |groups| casted.grouped_mean(groups))?
-                    .into_series();
-                Ok(series)
-            }
-            DataType::Decimal128(..) => {
-                let casted = self.cast(&target_type)?;
-                let casted = casted.decimal128()?;
-                let series = groups
-                    .map_or_else(|| casted.mean(), |groups| casted.grouped_mean(groups))?
-                    .into_series();
-                Ok(series)
-            }
-
-            _ => Err(DaftError::not_implemented(format!(
-                "Mean not implemented for {target_type}, source type: {}",
-                self.data_type()
-            ))),
-        }
-    }
-
-    pub fn percentile(&self, groups: Option<&GroupIndices>, percentage: f64) -> DaftResult<Self> {
-        if !stats::is_valid_percentile_percentage(percentage) {
-            return Err(DaftError::ValueError(format!(
-                "Provided percentile must be between 0 and 1: {percentage}"
-            )));
-        }
-
-        match self.data_type() {
-            dt if dt.is_numeric() => {
-                let casted = self.cast(&DataType::Float64)?;
-                let casted = casted.f64()?;
-                let result = match groups {
-                    Some(groups) => casted.grouped_percentile(groups, percentage),
-                    None => casted.percentile(percentage),
-                }?;
-                Ok(result.into_series())
-            }
-            DataType::List(inner_dtype) | DataType::FixedSizeList(inner_dtype, _)
-                if inner_dtype.is_numeric() =>
-            {
-                let casted = self.cast(&DataType::List(Box::new(DataType::Float64)))?;
-                let downcasted = casted.downcast::<ListArray>()?;
-                let result = match groups {
-                    Some(groups) => downcasted.grouped_percentile(groups, percentage),
-                    None => downcasted.percentile(percentage),
-                }?;
-                Ok(result.into_series())
-            }
-            other => Err(DaftError::TypeError(format!(
-                "Percentile is not implemented for type {other}"
-            ))),
-        }
-    }
-
-    pub fn stddev(&self, groups: Option<&GroupIndices>, ddof: usize) -> DaftResult<Self> {
-        let target_type = try_stddev_aggregation_supertype(self.data_type())?;
-        match target_type {
-            DataType::Float64 => {
-                let casted = self.cast(&DataType::Float64)?;
-                let casted = casted.f64()?;
-                let series = groups
-                    .map_or_else(
-                        || casted.stddev(ddof),
-                        |groups| casted.grouped_stddev(groups, ddof),
-                    )?
-                    .into_series();
-                Ok(series)
-            }
-            _ => Err(DaftError::not_implemented(format!(
-                "StdDev not implemented for {target_type}, source type: {}",
-                self.data_type()
-            ))),
-        }
-    }
-
-    pub fn var(&self, groups: Option<&GroupIndices>, ddof: usize) -> DaftResult<Self> {
-        let target_type = try_variance_aggregation_supertype(self.data_type())?;
-        match target_type {
-            DataType::Float64 => {
-                let casted = self.cast(&DataType::Float64)?;
-                let casted = casted.f64()?;
-                let series = groups
-                    .map_or_else(
-                        || casted.var(ddof),
-                        |groups| casted.grouped_var(groups, ddof),
-                    )?
-                    .into_series();
-                Ok(series)
-            }
-            _ => Err(DaftError::not_implemented(format!(
-                "Variance not implemented for {target_type}, source type: {}",
-                self.data_type()
-            ))),
-        }
-    }
-
-    pub fn min(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
+    pub fn min(&self, groups: Option<&GroupIndices>) -> DaftResult<Series> {
         self.inner.min(groups)
     }
 
-    pub fn max(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
+    pub fn max(&self, groups: Option<&GroupIndices>) -> DaftResult<Series> {
         self.inner.max(groups)
     }
 
-    pub fn any_value(&self, groups: Option<&GroupIndices>, ignore_nulls: bool) -> DaftResult<Self> {
-        let indices: UInt64Array = match groups {
+    pub fn any_value(
+        &self,
+        groups: Option<&GroupIndices>,
+        ignore_nulls: bool,
+    ) -> DaftResult<Series> {
+        let indices = match groups {
             Some(groups) => {
                 if self.data_type().is_null() {
-                    std::iter::repeat_n(None, groups.len()).collect()
-                } else if ignore_nulls && let Some(nulls) = self.nulls() {
-                    groups
-                        .iter()
-                        .map(|g| g.iter().find(|i| nulls.is_valid(**i as usize)).copied())
-                        .collect()
+                    Box::new(PrimitiveArray::new_null(arrow2::datatypes::DataType::UInt64, groups.len()))
+                } else if ignore_nulls && let Some(validity) = self.validity() {
+                    Box::new(PrimitiveArray::from_trusted_len_iter(groups.iter().map(|g| {
+                        g.iter().find(|i| validity.get_bit(**i as usize)).copied()
+                    })))
                 } else {
-                    groups.iter().map(|g| g.first().copied()).collect()
+                    Box::new(PrimitiveArray::from_trusted_len_iter(groups.iter().map(|g| g.first().cloned())))
                 }
-            }
+            },
             None => {
-                let idx = if self.data_type().is_null() || self.is_empty() {
+                let idx = if self.data_type().is_null() || self.is_empty(){
                     None
-                } else if ignore_nulls && let Some(nulls) = self.nulls() {
-                    nulls.iter().position(|v| v).map(|i| i as u64)
+                } else if ignore_nulls && let Some(validity) = self.validity() {
+                    validity.iter().position(|v| v).map(|i| i as u64)
                 } else {
                     Some(0)
                 };
 
-                std::iter::once(idx).collect()
+                Box::new(PrimitiveArray::from([idx]))
             }
         };
 
-        self.take(&indices)
+        self.take(&Series::from_arrow(
+            Field::new("", DataType::UInt64).into(),
+            indices,
+        )?)
     }
 
-    pub fn agg_list(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
+    pub fn agg_list(&self, groups: Option<&GroupIndices>) -> DaftResult<Series> {
         self.inner.agg_list(groups)
     }
 
-    pub fn agg_set(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
-        self.inner.agg_set(groups)
-    }
-
-    pub fn agg_concat(
-        &self,
-        groups: Option<&GroupIndices>,
-        delimiter: Option<&str>,
-    ) -> DaftResult<Self> {
-        let delimiter = delimiter.filter(|d| !d.is_empty());
-        match (self.data_type(), delimiter) {
-            (DataType::List(..), Some(_)) => Err(DaftError::TypeError(
-                "concat aggregation delimiter is only supported for Utf8".to_string(),
-            )),
-
-            (DataType::List(..), None) => {
+    pub fn agg_concat(&self, groups: Option<&GroupIndices>) -> DaftResult<Series> {
+        use crate::array::ops::DaftConcatAggable;
+        match self.data_type() {
+            DataType::List(..) => {
                 let downcasted = self.downcast::<ListArray>()?;
-                let result = match groups {
-                    Some(groups) => DaftConcatAggable::grouped_concat(downcasted, groups)?,
-                    None => DaftConcatAggable::concat(downcasted)?,
-                };
-                Ok(result.into_series())
-            }
-            (DataType::Utf8, Some(delimiter)) => {
-                let downcasted = self.downcast::<Utf8Array>()?;
-                let result: Utf8Array = match groups {
-                    Some(groups) => groups
-                        .iter()
-                        .map(|group| {
-                            let values: Vec<_> = group
-                                .iter()
-                                .filter_map(|&idx| downcasted.get(idx as usize))
-                                .collect();
-                            (!values.is_empty()).then(|| values.join(delimiter))
-                        })
-                        .collect(),
-                    None => {
-                        let output = if downcasted.null_count() == downcasted.len() {
-                            None
-                        } else {
-                            Some(downcasted.into_iter().flatten().join(delimiter))
-                        };
-                        std::iter::once(output).collect()
+                match groups {
+                    Some(groups) => {
+                        Ok(DaftConcatAggable::grouped_concat(downcasted, groups)?.into_series())
                     }
-                };
-                Ok(result.rename(downcasted.name()).into_series())
-            }
-            (DataType::Utf8, None) => {
-                let downcasted = self.downcast::<Utf8Array>()?;
-                let result = match groups {
-                    Some(groups) => DaftConcatAggable::grouped_concat(downcasted, groups)?,
-                    None => DaftConcatAggable::concat(downcasted)?,
-                };
-                Ok(result.into_series())
-            }
-            (other, _) => Err(DaftError::TypeError(format!(
-                "concat aggregation is only valid for List or Utf8, got {other}"
-            ))),
-        }
-    }
-
-    pub fn bool_and(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
-        match self.data_type() {
-            DataType::Boolean => {
-                let downcasted = self.bool()?;
-                Ok(match groups {
-                    Some(groups) => downcasted.grouped_bool_and(groups)?,
-                    None => downcasted.bool_and()?,
+                    None => Ok(DaftConcatAggable::concat(downcasted)?.into_series()),
                 }
-                .into_series())
             }
-            DataType::Null => {
-                // Return a single null value for null type
-                Ok(Self::full_null(
-                    self.field().name.as_ref(),
-                    &DataType::Boolean,
-                    1,
-                ))
-            }
-            other => Err(DaftError::TypeError(format!(
-                "bool_and is not implemented for type {}",
-                other
-            ))),
-        }
-    }
-
-    pub fn bool_or(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
-        use crate::array::ops::DaftBoolAggable;
-        match self.data_type() {
-            DataType::Boolean => {
-                let downcasted = self.bool()?;
-                Ok(match groups {
-                    Some(groups) => downcasted.grouped_bool_or(groups)?,
-                    None => downcasted.bool_or()?,
+            #[cfg(feature = "python")]
+            DataType::Python => {
+                let downcasted = self.downcast::<PythonArray>()?;
+                match groups {
+                    Some(groups) => {
+                        Ok(DaftConcatAggable::grouped_concat(downcasted, groups)?.into_series())
+                    }
+                    None => Ok(DaftConcatAggable::concat(downcasted)?.into_series()),
                 }
-                .into_series())
             }
-            DataType::Null => {
-                // Return a single null value for null type
-                Ok(Self::full_null(
-                    self.field().name.as_ref(),
-                    &DataType::Boolean,
-                    1,
-                ))
-            }
-            other => Err(DaftError::TypeError(format!(
-                "bool_or is not implemented for type {}",
-                other
-            ))),
-        }
-    }
-
-    pub fn skew(&self, groups: Option<&GroupIndices>) -> DaftResult<Self> {
-        let target_type = try_skew_aggregation_supertype(self.data_type())?;
-        if !matches!(target_type, DataType::Float64) {
-            return Err(DaftError::not_implemented(format!(
-                "Skew is not implement for {target_type}, source type: {}",
+            _ => Err(DaftError::TypeError(format!(
+                "concat aggregation is only valid for List or Python types, got {}",
                 self.data_type()
-            )));
+            ))),
         }
-
-        let casted = self.cast(&DataType::Float64)?;
-        let casted = casted.f64()?;
-        Ok(groups
-            .map_or_else(|| casted.skew(), |groups| casted.grouped_skew(groups))?
-            .into_series())
-    }
-}
-
-impl DaftSetAggable for Series {
-    type Output = DaftResult<ListArray>;
-
-    fn set(&self) -> Self::Output {
-        let child_series = self.clone();
-        let unique_indices = deduplicate_indices(&child_series)?;
-        let indices_array = UInt64Array::from_vec("", unique_indices);
-        let deduped_series = child_series.take(&indices_array)?;
-
-        let offsets = OffsetBuffer::new(vec![0, deduped_series.len() as i64].into());
-
-        let list_field = self.field().to_list_field();
-        Ok(ListArray::new(list_field, deduped_series, offsets, None))
-    }
-
-    fn grouped_set(&self, groups: &GroupIndices) -> Self::Output {
-        let series = self.clone();
-
-        let mut offsets = Vec::with_capacity(groups.len() + 1);
-        offsets.push(0);
-
-        let mut growable = make_growable(
-            self.name(),
-            self.data_type(),
-            vec![self],
-            self.nulls().is_some(),
-            series.len(),
-        );
-
-        for group in groups {
-            if group.is_empty() {
-                offsets.push(*offsets.last().unwrap());
-                continue;
-            }
-
-            let group_indices = UInt64Array::from_vec("", group.to_vec());
-            let group_series = series.take(&group_indices)?;
-
-            let unique_indices = deduplicate_indices(&group_series)?;
-
-            for &local_idx in &unique_indices {
-                let orig_idx = group[local_idx as usize];
-                growable.extend(0, orig_idx as usize, 1);
-            }
-
-            offsets.push(offsets.last().unwrap() + unique_indices.len() as i64);
-        }
-
-        let list_field = self.field().to_list_field();
-        let result = ListArray::new(
-            list_field,
-            growable.build()?,
-            OffsetBuffer::new(offsets.into()),
-            None,
-        );
-
-        Ok(result)
     }
 }

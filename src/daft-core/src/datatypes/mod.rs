@@ -1,55 +1,39 @@
 mod agg_ops;
-mod infer_datatype;
+mod binary_ops;
+mod dtype;
+mod field;
+mod image_format;
+mod image_mode;
 mod matching;
+mod time_unit;
 
-use arrow::{array::ArrowNumericType, datatypes::ArrowNativeType};
-use bytemuck::Pod;
-pub use infer_datatype::InferDataType;
-pub mod prelude;
-use std::{
-    ops::{Add, Div, Mul, Rem, Sub},
-    panic::RefUnwindSafe,
+pub use crate::array::{DataArray, FixedSizeListArray};
+use crate::array::{ListArray, StructArray};
+pub use agg_ops::{try_mean_supertype, try_sum_supertype};
+use arrow2::{
+    compute::comparison::Simd8,
+    types::{simd::Simd, NativeType},
 };
-
-pub use agg_ops::{
-    try_mean_aggregation_supertype, try_percentile_aggregation_supertype, try_product_supertype,
-    try_skew_aggregation_supertype, try_stddev_aggregation_supertype, try_sum_supertype,
-    try_variance_aggregation_supertype,
-};
-// Import DataType enum
-pub use daft_schema::dtype::DataType;
-pub use daft_schema::{
-    field::{Field, FieldID, FieldRef},
-    image_format::ImageFormat,
-    image_mode::ImageMode,
-    time_unit::{TimeUnit, format_string_has_offset, infer_timeunit_from_format_string},
-};
-pub use infer_datatype::try_physical_supertype;
+pub use binary_ops::try_physical_supertype;
+pub use dtype::DataType;
+pub use field::Field;
+pub use field::FieldID;
+pub use field::FieldRef;
+pub use image_format::ImageFormat;
+pub use image_mode::ImageMode;
 use num_traits::{Bounded, Float, FromPrimitive, Num, NumCast, ToPrimitive, Zero};
 use serde::Serialize;
+use std::ops::{Add, Div, Mul, Rem, Sub};
+pub use time_unit::TimeUnit;
 
-pub use crate::array::{DataArray, FixedSizeListArray, file_array::FileArray};
-#[cfg(feature = "python")]
-use crate::prelude::PythonArray;
-use crate::{
-    array::{ListArray, StructArray, UnionArray},
-    file::{DaftMediaType, FileType},
-};
-
-pub mod interval;
 pub mod logical;
-pub use interval::*;
-#[cfg(feature = "python")]
-pub mod python;
 
 /// Trait that is implemented by all Array types
 ///
 /// NOTE: Arrays are 'static because they fully own all their internal components
 /// This implicitly allows them to implement the std::any::Any trait, which we rely on
 /// for downcasting Series to concrete DaftArrayType types.
-pub trait DaftArrayType: Clone + 'static {
-    fn data_type(&self) -> &DataType;
-}
+pub trait DaftArrayType: Clone + 'static {}
 
 /// Trait to wrap DataType Enum
 ///
@@ -66,20 +50,6 @@ pub trait DaftDataType: Sync + Send + Clone + 'static {
         Self: Sized;
 }
 
-impl<T> DaftDataType for T
-where
-    T: DaftMediaType,
-{
-    type ArrayType = FileArray<T>;
-
-    fn get_dtype() -> DataType
-    where
-        Self: Sized,
-    {
-        DataType::File(T::get_type())
-    }
-}
-
 pub trait DaftPhysicalType: Send + Sync + DaftDataType {}
 
 pub trait DaftArrowBackedType: Send + Sync + DaftPhysicalType + 'static {}
@@ -89,8 +59,7 @@ pub trait DaftLogicalType: Send + Sync + DaftDataType + 'static {
 }
 
 macro_rules! impl_daft_arrow_datatype {
-    ($ca:ident, $variant:ident $(, $docstring:expr)?) => {
-        $(#[doc = $docstring])?
+    ($ca:ident, $variant:ident) => {
         #[derive(Clone, Debug)]
         pub struct $ca {}
 
@@ -104,6 +73,23 @@ macro_rules! impl_daft_arrow_datatype {
         }
 
         impl DaftArrowBackedType for $ca {}
+        impl DaftPhysicalType for $ca {}
+    };
+}
+
+macro_rules! impl_daft_non_arrow_datatype {
+    ($ca:ident, $variant:ident) => {
+        #[derive(Clone, Debug)]
+        pub struct $ca {}
+
+        impl DaftDataType for $ca {
+            #[inline]
+            fn get_dtype() -> DataType {
+                DataType::$variant
+            }
+
+            type ArrayType = DataArray<$ca>;
+        }
         impl DaftPhysicalType for $ca {}
     };
 }
@@ -191,113 +177,45 @@ impl_daft_arrow_datatype!(Int8Type, Int8);
 impl_daft_arrow_datatype!(Int16Type, Int16);
 impl_daft_arrow_datatype!(Int32Type, Int32);
 impl_daft_arrow_datatype!(Int64Type, Int64);
+impl_daft_arrow_datatype!(Int128Type, Int128);
 impl_daft_arrow_datatype!(UInt8Type, UInt8);
 impl_daft_arrow_datatype!(UInt16Type, UInt16);
 impl_daft_arrow_datatype!(UInt32Type, UInt32);
 impl_daft_arrow_datatype!(UInt64Type, UInt64);
-
-// This Type isn't actually used but has to be kept around to ensure that i128 is recognized as a primitive
-impl_daft_arrow_datatype!(Int128Type, Unknown);
-
-impl_daft_arrow_datatype!(
-    IntervalType,
-    Interval,
-    r"
-Value of an IntervalMonthDayNano array
-
-## Representation
-
-This type is stored as a single 128 bit integer, interpreted as three
-different signed integral fields:
-
-1. The number of months (32 bits)
-2. The number days (32 bits)
-2. The number of nanoseconds (64 bits).
-
-Nanoseconds does not allow for leap seconds.
-
-Each field is independent (e.g. there is no constraint that the quantity of
-nanoseconds represents less than a day's worth of time).
-
-```text
-┌───────────────┬─────────────┬─────────────────────────────┐
-│     Months    │     Days    │            Nanos            │
-│   (32 bits)   │  (32 bits)  │          (64 bits)          │
-└───────────────┴─────────────┴─────────────────────────────┘
-0            32             64                           128 bit offset
-```
-Please see the [Arrow Spec](https://github.com/apache/arrow/blob/081b4022fe6f659d8765efc82b3f4787c5039e3c/format/Schema.fbs#L409-L415) for more details
-"
-);
-
-impl_daft_arrow_datatype!(Float16Type, Float16);
+// impl_daft_arrow_datatype!(Float16Type, Float16);
 impl_daft_arrow_datatype!(Float32Type, Float32);
 impl_daft_arrow_datatype!(Float64Type, Float64);
 impl_daft_arrow_datatype!(BinaryType, Binary);
-impl_daft_arrow_datatype!(FixedSizeBinaryType, Unknown);
 impl_daft_arrow_datatype!(Utf8Type, Utf8);
 impl_daft_arrow_datatype!(ExtensionType, Unknown);
-impl_daft_arrow_datatype!(Decimal128Type, Unknown);
 
 impl_nested_datatype!(FixedSizeListType, FixedSizeListArray);
 impl_nested_datatype!(StructType, StructArray);
 impl_nested_datatype!(ListType, ListArray);
-impl_nested_datatype!(UnionType, UnionArray);
 
+impl_daft_logical_data_array_datatype!(Decimal128Type, Unknown, Int128Type);
 impl_daft_logical_data_array_datatype!(TimestampType, Unknown, Int64Type);
 impl_daft_logical_data_array_datatype!(DateType, Date, Int32Type);
 impl_daft_logical_data_array_datatype!(TimeType, Unknown, Int64Type);
 impl_daft_logical_data_array_datatype!(DurationType, Unknown, Int64Type);
 impl_daft_logical_data_array_datatype!(ImageType, Unknown, StructType);
 impl_daft_logical_data_array_datatype!(TensorType, Unknown, StructType);
-impl_daft_logical_data_array_datatype!(SparseTensorType, Unknown, StructType);
-impl_daft_logical_data_array_datatype!(FixedShapeSparseTensorType, Unknown, StructType);
-impl_daft_logical_data_array_datatype!(UuidType, Uuid, FixedSizeBinaryType);
-
 impl_daft_logical_fixed_size_list_datatype!(EmbeddingType, Unknown);
 impl_daft_logical_fixed_size_list_datatype!(FixedShapeImageType, Unknown);
 impl_daft_logical_fixed_size_list_datatype!(FixedShapeTensorType, Unknown);
 impl_daft_logical_list_datatype!(MapType, Unknown);
 
-impl<T> DaftDataType for FileType<T>
-where
-    T: DaftMediaType,
-{
-    #[inline]
-    fn get_dtype() -> DataType {
-        DataType::File(T::get_type())
-    }
-    #[allow(clippy::use_self)]
-    type ArrayType = logical::LogicalArray<FileType<T>>;
-}
-
-impl<T> DaftLogicalType for FileType<T>
-where
-    T: DaftMediaType,
-{
-    type PhysicalType = StructType;
-}
-
 #[cfg(feature = "python")]
-#[derive(Clone, Debug)]
-pub struct PythonType {}
-
-#[cfg(feature = "python")]
-impl DaftDataType for PythonType {
-    #[inline]
-    fn get_dtype() -> DataType {
-        DataType::Python
-    }
-
-    type ArrayType = PythonArray;
-}
+impl_daft_non_arrow_datatype!(PythonType, Python);
 
 pub trait NumericNative:
-    ArrowNativeType
-    + PartialOrd
+    PartialOrd
+    + NativeType
     + Num
     + NumCast
     + Zero
+    + Simd
+    + Simd8
     + std::iter::Sum<Self>
     + Add<Output = Self>
     + Sub<Output = Self>
@@ -308,18 +226,8 @@ pub trait NumericNative:
     + FromPrimitive
     + ToPrimitive
     + Serialize
-    + Pod
-    + Send
-    + Sync
-    + Sized
-    + RefUnwindSafe
-    + std::fmt::Debug
-    + std::fmt::Display
-    + PartialEq
-    + Default
 {
     type DAFTTYPE: DaftNumericType;
-    type ARROWTYPE: ArrowNumericType;
 }
 
 /// Trait to express types that are native and can be vectorized
@@ -329,52 +237,37 @@ pub trait DaftNumericType: Send + Sync + DaftArrowBackedType + 'static {
 
 impl NumericNative for i8 {
     type DAFTTYPE = Int8Type;
-    type ARROWTYPE = arrow::datatypes::Int8Type;
 }
 impl NumericNative for i16 {
     type DAFTTYPE = Int16Type;
-    type ARROWTYPE = arrow::datatypes::Int16Type;
 }
 impl NumericNative for i32 {
     type DAFTTYPE = Int32Type;
-    type ARROWTYPE = arrow::datatypes::Int32Type;
 }
 impl NumericNative for i64 {
     type DAFTTYPE = Int64Type;
-    type ARROWTYPE = arrow::datatypes::Int64Type;
 }
 impl NumericNative for i128 {
     type DAFTTYPE = Int128Type;
-    type ARROWTYPE = arrow::datatypes::Decimal128Type;
 }
 impl NumericNative for u8 {
     type DAFTTYPE = UInt8Type;
-    type ARROWTYPE = arrow::datatypes::UInt8Type;
 }
 impl NumericNative for u16 {
     type DAFTTYPE = UInt16Type;
-    type ARROWTYPE = arrow::datatypes::UInt16Type;
 }
 impl NumericNative for u32 {
     type DAFTTYPE = UInt32Type;
-    type ARROWTYPE = arrow::datatypes::UInt32Type;
 }
 impl NumericNative for u64 {
     type DAFTTYPE = UInt64Type;
-    type ARROWTYPE = arrow::datatypes::UInt64Type;
 }
 
-impl NumericNative for half::f16 {
-    type DAFTTYPE = Float16Type;
-    type ARROWTYPE = arrow::datatypes::Float16Type;
-}
 impl NumericNative for f32 {
     type DAFTTYPE = Float32Type;
-    type ARROWTYPE = arrow::datatypes::Float32Type;
 }
 impl NumericNative for f64 {
     type DAFTTYPE = Float64Type;
-    type ARROWTYPE = arrow::datatypes::Float64Type;
 }
 
 impl DaftNumericType for UInt8Type {
@@ -401,13 +294,8 @@ impl DaftNumericType for Int32Type {
 impl DaftNumericType for Int64Type {
     type Native = i64;
 }
-
 impl DaftNumericType for Int128Type {
     type Native = i128;
-}
-
-impl DaftNumericType for Float16Type {
-    type Native = half::f16;
 }
 impl DaftNumericType for Float32Type {
     type Native = f32;
@@ -418,20 +306,8 @@ impl DaftNumericType for Float64Type {
 
 pub trait DaftIntegerType: DaftNumericType
 where
-    Self::Native: Ord + std::hash::Hash,
+    Self::Native: Ord,
 {
-}
-
-pub trait DaftPrimitiveType: Send + Sync + DaftArrowBackedType + 'static {
-    type Native: NumericNative;
-}
-
-impl<T: DaftNumericType> DaftPrimitiveType for T {
-    type Native = T::Native;
-}
-
-impl DaftPrimitiveType for Decimal128Type {
-    type Native = i128;
 }
 
 impl DaftIntegerType for UInt8Type {}
@@ -442,6 +318,7 @@ impl DaftIntegerType for Int8Type {}
 impl DaftIntegerType for Int16Type {}
 impl DaftIntegerType for Int32Type {}
 impl DaftIntegerType for Int64Type {}
+impl DaftIntegerType for Int128Type {}
 
 pub trait DaftFloatType: DaftNumericType
 where
@@ -449,7 +326,6 @@ where
 {
 }
 
-impl DaftFloatType for Float16Type {}
 impl DaftFloatType for Float32Type {}
 impl DaftFloatType for Float64Type {}
 
@@ -464,16 +340,17 @@ pub type Int8Array = DataArray<Int8Type>;
 pub type Int16Array = DataArray<Int16Type>;
 pub type Int32Array = DataArray<Int32Type>;
 pub type Int64Array = DataArray<Int64Type>;
+pub type Int128Array = DataArray<Int128Type>;
 pub type UInt8Array = DataArray<UInt8Type>;
 pub type UInt16Array = DataArray<UInt16Type>;
 pub type UInt32Array = DataArray<UInt32Type>;
 pub type UInt64Array = DataArray<UInt64Type>;
-pub type Float16Array = DataArray<Float16Type>;
+// pub type Float16Array = DataArray<Float16Type>;
 pub type Float32Array = DataArray<Float32Type>;
 pub type Float64Array = DataArray<Float64Type>;
 pub type BinaryArray = DataArray<BinaryType>;
-pub type FixedSizeBinaryArray = DataArray<FixedSizeBinaryType>;
 pub type Utf8Array = DataArray<Utf8Type>;
 pub type ExtensionArray = DataArray<ExtensionType>;
-pub type IntervalArray = DataArray<IntervalType>;
-pub type Decimal128Array = DataArray<Decimal128Type>;
+
+#[cfg(feature = "python")]
+pub type PythonArray = DataArray<PythonType>;

@@ -1,221 +1,251 @@
 from __future__ import annotations
 
-import contextlib
+import dataclasses
 import logging
-import threading
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar
+import os
+import warnings
+from typing import TYPE_CHECKING, ClassVar
 
-from daft.daft import (
-    IOConfig,
-    PyDaftContext,
-    PyDaftEventLogConfig,
-    PyDaftExecutionConfig,
-    PyDaftPlanningConfig,
-    PyQueryResult,
-)
-from daft.daft import get_context as _get_context
+from daft.daft import IOConfig, PyDaftExecutionConfig, PyDaftPlanningConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
-    from pathlib import Path
-
-    from daft.daft import PyQueryMetadata
-    from daft.subscribers import Subscriber
+    from daft.runners.runner import Runner
 
 logger = logging.getLogger(__name__)
 
+import threading
 
-@dataclass
+
+class _RunnerConfig:
+    name = ClassVar[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class _PyRunnerConfig(_RunnerConfig):
+    name = "py"
+    use_thread_pool: bool | None
+
+
+@dataclasses.dataclass(frozen=True)
+class _RayRunnerConfig(_RunnerConfig):
+    name = "ray"
+    address: str | None
+    max_task_backlog: int | None
+
+
+def _get_runner_config_from_env() -> _RunnerConfig:
+    """Retrieves the appropriate RunnerConfig from environment variables
+
+    To use:
+
+    1. PyRunner: set DAFT_RUNNER=py
+    2. RayRunner: set DAFT_RUNNER=ray and optionally DAFT_RAY_ADDRESS=ray://...
+    """
+    runner = os.getenv("DAFT_RUNNER") or "PY"
+    if runner.upper() == "RAY":
+        task_backlog_env = os.getenv("DAFT_DEVELOPER_RAY_MAX_TASK_BACKLOG")
+        return _RayRunnerConfig(
+            address=os.getenv("DAFT_RAY_ADDRESS"),
+            max_task_backlog=int(task_backlog_env) if task_backlog_env else None,
+        )
+    elif runner.upper() == "PY":
+        use_thread_pool_env = os.getenv("DAFT_DEVELOPER_USE_THREAD_POOL")
+        use_thread_pool = bool(int(use_thread_pool_env)) if use_thread_pool_env is not None else None
+        return _PyRunnerConfig(use_thread_pool=use_thread_pool)
+    raise ValueError(f"Unsupported DAFT_RUNNER variable: {runner}")
+
+
+@dataclasses.dataclass
 class DaftContext:
-    """Global context for the current Daft execution environment."""
+    """Global context for the current Daft execution environment"""
 
-    _ctx: PyDaftContext
+    # When a dataframe is executed, this config is copied into the Runner
+    # which then keeps track of a per-unique-execution-ID copy of the config, using it consistently throughout the execution
+    _daft_execution_config: PyDaftExecutionConfig = PyDaftExecutionConfig()
 
+    # Non-execution calls (e.g. creation of a dataframe, logical plan building etc) directly reference values in this config
+    _daft_planning_config: PyDaftPlanningConfig = PyDaftPlanningConfig()
+
+    _runner_config: _RunnerConfig = dataclasses.field(default_factory=_get_runner_config_from_env)
+    _disallow_set_runner: bool = False
+    _runner: Runner | None = None
+
+    _instance: ClassVar[DaftContext | None] = None
     _lock: ClassVar[threading.Lock] = threading.Lock()
 
-    @staticmethod
-    def _from_native(ctx: PyDaftContext) -> DaftContext:
-        return DaftContext(ctx=ctx)
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                # Another thread could have created the instance
+                # before we acquired the lock. So check that the
+                # instance is still nonexistent.
+                if not cls._instance:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
 
-    def __init__(self, ctx: PyDaftContext | None = None):
-        if ctx is not None:
-            self._ctx = ctx
-        else:
-            self._ctx = PyDaftContext()
+    def runner(self) -> Runner:
+        with self._lock:
+            return self._get_runner()
 
     @property
     def daft_execution_config(self) -> PyDaftExecutionConfig:
-        return self._ctx._daft_execution_config
+        with self._lock:
+            return self._daft_execution_config
 
     @property
     def daft_planning_config(self) -> PyDaftPlanningConfig:
-        return self._ctx._daft_planning_config
+        with self._lock:
+            return self._daft_planning_config
 
     @property
-    def daft_event_log_config(self) -> PyDaftEventLogConfig:
-        return self._ctx._daft_event_log_config
+    def runner_config(self) -> _RunnerConfig:
+        with self._lock:
+            return self._runner_config
 
-    def attach_subscriber(self, alias: str, subscriber: Subscriber) -> None:
-        """Attaches a subscriber to this context.
+    def _get_runner(self) -> Runner:
+        if self._runner is not None:
+            return self._runner
 
-        Subscribers listen to events emitted during runtime, particularly during query execution.
-        See the Subscriber class for more details.
+        if self._runner_config.name == "ray":
+            from daft.runners.ray_runner import RayRunner
 
-        Args:
-            alias (str): alias for the subscriber
-            subscriber (Subscriber): subscriber instance
-        """
-        self._ctx.attach_subscriber(alias, subscriber)
+            assert isinstance(self._runner_config, _RayRunnerConfig)
+            self._runner = RayRunner(
+                address=self._runner_config.address,
+                max_task_backlog=self._runner_config.max_task_backlog,
+            )
+        elif self._runner_config.name == "py":
+            from daft.runners.pyrunner import PyRunner
 
-    def detach_subscriber(self, alias: str) -> None:
-        """Detaches a subscriber from this context.
+            try:
+                import ray
 
-        Args:
-            alias (str): alias for the subscriber
-        """
-        self._ctx.detach_subscriber(alias)
+                if ray.is_initialized():
+                    logger.warning(
+                        "WARNING: Daft is NOT using Ray for execution!\n"
+                        "Daft is using the PyRunner but we detected an active Ray connection. "
+                        "If you intended to use the Daft RayRunner, please first run `daft.context.set_runner_ray()` "
+                        "before executing Daft queries."
+                    )
+            except ImportError:
+                pass
 
-    def _notify_query_start(self, query_id: str, metadata: PyQueryMetadata) -> None:
-        self._ctx.notify_query_start(query_id, metadata)
+            assert isinstance(self._runner_config, _PyRunnerConfig)
+            self._runner = PyRunner(use_thread_pool=self._runner_config.use_thread_pool)
 
-    def _notify_query_heartbeat(self, query_id: str) -> None:
-        self._ctx.notify_query_heartbeat(query_id)
+        else:
+            raise NotImplementedError(f"Runner config implemented: {self._runner_config.name}")
 
-    def _notify_query_end(self, query_id: str, query_result: PyQueryResult) -> None:
-        """Notifies the query end to the subscribers. Exceptions from subscribers are logged and ignored."""
-        self._ctx.notify_query_end(query_id, query_result)
+        # Mark DaftContext as having the runner set, which prevents any subsequent setting of the config
+        # after the runner has been initialized once
+        self._disallow_set_runner = True
 
-    def _notify_optimization_start(self, query_id: str) -> None:
-        self._ctx.notify_optimization_start(query_id)
+        return self._runner
 
-    def _notify_optimization_end(self, query_id: str, optimized_plan: str) -> None:
-        self._ctx.notify_optimization_end(query_id, optimized_plan)
+    @property
+    def is_ray_runner(self) -> bool:
+        with self._lock:
+            return isinstance(self._runner_config, _RayRunnerConfig)
 
-    def _notify_exec_start(self, query_id: str, physical_plan: str) -> None:
-        self._ctx.notify_exec_start(query_id, physical_plan)
 
-    def _notify_exec_end(self, query_id: str) -> None:
-        self._ctx.notify_exec_end(query_id)
-
-    def _notify_exec_operator_start(self, query_id: str, node_id: int) -> None:
-        self._ctx.notify_exec_operator_start(query_id, node_id)
-
-    def _notify_exec_operator_end(self, query_id: str, node_id: int) -> None:
-        self._ctx.notify_exec_operator_end(query_id, node_id)
-
-    def _notify_exec_emit_stats(self, query_id: str, node_id: int, stats: dict[str, int]) -> None:
-        self._ctx.notify_exec_emit_stats(query_id, node_id, stats)
+_DaftContext = DaftContext()
 
 
 def get_context() -> DaftContext:
-    """Returns the global singleton daft context."""
-    return DaftContext(_get_context())
+    return _DaftContext
 
 
-@contextlib.contextmanager
-def with_subscriber(alias: str, subscriber: Subscriber) -> Generator[None, None, None]:
-    """Context manager that attaches a subscriber to the current context, and detaches it afterwards.
+def set_runner_ray(
+    address: str | None = None,
+    noop_if_initialized: bool = False,
+    max_task_backlog: int | None = None,
+) -> DaftContext:
+    """Set the runner for executing Daft dataframes to a Ray cluster
 
-    Args:
-        alias (str): Alias of subscriber to attach
-        subscriber (Subscriber): Subscriber instance that will receive events
+    Alternatively, users can set this behavior via environment variables:
 
-    Examples:
-        >>> with daft.with_subscriber("my_subscriber", ...):
-        ...     df = daft.from_pydict({"x": [1, 2, 3]})
-        ...     df = df.with_column("y", df["x"] + 1)
-        ...     df = df.limit(5)
-        ...     df.collect()
-    """
-    ctx = get_context()
-    ctx.attach_subscriber(alias, subscriber)
-    try:
-        yield
-    finally:
-        ctx.detach_subscriber(alias)
+    1. DAFT_RUNNER=ray
+    2. Optionally, DAFT_RAY_ADDRESS=ray://...
 
-
-def attach_subscriber(alias: str, subscriber: Subscriber) -> DaftContext:
-    """Attaches a subscriber to the current context.
+    **This function will throw an error if called multiple times in the same process.**
 
     Args:
-        alias (str): Name-based alias for the subscriber
-        subscriber (Subscriber): Subscriber instance that will receive events
+        address: Address to head node of the Ray cluster. Defaults to None.
+        noop_if_initialized: If set to True, only the first call to this function will have any effect in setting the Runner.
+            Subsequent calls will have no effect at all. Defaults to False, which throws an error if this function is called
+            more than once per process.
+
+    Returns:
+        DaftContext: Daft context after setting the Ray runner
     """
     ctx = get_context()
-    ctx.attach_subscriber(alias, subscriber)
-    return ctx
+    with ctx._lock:
+        if ctx._disallow_set_runner:
+            if noop_if_initialized:
+                warnings.warn(
+                    "Calling daft.context.set_runner_ray(noop_if_initialized=True) multiple times has no effect beyond the first call."
+                )
+                return ctx
+            raise RuntimeError("Cannot set runner more than once")
+
+        ctx._runner_config = _RayRunnerConfig(
+            address=address,
+            max_task_backlog=max_task_backlog,
+        )
+        ctx._disallow_set_runner = True
+        return ctx
 
 
-def detach_subscriber(alias: str) -> None:
-    """Detaches a subscriber from the current context.
+def set_runner_py(use_thread_pool: bool | None = None) -> DaftContext:
+    """Set the runner for executing Daft dataframes to your local Python interpreter - this is the default behavior.
 
-    Args:
-        alias (str): Alias of subscriber to detach
+    Alternatively, users can set this behavior via an environment variable: DAFT_RUNNER=py
+
+    Returns:
+        DaftContext: Daft context after setting the Py runner
     """
     ctx = get_context()
-    ctx.detach_subscriber(alias)
+    with ctx._lock:
+        if ctx._disallow_set_runner:
+            raise RuntimeError("Cannot set runner more than once")
 
-
-@contextlib.contextmanager
-def planning_config_ctx(**kwargs: Any) -> Generator[None, None, None]:
-    """Context manager that wraps set_planning_config to reset the config to its original setting afternwards."""
-    original_config = get_context().daft_planning_config
-    try:
-        set_planning_config(**kwargs)
-        yield
-    finally:
-        set_planning_config(config=original_config)
+        ctx._runner_config = _PyRunnerConfig(use_thread_pool=use_thread_pool)
+        ctx._disallow_set_runner = True
+        return ctx
 
 
 def set_planning_config(
     config: PyDaftPlanningConfig | None = None,
     default_io_config: IOConfig | None = None,
-    enable_strict_filter_pushdown: bool | None = None,
 ) -> DaftContext:
-    """Globally sets various configuration parameters which control Daft plan construction behavior.
-
-    These configuration values are used when a Dataframe is being constructed (e.g. calls to create a Dataframe, or to build on an existing Dataframe).
+    """Globally sets various configuration parameters which control Daft plan construction behavior. These configuration values
+    are used when a Dataframe is being constructed (e.g. calls to create a Dataframe, or to build on an existing Dataframe)
 
     Args:
         config: A PyDaftPlanningConfig object to set the config to, before applying other kwargs. Defaults to None which indicates
             that the old (current) config should be used.
-        default_io_config: A default IOConfig to use in the absence of one being explicitly passed into any Expression (e.g. `.download()`)
+        default_io_config: A default IOConfig to use in the absence of one being explicitly passed into any Expression (e.g. `.url.download()`)
             or Dataframe operation (e.g. `daft.read_parquet()`).
     """
     # Replace values in the DaftPlanningConfig with user-specified overrides
     ctx = get_context()
     with ctx._lock:
-        old_daft_planning_config = ctx._ctx._daft_planning_config if config is None else config
+        old_daft_planning_config = ctx._daft_planning_config if config is None else config
         new_daft_planning_config = old_daft_planning_config.with_config_values(
-            default_io_config=default_io_config, enable_strict_filter_pushdown=enable_strict_filter_pushdown
+            default_io_config=default_io_config,
         )
 
-        ctx._ctx._daft_planning_config = new_daft_planning_config
+        ctx._daft_planning_config = new_daft_planning_config
         return ctx
-
-
-@contextlib.contextmanager
-def execution_config_ctx(**kwargs: Any) -> Generator[None, None, None]:
-    """Context manager that wraps set_execution_config to reset the config to its original setting afternwards."""
-    original_config = get_context()._ctx._daft_execution_config
-    try:
-        set_execution_config(**kwargs)
-        yield
-    finally:
-        set_execution_config(config=original_config)
 
 
 def set_execution_config(
     config: PyDaftExecutionConfig | None = None,
-    enable_scan_task_split_and_merge: bool | None = None,
     scan_tasks_min_size_bytes: int | None = None,
     scan_tasks_max_size_bytes: int | None = None,
-    max_sources_per_scan_task: int | None = None,
     broadcast_join_size_bytes_threshold: int | None = None,
     parquet_split_row_groups_max_files: int | None = None,
-    hash_join_partition_size_leniency: float | None = None,
+    sort_merge_join_sort_with_aligned_boundaries: bool | None = None,
     sample_size_for_sort: int | None = None,
     num_preview_rows: int | None = None,
     parquet_target_filesize: int | None = None,
@@ -223,45 +253,27 @@ def set_execution_config(
     parquet_inflation_factor: float | None = None,
     csv_target_filesize: int | None = None,
     csv_inflation_factor: float | None = None,
-    json_target_filesize: int | None = None,
-    json_inflation_factor: float | None = None,
-    text_inflation_factor: float | None = None,
     shuffle_aggregation_default_partitions: int | None = None,
-    partial_aggregation_threshold: int | None = None,
-    high_cardinality_aggregation_threshold: float | None = None,
     read_sql_partition_size_bytes: int | None = None,
-    default_morsel_size: int | None = None,
-    shuffle_algorithm: str | None = None,
-    pre_shuffle_merge_threshold: int | None = None,
-    pre_shuffle_merge_partition_threshold: int | None = None,
-    scantask_max_parallel: int | None = None,
-    native_parquet_writer: bool | None = None,
-    actor_udf_ready_timeout: int | None = None,
-    maintain_order: bool | None = None,
-    enable_dynamic_batching: bool | None = None,
-    dynamic_batching_strategy: str | None = None,
-    flight_shuffle_dirs: list[str] | None = None,
-    flight_shuffle_compression: str | None = None,
-    enable_multi_glob_path_tasks: bool | None = None,
 ) -> DaftContext:
-    """Globally sets various configuration parameters which control various aspects of Daft execution.
-
-    These configuration values
-    are used when a Dataframe is executed (e.g. calls to `DataFrame.write_*`, [DataFrame.collect()](https://docs.daft.ai/en/stable/api/dataframe/#daft.DataFrame.collect) or [DataFrame.show()](https://docs.daft.ai/en/stable/api/dataframe/#daft.DataFrame.select)).
+    """Globally sets various configuration parameters which control various aspects of Daft execution. These configuration values
+    are used when a Dataframe is executed (e.g. calls to `.write_*`, `.collect()` or `.show()`)
 
     Args:
         config: A PyDaftExecutionConfig object to set the config to, before applying other kwargs. Defaults to None which indicates
             that the old (current) config should be used.
-        enable_scan_task_split_and_merge: Whether to enable scan task split and merge. Defaults to False.
-        scan_tasks_min_size_bytes: Minimum size of scan tasks in bytes. Defaults to 96MB.
-        scan_tasks_max_size_bytes: Maximum size of scan tasks in bytes. Defaults to 384MB.
-        max_sources_per_scan_task: Maximum number of sources per scan task. Defaults to 10.
-        parquet_split_row_groups_max_files: Maximum number of files to read in which the row group splitting should happen. (Defaults to 10)
+        scan_tasks_min_size_bytes: Minimum size in bytes when merging ScanTasks when reading files from storage.
+            Increasing this value will make Daft perform more merging of files into a single partition before yielding,
+            which leads to bigger but fewer partitions. (Defaults to 96 MiB)
+        scan_tasks_max_size_bytes: Maximum size in bytes when merging ScanTasks when reading files from storage.
+            Increasing this value will increase the upper bound of the size of merged ScanTasks, which leads to bigger but
+            fewer partitions. (Defaults to 384 MiB)
         broadcast_join_size_bytes_threshold: If one side of a join is smaller than this threshold, a broadcast join will be used.
             Default is 10 MiB.
-        hash_join_partition_size_leniency: If the left side of a hash join is already correctly partitioned and the right side isn't,
-            and the ratio between the left and right size is at least this value, then the right side is repartitioned to have an equal
-            number of partitions as the left. Defaults to 0.5.
+        parquet_split_row_groups_max_files: Maximum number of files to read in which the row group splitting should happen. (Defaults to 10)
+        sort_merge_join_sort_with_aligned_boundaries: Whether to use a specialized algorithm for sorting both sides of a
+            sort-merge join such that they have aligned boundaries. This can lead to a faster merge-join at the cost of
+            more skewed sorted join inputs, increasing the risk of OOMs.
         sample_size_for_sort: number of elements to sample from each partition when running sort,
             Default is 20.
         num_preview_rows: number of rows to when showing a dataframe preview,
@@ -271,40 +283,19 @@ def set_execution_config(
         parquet_inflation_factor: Inflation Factor of parquet files (In-Memory-Size / File-Size) ratio. Defaults to 3.0
         csv_target_filesize: Target File Size when writing out CSV Files. Defaults to 512MB
         csv_inflation_factor: Inflation Factor of CSV files (In-Memory-Size / File-Size) ratio. Defaults to 0.5
-        json_target_filesize: Target File Size when writing out JSON Files. Defaults to 512MB
-        json_inflation_factor: Inflation Factor of JSON files (In-Memory-Size / File-Size) ratio. Defaults to 0.25
-        text_inflation_factor: Inflation Factor of Text files (In-Memory-Size / File-Size) ratio. Defaults to 1.0
-        shuffle_aggregation_default_partitions: Maximum number of partitions to create when performing aggregations on the Ray Runner. Defaults to 200, unless the number of input partitions is less than 200.
-        partial_aggregation_threshold: Threshold for performing partial aggregations on the Native Runner. Defaults to 10000 rows.
-        high_cardinality_aggregation_threshold: Threshold selectivity for performing high cardinality aggregations on the Native Runner. Defaults to 0.8.
+        shuffle_aggregation_default_partitions: Minimum number of partitions to create when performing aggregations. Defaults to 200, unless the number of input partitions is less than 200.
         read_sql_partition_size_bytes: Target size of partition when reading from SQL databases. Defaults to 512MB
-        default_morsel_size: Default size of morsels used for the new local executor. Defaults to 131072 rows.
-        shuffle_algorithm: The shuffle algorithm to use. Defaults to "auto", which will let Daft determine the algorithm. Options are "map_reduce", "pre_shuffle_merge", and "flight_shuffle".
-        pre_shuffle_merge_threshold: Memory threshold in bytes for pre-shuffle merge. Defaults to 1GB
-        pre_shuffle_merge_partition_threshold: Number of partitions threshold to enable pre-shuffle merge when shuffle_algorithm is "auto". Defaults to 200.
-        scantask_max_parallel: Set the max parallelism for running scan tasks simultaneously. Currently, this only works for Native Runner. If set to 0, all available CPUs will be used. Defaults to 8.
-        native_parquet_writer: Whether to use the native parquet writer vs the pyarrow parquet writer. Defaults to `True`.
-        actor_udf_ready_timeout: Timeout for UDF actors to be ready. Defaults to 120 seconds.
-        maintain_order: Whether to maintain order during execution. Defaults to True. Some blocking sink operators (e.g. write_parquet) won't respect this flag and will always keep maintain_order as false, and propagate to child operators. It's useful to set this to False for running df.collect() when no ordering is required.
-        enable_dynamic_batching: Whether to enable dynamic batching. Defaults to False.
-        dynamic_batching_strategy: The strategy to use for dynamic batching. Defaults to 'auto'.
-        flight_shuffle_dirs: Directories to use for flight shuffle. Defaults to ["/tmp"]. Must not be empty.
-        flight_shuffle_compression: Arrow IPC compression for flight shuffle spill files. One of "lz4", "zstd", or "none". Defaults to "lz4". Pass "none" to disable compression; passing Python None leaves the current config unchanged.
-        enable_multi_glob_path_tasks: Whether to create multiple glob path tasks in Ray Runner to achieve parallel glob. Defaults to False.
     """
     # Replace values in the DaftExecutionConfig with user-specified overrides
     ctx = get_context()
     with ctx._lock:
-        old_daft_execution_config = ctx._ctx._daft_execution_config if config is None else config
-
+        old_daft_execution_config = ctx._daft_execution_config if config is None else config
         new_daft_execution_config = old_daft_execution_config.with_config_values(
-            enable_scan_task_split_and_merge=enable_scan_task_split_and_merge,
             scan_tasks_min_size_bytes=scan_tasks_min_size_bytes,
             scan_tasks_max_size_bytes=scan_tasks_max_size_bytes,
-            max_sources_per_scan_task=max_sources_per_scan_task,
-            parquet_split_row_groups_max_files=parquet_split_row_groups_max_files,
             broadcast_join_size_bytes_threshold=broadcast_join_size_bytes_threshold,
-            hash_join_partition_size_leniency=hash_join_partition_size_leniency,
+            parquet_split_row_groups_max_files=parquet_split_row_groups_max_files,
+            sort_merge_join_sort_with_aligned_boundaries=sort_merge_join_sort_with_aligned_boundaries,
             sample_size_for_sort=sample_size_for_sort,
             num_preview_rows=num_preview_rows,
             parquet_target_filesize=parquet_target_filesize,
@@ -312,83 +303,9 @@ def set_execution_config(
             parquet_inflation_factor=parquet_inflation_factor,
             csv_target_filesize=csv_target_filesize,
             csv_inflation_factor=csv_inflation_factor,
-            json_target_filesize=json_target_filesize,
-            json_inflation_factor=json_inflation_factor,
-            text_inflation_factor=text_inflation_factor,
             shuffle_aggregation_default_partitions=shuffle_aggregation_default_partitions,
-            partial_aggregation_threshold=partial_aggregation_threshold,
-            high_cardinality_aggregation_threshold=high_cardinality_aggregation_threshold,
             read_sql_partition_size_bytes=read_sql_partition_size_bytes,
-            default_morsel_size=default_morsel_size,
-            shuffle_algorithm=shuffle_algorithm,
-            pre_shuffle_merge_threshold=pre_shuffle_merge_threshold,
-            pre_shuffle_merge_partition_threshold=pre_shuffle_merge_partition_threshold,
-            scantask_max_parallel=scantask_max_parallel,
-            native_parquet_writer=native_parquet_writer,
-            actor_udf_ready_timeout=actor_udf_ready_timeout,
-            maintain_order=maintain_order,
-            enable_dynamic_batching=enable_dynamic_batching,
-            dynamic_batching_strategy=dynamic_batching_strategy,
-            flight_shuffle_dirs=flight_shuffle_dirs,
-            flight_shuffle_compression=flight_shuffle_compression,
-            enable_multi_glob_path_tasks=enable_multi_glob_path_tasks,
         )
 
-        ctx._ctx._daft_execution_config = new_daft_execution_config
+        ctx._daft_execution_config = new_daft_execution_config
         return ctx
-
-
-def set_event_log_config(
-    config: PyDaftEventLogConfig | None = None,
-    enabled: bool | None = None,
-    path: str | Path | None = None,
-) -> DaftContext:
-    """Globally sets configuration parameters which control Daft event logging.
-
-    These configuration values are used to control whether Daft emits event logs during query execution and
-    where those event logs are written.
-
-    This is an experimental feature.
-
-    Args:
-        config: A PyDaftEventLogConfig object to set the config to, before applying other kwargs. Defaults to None
-            which indicates that the old (current) config should be used.
-        enabled: Whether event logging should be enabled. Defaults to None, which leaves the current setting unchanged.
-        path: Directory where event logs should be written. Defaults to None, which leaves the current path unchanged.
-    """
-    ctx = get_context()
-    with ctx._lock:
-        old_config = ctx.daft_event_log_config if config is None else config
-        kwargs: dict[str, Any] = {"enabled": enabled}
-        if path is not None:
-            kwargs["path"] = str(path)
-
-        new_config = old_config.with_config_values(**kwargs)
-        ctx._ctx._daft_event_log_config = new_config
-        return ctx
-
-
-@contextlib.contextmanager
-def event_log_ctx(
-    path: str | Path | None = None,
-    *,
-    enabled: bool = True,
-) -> Generator[None, None, None]:
-    """Context manager that temporarily sets event logging configuration.
-
-    This is an experimental feature.
-
-    Args:
-        path: Directory where event logs should be written while inside the context. Defaults to None, which leaves
-            the current path unchanged.
-        enabled: Whether event logging should be enabled while inside the context. Defaults to True.
-    """
-    original_config = get_context().daft_event_log_config
-    try:
-        kwargs: dict[str, Any] = {"enabled": enabled}
-        if path is not None:
-            kwargs["path"] = path
-        set_event_log_config(**kwargs)
-        yield
-    finally:
-        set_event_log_config(config=original_config)

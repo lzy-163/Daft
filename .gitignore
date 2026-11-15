@@ -1,3 +1,5 @@
+.vscode
+
 # Added by jetbrains IDE
 .idea/
 
@@ -11,15 +13,12 @@ requirements.txt
 build
 .cython_build
 .hypothesis
-mise.toml
 
 **/.ipynb_checkpoints/
 
 **/node_modules/**
 data/**
-benchmarking/tpcds/data
 *.so
-*.dylib
 *.whl
 log/
 *.egg-info
@@ -29,49 +28,12 @@ log/
 
 # Added by cargo
 /target
-**/target/
+
 # pytest benchmarks
 .benchmarks
 
+# docs autogen
+/docs/source/api_docs/doc_gen/
+
 # Added by pyenv
 .python-version
-
-# Added by mypy
-.mypy_cache
-
-# Zed editor
-.zed/
-
-# helix editor
-.helix
-
-# dependencies
-node_modules
-
-# next.js
-.next
-
-out/**
-!out/
-!out/.gitkeep
-
-# production
-/build
-
-# typescript
-*.tsbuildinfo
-next-env.d.ts
-
-# docs build
-site
-
-# added by vim
-*.swp
-*.swo
-
-# AGENT Prompting Templates
-AGENTS.md
-CLAUDE.local.md
-.claude/**/*.md
-.claude/worktrees/
-.beads

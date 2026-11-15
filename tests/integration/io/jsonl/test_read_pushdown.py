@@ -6,10 +6,10 @@ import pytest
 
 import daft
 from daft.daft import JsonConvertOptions
-from daft.recordbatch import MicroPartition
+from daft.table import MicroPartition
 
 PRED_PUSHDOWN_FILES = [
-    "s3://daft-oss-public-data/test_fixtures/json-dev/sampled-tpch.jsonl",
+    "s3://daft-public-data/test_fixtures/json-dev/sampled-tpch.jsonl",
     "tests/assets/sampled-tpch.jsonl",
 ]
 

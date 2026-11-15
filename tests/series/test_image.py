@@ -9,10 +9,8 @@ import pyarrow as pa
 import pytest
 from PIL import Image, ImageSequence
 
-from daft.datatype import DataType, get_super_ext_type
+from daft.datatype import DaftExtension, DataType
 from daft.series import Series
-
-DaftExtension = get_super_ext_type()
 
 MODE_TO_NP_DTYPE = {
     "L": np.uint8,
@@ -73,7 +71,7 @@ def test_image_round_trip(give_mode):
         np.arange(12, 39, dtype=np.uint8).reshape((3, 3, 3)),
         None,
     ]
-    s = Series.from_pylist(data, dtype=DataType.python())
+    s = Series.from_pylist(data, pyobj="force")
 
     mode = "RGB" if give_mode else None
     target_dtype = DataType.image(mode)
@@ -114,7 +112,7 @@ def test_fixed_shape_image_round_trip():
         np.arange(12, 24, dtype=np.uint8).reshape(shape),
         None,
     ]
-    s = Series.from_pylist(data, dtype=DataType.python())
+    s = Series.from_pylist(data, pyobj="force")
 
     target_dtype = DataType.image("RGB", height, width)
 
@@ -210,7 +208,7 @@ def test_image_pil_inference_mixed():
     ]
 
     # Forcing should still create Python Series
-    s = Series.from_pylist(imgs, dtype=DataType.python())
+    s = Series.from_pylist(imgs, pyobj="force")
     assert s.datatype() == DataType.python()
 
     s = Series.from_pylist(imgs, pyobj="allow")
@@ -297,25 +295,22 @@ def test_image_encode_pil(fixed_shape, mode, file_format):
         np.testing.assert_equal(pil_decoded_imgs, arrs)
 
 
-PIL_DECODE_MODES = [
-    ("L", "png"),
-    ("L", "tiff"),
-    ("LA", "png"),
-    # Image crate doesn't support 2 samples per pixel.
-    # ("LA", "tiff"),
-    ("RGB", "png"),
-    ("RGB", "tiff"),
-    ("RGB", "bmp"),
-    ("RGBA", "png"),
-    ("RGBA", "tiff"),
-    # Not supported by Daft or PIL.
-    # "L16", "LA16", "RGB16", "RGBA16", "RGB32F", "RGBA32F"
-]
-
-
 @pytest.mark.parametrize(
     ["mode", "file_format"],
-    PIL_DECODE_MODES,
+    [
+        ("L", "png"),
+        ("L", "tiff"),
+        ("LA", "png"),
+        # Image crate doesn't support 2 samples per pixel.
+        # ("LA", "tiff"),
+        ("RGB", "png"),
+        ("RGB", "tiff"),
+        ("RGB", "bmp"),
+        ("RGBA", "png"),
+        ("RGBA", "tiff"),
+        # Not supported by Daft or PIL.
+        # "L16", "LA16", "RGB16", "RGBA16", "RGB32F", "RGBA32F"
+    ],
 )
 def test_image_decode_pil(mode, file_format):
     np_dtype = MODE_TO_NP_DTYPE[mode]
@@ -330,7 +325,7 @@ def test_image_decode_pil(mode, file_format):
     img_bytes = img_bytes.getvalue()
     arrow_arr = pa.array([img_bytes, img_bytes, img_bytes], type=pa.binary())
     s = Series.from_arrow(arrow_arr)
-    t = s.image.decode(mode=None)
+    t = s.image.decode()
     # TODO(Clark): Infer type-leve mode if all images are the same mode.
     assert t.datatype() == DataType.image()
     out = t.cast(DataType.python()).to_pylist()
@@ -338,31 +333,6 @@ def test_image_decode_pil(mode, file_format):
     if num_channels == 1:
         expected_arrs = [np.expand_dims(arr, -1) for arr in expected_arrs]
     np.testing.assert_equal(out, expected_arrs)
-
-
-@pytest.mark.parametrize("output_mode", ["L", "LA", "RGB", "RGBA"])
-def test_image_decode_pil_multi_mode(output_mode):
-    imgs = []
-    for mode, file_format in PIL_DECODE_MODES:
-        np_dtype = MODE_TO_NP_DTYPE[mode]
-        num_channels = MODE_TO_NUM_CHANNELS[mode]
-        shape = (4, 4)
-        if num_channels > 1:
-            shape += (num_channels,)
-        arr = np.arange(np.prod(shape)).reshape(shape).astype(np_dtype)
-        img = Image.fromarray(arr, mode=mode)
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, file_format)
-        img_bytes = img_bytes.getvalue()
-        imgs.append(img_bytes)
-
-    arrow_arr = pa.array(imgs, type=pa.binary())
-    s = Series.from_arrow(arrow_arr)
-    t = s.image.decode(mode=output_mode)
-    assert t.datatype() == DataType.image(output_mode)
-    out = t.cast(DataType.python()).to_pylist()
-    for o in out:
-        assert o.shape == (4, 4, MODE_TO_NUM_CHANNELS[output_mode])
 
 
 @pytest.mark.parametrize(
@@ -419,7 +389,7 @@ def test_image_encode_decode_pil_roundtrip(fixed_shape, mode, file_format):
         imgs_bytes.append(img_bytes)
     arrow_arr = pa.array(imgs_bytes, type=pa.binary())
     s = Series.from_arrow(arrow_arr)
-    t = s.image.decode(mode=None)
+    t = s.image.decode()
     # TODO(Clark): Infer type-leve mode if all images are the same mode.
     assert t.datatype() == DataType.image()
 
@@ -525,7 +495,7 @@ def test_image_decode_opencv(mode, file_format):
     img_bytes = encoded_arr.tobytes()
     arrow_arr = pa.array([img_bytes, img_bytes, img_bytes], type=pa.binary())
     s = Series.from_arrow(arrow_arr)
-    t = s.image.decode(mode=None)
+    t = s.image.decode()
     # TODO(Clark): Support constructing an Image type with an unknown mode by known dtype.
     if np_dtype == np.uint8:
         # TODO(Clark): Infer type-leve mode if all images are the same mode.
@@ -533,53 +503,6 @@ def test_image_decode_opencv(mode, file_format):
     out = t.cast(DataType.python()).to_pylist()
     expected_arrs = [arr, arr, arr]
     np.testing.assert_equal(out, expected_arrs)
-
-
-# check support for decoding even from unsupported types
-@pytest.mark.parametrize("output_mode", ["L", "LA", "RGB", "RGBA"])
-def test_image_decode_opencv_multi_modes(output_mode):
-    INPUT_MODES = [
-        ("L", "png"),
-        ("L", "tiff"),
-        # OpenCV doesn't support 2-channel images.
-        # ("LA", "png"),
-        ("RGB", "png"),
-        ("RGB", "tiff"),
-        ("RGB", "bmp"),
-        ("RGBA", "png"),
-        ("RGBA", "tiff"),
-        ("RGBA", "webp"),
-        ("L16", "png"),
-        # OpenCV doesn't support 2-channel images.
-        # ("LA16", "png"),
-        ("RGB16", "png"),
-        ("RGB16", "tiff"),
-        ("RGBA16", "png"),
-        ("RGBA16", "tiff"),
-        # Image crate doesn't support LogLuv HDR encoding.
-        # ("RGB32F", "tiff"),
-        # ("RGBA32F", "tiff"),
-    ]
-    imgs = []
-    for mode, file_format in INPUT_MODES:
-        np_dtype = MODE_TO_NP_DTYPE[mode]
-        num_channels = MODE_TO_NUM_CHANNELS[mode]
-        shape = (4, 4, num_channels)
-        arr = np.arange(np.prod(shape)).reshape(shape).astype(np_dtype)
-        cv2_arr = arr
-        color_conv = MODE_TO_OPENCV_COLOR_CONVERSION.get(mode)
-        if color_conv is not None:
-            cv2_arr = cv2.cvtColor(arr, color_conv)
-        encoded_arr = cv2.imencode(f".{file_format}", cv2_arr)[1]
-        img_bytes = encoded_arr.tobytes()
-        imgs.append(img_bytes)
-    arrow_arr = pa.array(imgs, type=pa.binary())
-    s = Series.from_arrow(arrow_arr)
-    t = s.image.decode(mode=output_mode)
-    assert t.datatype() == DataType.image(output_mode)
-    out = t.to_pylist()
-    for o in out:
-        assert o.shape == (4, 4, MODE_TO_NUM_CHANNELS[output_mode])
 
 
 @pytest.mark.parametrize(
@@ -624,7 +547,7 @@ def test_image_encode_decode_opencv_roundtrip(mode, file_format):
     arrow_arr = pa.array([img_bytes, img_bytes, img_bytes], type=pa.binary())
 
     s = Series.from_arrow(arrow_arr)
-    t = s.image.decode(mode=None)
+    t = s.image.decode()
     # TODO(Clark): Support constructing an Image type with an unknown mode by known dtype.
     if np_dtype == np.uint8:
         # TODO(Clark): Infer type-leve mode if all images are the same mode.
@@ -667,7 +590,7 @@ def test_image_resize_same_mode(fixed_shape, mode):
             if arr is not None:
                 arr[..., -1] = 255
 
-    s = Series.from_pylist(arrs, dtype=DataType.python())
+    s = Series.from_pylist(arrs, pyobj="force")
     t = s.cast(dtype)
     assert t.datatype() == dtype
 
@@ -702,7 +625,7 @@ def test_image_resize_mixed_modes():
         None,
     ]
 
-    s = Series.from_pylist(data, dtype=DataType.python())
+    s = Series.from_pylist(data, pyobj="force")
 
     target_dtype = DataType.image()
 
@@ -729,7 +652,7 @@ def test_fixed_shape_image_roundtrip():
     width = 2
     shape = (height, width, 3)
     data = [np.arange(12, dtype=np.uint8).reshape(shape), np.arange(12, 24, dtype=np.uint8).reshape(shape), None]
-    s = Series.from_pylist(data, dtype=DataType.python())
+    s = Series.from_pylist(data, pyobj="force")
 
     target_dtype = DataType.image("RGB", height, width)
 
@@ -766,12 +689,10 @@ def test_bad_cast_image():
         np.arange(12, 39, dtype=np.uint64).reshape((3, 3, 3)),
         None,
     ]
-    s = Series.from_pylist(data, dtype=DataType.python())
+    s = Series.from_pylist(data, pyobj="force")
 
     target_dtype = DataType.image("RGB")
-    with pytest.raises(
-        ValueError, match="Images with mode RGB can only be created from tensors of type UInt8, found UInt64"
-    ):
+    with pytest.raises(ValueError, match="Expected Numpy array to be of type: UInt8"):
         s.cast(target_dtype)
 
 
@@ -782,7 +703,7 @@ def test_bad_cast_fixed_shape_image():
     width = 2
     shape = (height, width, 3)
     data = [np.arange(12, dtype=np.uint8).reshape(shape), np.arange(12, 24, dtype=np.uint64).reshape(shape), None]
-    s = Series.from_pylist(data, dtype=DataType.python())
+    s = Series.from_pylist(data, pyobj="force")
 
     target_dtype = DataType.image("RGB", height, width)
 
@@ -793,87 +714,10 @@ def test_bad_cast_fixed_shape_image():
 def test_on_error_image_decode():
     s = Series.from_pylist([b"not an image"])
 
-    with pytest.raises(Exception, match="Invalid on_error value: NOT IMPLEMENTED"):
+    with pytest.raises(NotImplementedError, match="Unimplemented on_error option"):
         s.image.decode(on_error="NOT IMPLEMENTED")
 
     with pytest.raises(ValueError, match="Decoding image from bytes failed"):
         s.image.decode(on_error="raise")
 
     s.image.decode(on_error="null").to_pylist() == [None]
-
-
-mode_cast_modes = ["L", "LA", "RGB", "RGBA"]
-
-
-@pytest.mark.parametrize(
-    ["input_mode", "output_mode"],
-    [(a, b) for a in mode_cast_modes for b in mode_cast_modes],
-)
-def test_image_to_mode(input_mode, output_mode):
-    channels = MODE_TO_NUM_CHANNELS[input_mode]
-    data = [
-        np.arange(4 * channels, dtype=np.uint8).reshape((2, 2, channels)),
-        np.arange(4 * channels, 13 * channels, dtype=np.uint8).reshape((3, 3, channels)),
-        None,
-    ]
-    s = Series.from_pylist(data, dtype=DataType.python())
-
-    s = s.cast(DataType.image(input_mode)).image.to_mode(output_mode)
-    assert s.datatype() == DataType.image(output_mode)
-    assert s.to_pylist()[0].shape[2] == MODE_TO_NUM_CHANNELS[output_mode]
-
-
-@pytest.mark.parametrize(
-    ["input_mode", "output_mode"],
-    [(a, b) for a in mode_cast_modes for b in mode_cast_modes],
-)
-def test_image_to_mode_fixed_size(input_mode, output_mode):
-    channels = MODE_TO_NUM_CHANNELS[input_mode]
-    data = [
-        np.arange(4 * channels, dtype=np.uint8).reshape((2, 2, channels)),
-        np.arange(4 * channels, 8 * channels, dtype=np.uint8).reshape((2, 2, channels)),
-        None,
-    ]
-    s = Series.from_pylist(data, dtype=DataType.python())
-
-    s = s.cast(DataType.image(input_mode, 2, 2)).image.to_mode(output_mode)
-    assert s.datatype() == DataType.image(output_mode, 2, 2)
-    assert s.to_pylist()[0].shape[2] == MODE_TO_NUM_CHANNELS[output_mode]
-
-
-@pytest.mark.parametrize("input_mode", mode_cast_modes)
-def test_image_to_tensor(input_mode):
-    channels = MODE_TO_NUM_CHANNELS[input_mode]
-    data = [
-        np.arange(4 * channels, dtype=np.uint8).reshape((2, 2, channels)),
-        np.arange(4 * channels, 8 * channels, dtype=np.uint8).reshape((2, 2, channels)),
-        None,
-    ]
-    s = Series.from_pylist(data, dtype=DataType.python())
-    img = s.cast(DataType.image(input_mode))
-
-    t = img.image.to_tensor()
-    assert t.datatype() == DataType.tensor(DataType.uint8())
-
-    out = t.to_pylist()
-    assert out[-1] is None
-    np.testing.assert_equal(out[:-1], data[:-1])
-
-
-@pytest.mark.parametrize("input_mode", mode_cast_modes)
-def test_image_to_tensor_fixed_shape(input_mode):
-    channels = MODE_TO_NUM_CHANNELS[input_mode]
-    data = [
-        np.arange(4 * channels, dtype=np.uint8).reshape((2, 2, channels)),
-        np.arange(4 * channels, 8 * channels, dtype=np.uint8).reshape((2, 2, channels)),
-        None,
-    ]
-    s = Series.from_pylist(data, dtype=DataType.python())
-    img = s.cast(DataType.image(input_mode, 2, 2))
-    t = img.image.to_tensor()
-
-    assert t.datatype() == DataType.tensor(DataType.uint8(), shape=(2, 2, channels))
-
-    out = t.to_pylist()
-    assert out[-1] is None
-    np.testing.assert_equal(out[:-1], data[:-1])

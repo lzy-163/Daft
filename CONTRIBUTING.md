@@ -1,27 +1,17 @@
 # Contributing to Daft
 
-Daft is an open-source project and we welcome contributions from the community. Whether you're reporting bugs, proposing features, or contributing code, this guide will help you get started.
-
-## Quick Start
-
-- **Found a bug?** 🐛 [Report it here](#reporting-issues)
-- **Have a feature idea?** 💡 [Start a discussion](#proposing-features)
-- **Want to make your first PR?** 🚀 [Contribute new code](#contributing-code)
-
 ## Reporting Issues
 
-To report bugs and issues with Daft, please file an issue on our [issues](https://github.com/Eventual-Inc/Daft/issues) page.
-
-Additionally, please include the following information in your bug report:
+To report bugs and issues with Daft, please report in detail:
 
 1. Operating system
 2. Daft version
 3. Python version
-4. Daft runner (native or Ray)
+4. Runner that your code is using
 
 ## Proposing Features
 
-We highly encourage you to propose new features or ideas. Please start a GitHub Discussion in our [Ideas channel](https://github.com/Eventual-Inc/Daft/discussions/categories/ideas).
+Please start a GitHub Discussion in our [Ideas channel](https://github.com/Eventual-Inc/Daft/discussions/categories/ideas). Once the feature is clarified, fleshed out and approved, the corresponding issue(s) will be created from the GitHub discussion.
 
 When proposing features, please include:
 
@@ -31,88 +21,29 @@ When proposing features, please include:
 
 ## Contributing Code
 
-All **non-trivial** PRs are required to be linked to an issue that has been **approved by a maintainer**.
+### Development Environment
 
-### Contribution bar (non-trivial PRs):
+To set up your development environment:
 
-    1.	Link an approved issue (Fixes #…).
-    2.	Include tests or explain why not.
-    3.	Keep PRs small; large changes require a plan/design note and should be split.
-    4.	Disclose material AI usage and what you verified.
+1. Ensure that your system has a suitable Python version installed (>=3.7)
+2. [Install the Rust compilation toolchain](https://www.rust-lang.org/tools/install)
+3. Clone the Daft repo: `git clone git@github.com:Eventual-Inc/Daft.git`
+4. Run `make .venv` from your new cloned Daft repository to create a new virtual environment with all of Daft's development dependencies installed
+5. Run `make hooks` to install pre-commit hooks: these will run tooling on every commit to ensure that your code meets Daft development standards
 
-Non-trivial PRs that do not meet these requirements **may be closed without review**.
+### Developing
 
-### Trivial PRs
+1. `make build`: recompile your code after modifying any Rust code in `src/`
+2. `make test`: run tests
+3. `DAFT_RUNNER=ray make test`: set the runner to the Ray runner and run tests (DAFT_RUNNER defaults to `py`)
 
-Trivial PRs (docs, typos, small test fixes, clearly scoped bugfixes) may bypass the issue requirement, but must be labeled no-issue-needed by a maintainer.
+### Developing with Ray
 
-#### What counts as non-trivial
+Running a development version of Daft on a local Ray cluster is as simple as including `daft.context.set_runner_ray()` in your Python script and then building and executing it as usual.
 
-A PR is considered non-trivial if it:
-• Changes behavior, APIs, or performance
-• Touches core execution/planning logic
-• Adds dependencies or new features
-• Is large in scope (e.g. > ~300 LOC or many files)
+To use a remote Ray cluster, run the following steps on the same operating system version as your Ray nodes, in order to ensure that your binaries are executable on Ray.
 
-When in doubt, open an issue first.
-
-For detailed development instructions, see our [Development Guide](https://docs.daft.ai/en/stable/contributing/development/).
-
-## Governance
-
-The Daft project is governed by a community of contributors who have helped shape the project into what it is today. Members contribute in different ways and take on a variety of roles.
-
-### Maintainer
-
-A Maintainer is a recognized Contributor who has demonstrated sustained, meaningful contributions to the project. Maintainers are nominated by existing Maintainers or PMC members and approved by a majority vote of the PMC.
-
-- **Maintainer/Review**: Recognized contributors with review (and approval) permissions
-- **Maintainer/Merge**: Maintainers additionally with merge access to the repository
-
-**Maintainers/Review:**
-
-| GitHub                                             | Affiliation   | Focus Areas                                                             |
-| -------------------------------------------------- | ------------- | ----------------------------------------------------------------------- |
-| [@conceptofmind](https://github.com/conceptofmind) | Teraflop AI   | Performance and UDF bug reports                                         |
-| [@everySympathy](https://github.com/everySympathy) | ByteDance     | Series slicing, partition optimization                                  |
-| [@gweaverbiodev](https://github.com/gweaverbiodev) | Atoms         | pyiceberg support, UDF improvements                                     |
-| [@kevinzwang](https://github.com/kevinzwang)       | SkyPilot      | Core refactoring (arrow2 migration), UDF system, vLLM, type conversions |
-| [@pdames](https://github.com/pdames)               | Nvidia        | Catalog support and improvements                                        |
-| [@VOID001](https://github.com/VOID001)             | ByteDance     | Dashboard features, SQL error handling                                  |
-| [@caican00](https://github.com/caican00)           | Xiaomi        |                                                                         |
-
-**Maintainers/Merge:**
-
-Maintainers who additionally have merge access to the repository.
-
-| Name               | GitHub                                                     | Affiliation |
-| ------------------ | ---------------------------------------------------------- | ----------- |
-| Chris Kellogg      | [@cckellogg](https://github.com/cckellogg)                 | Eventual    |
-| Colin Ho           | [@colin-ho](https://github.com/colin-ho)                   | Eventual    |
-| Cory Grinstead     | [@universalmind303](https://github.com/universalmind303)   | Eventual    |
-| Desmond Cheong     | [@desmondcheongzx](https://github.com/desmondcheongzx)     | Eventual    |
-| Everett Kleven     | [@everettVT](https://github.com/everettVT)                 | Eventual    |
-| Jay Chia           | [@jaychia](https://github.com/jaychia)                     | Eventual    |
-| Jeev Balakrishnan  | [@jeevb](https://github.com/jeevb)                         | Eventual    |
-| Oliver Huang       | [@ohbh](https://github.com/ohbh)                           | Eventual    |
-| R. C. Howell       | [@rchowell](https://github.com/rchowell)                   | Eventual    |
-| Rohit Kulshreshtha | [@rohitkulshreshtha](https://github.com/rohitkulshreshtha) | Eventual    |
-| Sam Stokes         | [@samstokes](https://github.com/samstokes)                 | Eventual    |
-| Sammy Sidhu        | [@samster25](https://github.com/samster25)                 | Eventual    |
-| Srinivas Lade      | [@srilman](https://github.com/srilman)                     | Eventual    |
-| Varun Madan        | [@madvart](https://github.com/madvart)                     | Eventual    |
-| YK                 | [@ykdojo](https://github.com/ykdojo)                       | Eventual    |
-| Kejian Ju          | [@Jay-ju](https://github.com/Jay-ju)                       | Bytedance   |
-| Leilei Hu          | [@huleilei](https://github.com/huleilei)                   | Bytedance   |
-| Zhenchao Wang      | [@plotor](https://github.com/plotor)                       | Bytedance   |
-| Zhiping Wu         | [@stayrascal](https://github.com/stayrascal)               | Bytedance   |
-
-### Project Management Committee (PMC)
-
-The PMC provides oversight and governance for the Daft project. PMC members have voting rights on community decisions, including approving new Maintainers and setting the strategic direction of the project.
-
-| Name        | GitHub                                     |
-| ----------- | ------------------------------------------ |
-| Jay Chia    | [@jaychia](https://github.com/jaychia)     |
-| Sammy Sidhu | [@samster25](https://github.com/samster25) |
-| Varun Madan | [@madvart](https://github.com/madvart)     |
+1. `mkdir wd`: this is the working directory, it will hold all the files to be submitted to Ray for a job
+2. `ln -s daft wd/daft`: create a symbolic link from the Python module to the working directory
+3. `make build-release`: an optimized build to ensure that the module is small enough to be successfully uploaded to Ray. Run this after modifying any Rust code in `src/`
+4. `ray job submit --working-dir wd --address "http://<head_node_host>:8265" -- python script.py`: submit `wd/script.py` to be run on Ray

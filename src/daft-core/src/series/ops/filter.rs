@@ -1,9 +1,8 @@
+use crate::{datatypes::BooleanArray, series::Series};
 use common_error::{DaftError, DaftResult};
 
-use crate::{datatypes::BooleanArray, series::Series};
-
 impl Series {
-    pub fn filter(&self, mask: &BooleanArray) -> DaftResult<Self> {
+    pub fn filter(&self, mask: &BooleanArray) -> DaftResult<Series> {
         match (self.len(), mask.len()) {
             (_, 1) => {
                 if Some(true) == mask.get(0) {

@@ -6,12 +6,13 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from daft.datatype import DataType, get_super_ext_type
+from daft.datatype import DaftExtension, DataType
 from daft.series import Series
+from daft.utils import pyarrow_supports_fixed_shape_tensor
 from tests.series import ARROW_FLOAT_TYPES, ARROW_INT_TYPES
 from tests.utils import ANSI_ESCAPE
 
-DaftExtension = get_super_ext_type()
+ARROW_VERSION = tuple(int(s) for s in pa.__version__.split(".") if s.isnumeric())
 
 
 @pytest.mark.parametrize("dtype", ARROW_INT_TYPES + ARROW_FLOAT_TYPES)
@@ -80,14 +81,20 @@ def test_fixed_shape_tensor_roundtrip(dtype):
     # Test Arrow roundtrip.
     arrow_arr = t.to_arrow()
 
-    assert arrow_arr.type == pa.fixed_shape_tensor(dtype, shape)
+    if pyarrow_supports_fixed_shape_tensor():
+        assert arrow_arr.type == pa.fixed_shape_tensor(dtype, shape)
+    else:
+        assert isinstance(arrow_arr.type, DaftExtension)
     from_arrow = Series.from_arrow(t.to_arrow())
 
     assert from_arrow.datatype() == t.datatype()
     np.testing.assert_equal(from_arrow.to_pylist(), t.to_pylist())
 
-    # Can't deepcopy pyarrow's fixed-shape tensor type.
-    t_copy = t
+    if ARROW_VERSION >= (12, 0, 0):
+        # Can't deepcopy pyarrow's fixed-shape tensor type.
+        t_copy = t
+    else:
+        t_copy = copy.deepcopy(t)
     assert t_copy.datatype() == t.datatype()
     np.testing.assert_equal(t_copy.to_pylist(), t.to_pylist())
 
@@ -123,7 +130,7 @@ def test_tensor_repr():
         == """╭───────────────────────╮
 │ list_series           │
 │ ---                   │
-│ Tensor[Int64]         │
+│ Tensor(Int64)         │
 ╞═══════════════════════╡
 │ <Tensor shape=(2, 2)> │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤

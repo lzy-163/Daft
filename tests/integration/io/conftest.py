@@ -2,34 +2,42 @@ from __future__ import annotations
 
 import contextlib
 import io
-import json
 import os
 import pathlib
 import shutil
-import uuid
-from collections.abc import Generator
-from typing import TYPE_CHECKING, TypeAlias, TypeVar
+from typing import Generator, TypeVar
 
-import pyarrow as pa
-import pyarrow.parquet as pq
+import numpy as np
 import pytest
+import s3fs
+from PIL import Image
 
 import daft
 
-if TYPE_CHECKING:
-    from azure.storage.blob import BlobServiceClient
-
 T = TypeVar("T")
 
-YieldFixture: TypeAlias = Generator[T, None, None]
+YieldFixture = Generator[T, None, None]
 
 
-# ----------------- Public Config Fixtures ----------------- #
+###
+# Config fixtures
+###
+
+
+@pytest.fixture(scope="session")
+def minio_io_config() -> daft.io.IOConfig:
+    return daft.io.IOConfig(
+        s3=daft.io.S3Config(
+            endpoint_url="http://127.0.0.1:9000",
+            key_id="minioadmin",
+            access_key="minioadmin",
+        )
+    )
 
 
 @pytest.fixture(scope="session")
 def aws_public_s3_config(request) -> daft.io.IOConfig:
-    # Use anonymous mode to avoid having to search for credentials in the GitHub Runner
+    # Use anonymous mode to avoid having to search for credentials in the Github Runner
     # If pytest is run with `--credentials` then we set anonymous=None to go down the credentials chain
     anonymous = None if request.config.getoption("--credentials") else True
 
@@ -44,7 +52,7 @@ def aws_public_s3_config(request) -> daft.io.IOConfig:
 
 @pytest.fixture(scope="session")
 def gcs_public_config(request) -> daft.io.IOConfig:
-    # Use anonymous mode to avoid having to search for credentials in the GitHub Runner
+    # Use anonymous mode to avoid having to search for credentials in the Github Runner
     # If pytest is run with `--credentials` then we set anonymous=None to go down the credentials chain
     anonymous = None if request.config.getoption("--credentials") else True
     return daft.io.IOConfig(gcs=daft.io.GCSConfig(project_id=None, anonymous=anonymous))
@@ -60,80 +68,9 @@ def azure_storage_public_config() -> daft.io.IOConfig:
     )
 
 
-# ----------------- Azurite Fixtures ----------------- #
-
-# Well-known Azurite credentials:
-# https://learn.microsoft.com/en-us/azure/storage/common/storage-connect-azurite?tabs=blob-storage
-AZURITE_ACCOUNT_NAME = "devstoreaccount1"
-AZURITE_ACCOUNT_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
-AZURITE_BLOB_ENDPOINT = f"http://127.0.0.1:10000/{AZURITE_ACCOUNT_NAME}"
-
-
-@pytest.fixture(scope="session")
-def azurite_io_config() -> daft.io.IOConfig:
-    return daft.io.IOConfig(
-        azure=daft.io.AzureConfig(
-            storage_account=AZURITE_ACCOUNT_NAME,
-            access_key=AZURITE_ACCOUNT_KEY,
-            endpoint_url=AZURITE_BLOB_ENDPOINT,
-            use_ssl=False,
-        )
-    )
-
-
-def azurite_connection_string() -> str:
-    return (
-        f"DefaultEndpointsProtocol=http;AccountName={AZURITE_ACCOUNT_NAME};"
-        f"AccountKey={AZURITE_ACCOUNT_KEY};BlobEndpoint={AZURITE_BLOB_ENDPOINT};"
-    )
-
-
-@contextlib.contextmanager
-def azurite_create_container(
-    container_name: str | None = None,
-) -> YieldFixture[tuple[BlobServiceClient, str, daft.io.IOConfig]]:
-    """Creates a container in Azurite.
-
-    Yields a tuple of (BlobServiceClient, container_name, io_config).
-    If container_name is not provided, generates a unique one using UUID.
-    """
-    from azure.storage.blob import BlobServiceClient
-
-    if container_name is None:
-        container_name = f"container-{uuid.uuid4()}"
-
-    io_config = daft.io.IOConfig(
-        azure=daft.io.AzureConfig(
-            storage_account=AZURITE_ACCOUNT_NAME,
-            access_key=AZURITE_ACCOUNT_KEY,
-            endpoint_url=AZURITE_BLOB_ENDPOINT,
-            use_ssl=False,
-        )
-    )
-    blob_service = BlobServiceClient.from_connection_string(azurite_connection_string())
-    blob_service.create_container(container_name)
-    try:
-        yield blob_service, container_name, io_config
-    finally:
-        blob_service.delete_container(container_name)
-
-
-def azurite_upload_bytes(blob_service: BlobServiceClient, container: str, blob_name: str, data: bytes) -> str:
-    """Upload bytes to Azurite and return the az:// URL."""
-    blob_service.get_blob_client(container=container, blob=blob_name).upload_blob(data, overwrite=True)
-    return f"az://{container}/{blob_name}"
-
-
-def azurite_upload_parquet(blob_service: BlobServiceClient, container: str, blob_name: str, table: pa.Table) -> str:
-    """Write a pyarrow table to Azurite as parquet and return the az:// URL."""
-    buffer = io.BytesIO()
-    pq.write_table(table, buffer)
-    return azurite_upload_bytes(blob_service, container, blob_name, buffer.getvalue())
-
-
 @pytest.fixture(scope="session")
 def nginx_config() -> tuple[str, pathlib.Path]:
-    """Returns the (nginx_server_url, static_files_tmpdir) as a tuple."""
+    """Returns the (nginx_server_url, static_files_tmpdir) as a tuple"""
     return (
         "http://127.0.0.1:8080",
         pathlib.Path("/tmp/daft-integration-testing/nginx"),
@@ -142,79 +79,26 @@ def nginx_config() -> tuple[str, pathlib.Path]:
 
 @pytest.fixture(scope="session", params=["standard", "adaptive"], ids=["standard", "adaptive"])
 def retry_server_s3_config(request) -> daft.io.IOConfig:
-    """Returns the URL to the local retry_server fixture."""
+    """Returns the URL to the local retry_server fixture"""
     retry_mode = request.param
-    # set a bogus region to avoid a weird aws sdk bug that causes it to use a previously set config instead of the new one.
-    # once we upgrade, we can try removing the region_name param
     return daft.io.IOConfig(
-        s3=daft.io.S3Config(
-            endpoint_url="http://127.0.0.1:8001",
-            region_name="test",
-            anonymous=True,
-            num_tries=10,
-            retry_mode=retry_mode,
-        )
+        s3=daft.io.S3Config(endpoint_url="http://127.0.0.1:8001", anonymous=True, num_tries=10, retry_mode=retry_mode)
     )
 
 
 ###
-# Bigtable emulator fixtures
-###
-
-
-@pytest.fixture()
-def bigtable_emulator_config() -> dict[str, str]:
-    """Configuration for Bigtable emulator tests."""
-    return {
-        "project_id": "test-project",
-        "instance_id": "test-instance",
-        "table_id": f"table-{uuid.uuid4()}",
-        "emulator_host": os.environ.get("BIGTABLE_EMULATOR_HOST", "localhost:8086"),
-    }
-
-
-# ----------------- Minio Fixtures ----------------- #
-
-
-@pytest.fixture(scope="session")
-def minio_io_config() -> daft.io.IOConfig:
-    return daft.io.IOConfig(
-        s3=daft.io.S3Config(
-            endpoint_url="http://127.0.0.1:9000",
-            key_id="minioadmin",
-            access_key="minioadmin",
-            use_ssl=False,
-        )
-    )
-
-
-@pytest.fixture(scope="session")
-def anonymous_minio_io_config() -> daft.io.IOConfig:
-    return daft.io.IOConfig(
-        s3=daft.io.S3Config(
-            endpoint_url="http://127.0.0.1:9000",
-            use_ssl=False,
-            anonymous=True,
-        )
-    )
-
-
 # Mounting utilities: mount data and perform cleanup at the end of each test
+###
+
+
 @contextlib.contextmanager
 def minio_create_bucket(
-    minio_io_config: daft.io.IOConfig, bucket_name: str | None = None
-) -> YieldFixture[tuple[list[str], str]]:
-    """Creates a bucket in MinIO.
+    minio_io_config: daft.io.IOConfig, bucket_name: str = "my-minio-bucket"
+) -> YieldFixture[list[str]]:
+    """Creates a bucket in MinIO
 
-    Yields a tuple of (s3fs FileSystem, bucket_name).
-    If bucket_name is not provided, generates a unique one using UUID.
+    Yields a s3fs FileSystem
     """
-    import s3fs
-
-    # Generate unique bucket name if not provided to avoid conflicts in parallel test execution
-    if bucket_name is None:
-        bucket_name = f"bucket-{uuid.uuid4()}"
-
     fs = s3fs.S3FileSystem(
         key=minio_io_config.s3.key_id,
         password=minio_io_config.s3.access_key,
@@ -224,91 +108,26 @@ def minio_create_bucket(
         fs.rm(bucket_name, recursive=True)
     fs.mkdir(bucket_name)
     try:
-        yield fs, bucket_name
+        yield fs
     finally:
-        try:
-            fs.rm(bucket_name, recursive=True)
-        except FileNotFoundError:
-            # Bucket may have already been deleted, which is fine
-            pass
-
-
-@contextlib.contextmanager
-def minio_create_public_bucket(
-    minio_io_config: daft.io.IOConfig, bucket_name: str | None = None
-) -> YieldFixture[list[str]]:
-    """Creates a public bucket in MinIO.
-
-    Yields the bucket name.
-    If bucket_name is not provided, generates a unique one using UUID.
-    """
-    # Generate unique bucket name if not provided to avoid conflicts in parallel test execution
-    if bucket_name is None:
-        bucket_name = f"public-bucket-{uuid.uuid4()}"
-
-    # Create authenticated S3 client to set up the bucket.
-    import boto3
-    from botocore.config import Config
-
-    s3_client = boto3.client(
-        "s3",
-        endpoint_url=minio_io_config.s3.endpoint_url,
-        aws_access_key_id=minio_io_config.s3.key_id,
-        aws_secret_access_key=minio_io_config.s3.access_key,
-        config=Config(signature_version="s3v4"),
-        region_name="us-east-1",
-    )
-
-    # Create bucket if it doesn't exist.
-    try:
-        s3_client.create_bucket(Bucket=bucket_name)
-    except s3_client.exceptions.BucketAlreadyOwnedByYou:
-        pass
-
-    # Set bucket policy for anonymous access.
-    bucket_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": "*",
-                "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
-                "Resource": [f"arn:aws:s3:::{bucket_name}", f"arn:aws:s3:::{bucket_name}/*"],
-            }
-        ],
-    }
-    s3_client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(bucket_policy))
-
-    try:
-        yield bucket_name
-    finally:
-        paginator = s3_client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=bucket_name)
-
-        for page in pages:
-            if "Contents" in page:
-                objects_to_delete = [{"Key": obj["Key"]} for obj in page["Contents"]]
-                if objects_to_delete:
-                    s3_client.delete_objects(Bucket=bucket_name, Delete={"Objects": objects_to_delete})
-
-        s3_client.delete_bucket(Bucket=bucket_name)
+        fs.rm(bucket_name, recursive=True)
 
 
 @contextlib.contextmanager
 def mount_data_minio(
     minio_io_config: daft.io.IOConfig, folder: pathlib.Path, bucket_name: str = "my-minio-bucket"
 ) -> YieldFixture[list[str]]:
-    """Mounts data in `folder` into files in minio.
+    """Mounts data in `folder` into files in minio
 
     Yields a list of S3 URLs
     """
-    with minio_create_bucket(minio_io_config=minio_io_config, bucket_name=bucket_name) as (fs, actual_bucket_name):
+    with minio_create_bucket(minio_io_config=minio_io_config, bucket_name=bucket_name) as fs:
         urls = []
         for p in folder.glob("**/*"):
             if not p.is_file():
                 continue
             key = str(p.relative_to(folder))
-            url = f"s3://{actual_bucket_name}/{key}"
+            url = f"s3://{bucket_name}/{key}"
             fs.write_bytes(url, p.read_bytes())
             urls.append(url)
 
@@ -317,7 +136,7 @@ def mount_data_minio(
 
 @contextlib.contextmanager
 def mount_data_nginx(nginx_config: tuple[str, pathlib.Path], folder: pathlib.Path) -> YieldFixture[list[str]]:
-    """Mounts data in `folder` into servable static files in NGINX.
+    """Mounts data in `folder` into servable static files in NGINX
 
     Yields a list of HTTP URLs
     """
@@ -351,47 +170,6 @@ def mount_data_nginx(nginx_config: tuple[str, pathlib.Path], folder: pathlib.Pat
                 os.remove(static_assets_tmpdir / item)
 
 
-@contextlib.contextmanager
-def bigtable_emulator_setup(bigtable_emulator_config: dict[str, str]):
-    """Context manager to set up Bigtable emulator for testing."""
-    try:
-        from google.cloud import bigtable
-
-        # Set emulator host environment variable.
-        os.environ["BIGTABLE_EMULATOR_HOST"] = bigtable_emulator_config["emulator_host"]
-
-        # Create client and instance.
-        client = bigtable.Client(project=bigtable_emulator_config["project_id"], admin=True)
-
-        # Create instance (emulator allows any instance name).
-        # Skip existence check as emulator doesn't support admin operations
-        instance = client.instance(bigtable_emulator_config["instance_id"])
-
-        # Create table with column families.
-        # Skip existence check as emulator doesn't support admin operations
-        table = instance.table(bigtable_emulator_config["table_id"])
-        try:
-            from google.cloud.bigtable import column_family
-
-            # Create table with column families.
-            table.create(
-                column_families={
-                    "cf1": column_family.MaxVersionsGCRule(1),
-                    "cf2": column_family.MaxVersionsGCRule(1),
-                }
-            )
-        except Exception:
-            # Table might already exist, which is fine for emulator.
-            pass
-
-        yield {"client": client, "instance": instance, "table": table}
-
-    finally:
-        # Clean up - remove emulator host environment variable.
-        if "BIGTABLE_EMULATOR_HOST" in os.environ:
-            del os.environ["BIGTABLE_EMULATOR_HOST"]
-
-
 ###
 # Image data test fixtures
 ###
@@ -399,10 +177,7 @@ def bigtable_emulator_setup(bigtable_emulator_config: dict[str, str]):
 
 @pytest.fixture(scope="session")
 def image_data() -> YieldFixture[bytes]:
-    """Bytes of a small image."""
-    import numpy as np
-    from PIL import Image
-
+    """Bytes of a small image"""
     bio = io.BytesIO()
     image = Image.fromarray(np.ones((3, 3)).astype(np.uint8))
     image.save(bio, format="JPEG")
@@ -411,7 +186,7 @@ def image_data() -> YieldFixture[bytes]:
 
 @pytest.fixture(scope="function")
 def image_data_folder(image_data, tmpdir) -> YieldFixture[str]:
-    """Dumps 10 small JPEG files into a tmpdir."""
+    """Dumps 10 small JPEG files into a tmpdir"""
     tmpdir = pathlib.Path(tmpdir)
 
     for i in range(10):
@@ -425,7 +200,7 @@ def image_data_folder(image_data, tmpdir) -> YieldFixture[str]:
 def mock_http_image_urls(
     nginx_config: tuple[str, pathlib.Path], image_data_folder: pathlib.Path
 ) -> YieldFixture[list[str]]:
-    """Uses the docker-compose Nginx server to serve HTTP image URLs.
+    """Uses the docker-compose Nginx server to serve HTTP image URLs
 
     This fixture yields:
         list[str]: URLs of files available on the HTTP server
@@ -436,14 +211,14 @@ def mock_http_image_urls(
 
 @pytest.fixture(scope="function")
 def minio_image_data_fixture(minio_io_config, image_data_folder) -> YieldFixture[list[str]]:
-    """Populates the minio session with some fake data and yields (S3Config, paths)."""
+    """Populates the minio session with some fake data and yields (S3Config, paths)"""
     with mount_data_minio(minio_io_config, image_data_folder) as urls:
         yield urls
 
 
 @pytest.fixture(scope="session")
 def small_images_s3_paths() -> list[str]:
-    """Paths to small *.jpg files in a public S3 bucket."""
-    return [f"s3://daft-oss-public-data/test_fixtures/small_images/rickroll{i}.jpg" for i in range(6)] + [
-        f"s3a://daft-oss-public-data/test_fixtures/small_images/rickroll{i}.jpg" for i in range(6)
+    """Paths to small *.jpg files in a public S3 bucket"""
+    return [f"s3://daft-public-data/test_fixtures/small_images/rickroll{i}.jpg" for i in range(6)] + [
+        f"s3a://daft-public-data/test_fixtures/small_images/rickroll{i}.jpg" for i in range(6)
     ]

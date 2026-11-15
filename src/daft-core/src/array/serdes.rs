@@ -2,18 +2,20 @@ use std::cell::RefCell;
 
 use serde::ser::SerializeMap;
 
-use super::{DataArray, FixedSizeListArray, ListArray, StructArray, UnionArray};
-#[cfg(feature = "python")]
-use crate::prelude::PythonArray;
 use crate::{
     datatypes::{
-        BinaryArray, BooleanArray, DaftLogicalType, DaftPrimitiveType, DataType, ExtensionArray,
-        Field, FixedSizeBinaryArray, Int8Array, Int32Array, Int64Array, IntervalArray, NullArray,
-        Utf8Array, logical::LogicalArray,
+        logical::LogicalArray, BinaryArray, BooleanArray, DaftLogicalType, DaftNumericType,
+        ExtensionArray, Int64Array, NullArray, Utf8Array,
     },
-    series::{IntoSeries, Series},
+    DataType, IntoSeries, Series,
 };
 
+#[cfg(feature = "python")]
+use crate::datatypes::PythonArray;
+
+use super::{ops::as_arrow::AsArrow, DataArray, FixedSizeListArray, ListArray, StructArray};
+
+// adapted from Polars Serdes iterator
 pub struct IterSer<I>
 where
     I: IntoIterator,
@@ -28,7 +30,7 @@ where
     <I as IntoIterator>::Item: serde::Serialize,
 {
     fn new(iter: I) -> Self {
-        Self {
+        IterSer {
             iter: RefCell::new(Some(iter)),
         }
     }
@@ -51,37 +53,53 @@ where
     }
 }
 
-impl<T: DaftPrimitiveType> serde::Serialize for DataArray<T> {
+impl<T: DaftNumericType> serde::Serialize for DataArray<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         let mut s = serializer.serialize_map(Some(2))?;
         s.serialize_entry("field", self.field())?;
-        s.serialize_entry("values", &IterSer::new(self.iter()))?;
+        s.serialize_entry("values", &IterSer::new(self.as_arrow().iter()))?;
         s.end()
     }
 }
 
-macro_rules! impl_serialize_with_iter {
-    ($($arr:ty),+ $(,)?) => {
-        $(
-            impl serde::Serialize for $arr {
-                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-                where
-                    S: serde::Serializer,
-                {
-                    let mut s = serializer.serialize_map(Some(2))?;
-                    s.serialize_entry("field", self.field())?;
-                    s.serialize_entry("values", &IterSer::new(self.iter()))?;
-                    s.end()
-                }
-            }
-        )+
-    };
+impl serde::Serialize for Utf8Array {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut s = serializer.serialize_map(Some(2))?;
+        s.serialize_entry("field", self.field())?;
+        s.serialize_entry("values", &IterSer::new(self.as_arrow().iter()))?;
+        s.end()
+    }
 }
 
-impl_serialize_with_iter!(Utf8Array, BooleanArray, BinaryArray, FixedSizeBinaryArray);
+impl serde::Serialize for BooleanArray {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut s = serializer.serialize_map(Some(2))?;
+        s.serialize_entry("field", self.field())?;
+        s.serialize_entry("values", &IterSer::new(self.as_arrow().iter()))?;
+        s.end()
+    }
+}
+
+impl serde::Serialize for BinaryArray {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut s = serializer.serialize_map(Some(2))?;
+        s.serialize_entry("field", self.field())?;
+        s.serialize_entry("values", &IterSer::new(self.as_arrow().iter()))?;
+        s.end()
+    }
+}
 
 impl serde::Serialize for NullArray {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -102,14 +120,11 @@ impl serde::Serialize for ExtensionArray {
     {
         let mut s = serializer.serialize_map(Some(2))?;
         s.serialize_entry("field", self.field())?;
-        let DataType::Extension(_, inner, _) = self.data_type() else {
+        let values = if let DataType::Extension(_, inner, _) = self.data_type() {
+            Series::try_from(("physical", self.data.to_type(inner.to_arrow().unwrap()))).unwrap()
+        } else {
             panic!("Expected Extension Type!")
         };
-        let values = Series::from_arrow(
-            Field::new("physical", inner.as_ref().clone()),
-            self.to_arrow(),
-        )
-        .unwrap();
         s.serialize_entry("values", &values)?;
         s.end()
     }
@@ -117,17 +132,11 @@ impl serde::Serialize for ExtensionArray {
 
 #[cfg(feature = "python")]
 impl serde::Serialize for PythonArray {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let mut s = serializer.serialize_map(Some(2))?;
-        s.serialize_entry("field", self.field())?;
-        s.serialize_entry(
-            "values",
-            &IterSer::new(self.to_pickled_arrow().unwrap().iter()),
-        )?;
-        s.end()
+        panic!("Rust Serde is not implemented for Python Arrays")
     }
 }
 
@@ -141,39 +150,10 @@ impl serde::Serialize for StructArray {
         let mut values = Vec::with_capacity(self.children.len() + 1);
         values.extend(self.children.iter().map(Some));
 
-        let nulls = self.nulls().map(|b| {
-            BooleanArray::from_null_buffer("validity", b)
-                .unwrap()
-                .into_series()
-        });
-        values.push(nulls.as_ref());
-
-        s.serialize_entry("field", self.field.as_ref())?;
-        s.serialize_entry("values", &values)?;
-        s.end()
-    }
-}
-
-impl serde::Serialize for UnionArray {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut s = serializer.serialize_map(Some(2))?;
-        let mut values = Vec::with_capacity(self.children.len() + 2);
-        values.extend(self.children.iter().map(Some));
-
-        let ids = Int8Array::from_slice("ids", self.ids()).into_series();
-        values.push(Some(&ids));
-
-        let offsets = if let Some(offsets) = self.offsets() {
-            let offsets = Int32Array::from_slice("offsets", offsets).into_series();
-            Some(offsets)
-        } else {
-            None
-        };
-
-        values.push(offsets.as_ref());
+        let validity = self
+            .validity()
+            .map(|b| BooleanArray::from(("validity", b.clone())).into_series());
+        values.push(validity.as_ref());
 
         s.serialize_entry("field", self.field.as_ref())?;
         s.serialize_entry("values", &values)?;
@@ -190,15 +170,19 @@ impl serde::Serialize for ListArray {
         let mut values = Vec::with_capacity(3);
 
         values.push(Some(&self.flat_child));
-        let offsets = Int64Array::from_slice("offsets", self.offsets().inner()).into_series();
+
+        let arrow2_offsets = arrow2::array::Int64Array::new(
+            arrow2::datatypes::DataType::Int64,
+            self.offsets().buffer().clone(),
+            None,
+        );
+        let offsets = Int64Array::from(("offsets", Box::new(arrow2_offsets))).into_series();
         values.push(Some(&offsets));
 
-        let nulls = self.nulls().map(|b| {
-            BooleanArray::from_null_buffer("validity", b)
-                .unwrap()
-                .into_series()
-        });
-        values.push(nulls.as_ref());
+        let validity = self
+            .validity()
+            .map(|b| BooleanArray::from(("validity", b.clone())).into_series());
+        values.push(validity.as_ref());
 
         s.serialize_entry("field", self.field.as_ref())?;
         s.serialize_entry("values", &values)?;
@@ -213,12 +197,10 @@ impl serde::Serialize for FixedSizeListArray {
     {
         let mut s = serializer.serialize_map(Some(2))?;
 
-        let nulls = self.nulls().map(|b| {
-            BooleanArray::from_null_buffer("validity", b)
-                .unwrap()
-                .into_series()
-        });
-        let values = vec![Some(&self.flat_child), nulls.as_ref()];
+        let validity = self
+            .validity()
+            .map(|b| BooleanArray::from(("validity", b.clone())).into_series());
+        let values = vec![Some(&self.flat_child), validity.as_ref()];
         s.serialize_entry("field", self.field.as_ref())?;
         s.serialize_entry("values", &values)?;
         s.end()
@@ -237,23 +219,6 @@ where
         let mut s = serializer.serialize_map(Some(2))?;
         s.serialize_entry("field", self.field.as_ref())?;
         s.serialize_entry("values", &self.physical.clone().into_series())?;
-        s.end()
-    }
-}
-
-impl serde::Serialize for IntervalArray {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut s = serializer.serialize_map(Some(2))?;
-        s.serialize_entry("field", self.field())?;
-        s.serialize_entry(
-            "values",
-            &IterSer::new(
-                (0..self.len()).map(|i| self.get(i).map(|v| (v.months, v.days, v.nanoseconds))),
-            ),
-        )?;
         s.end()
     }
 }

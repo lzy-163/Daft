@@ -1,68 +1,223 @@
-use std::{
-    ops::{Div, Mul},
-    sync::Arc,
-};
+use std::{iter::repeat, sync::Arc};
 
-use arrow::{
-    array::Array as ArrowArray,
-    buffer::{OffsetBuffer, ScalarBuffer},
-};
-use common_error::{DaftError, DaftResult};
-use indexmap::IndexMap;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
-#[cfg(feature = "python")]
-use crate::lit::Literal;
-#[cfg(feature = "python")]
-use crate::prelude::PythonArray;
+use super::as_arrow::AsArrow;
 use crate::{
     array::{
-        DataArray, FixedSizeListArray, ListArray, StructArray, UnionArray, UuidArray,
         growable::make_growable,
-        image_array::ImageArraySidecarData,
-        ops::{DaftCompare, full::FullNull},
+        ops::{from_arrow::FromArrow, full::FullNull, image::ImageArraySidecarData},
+        DataArray, FixedSizeListArray, ListArray, StructArray,
     },
     datatypes::{
-        DaftArrayType, DaftArrowBackedType, DataType, Field, FileArray, ImageMode, Int64Array,
-        NullArray, TimeUnit, UInt64Array, Utf8Array,
         logical::{
-            DateArray, DurationArray, EmbeddingArray, FixedShapeImageArray,
-            FixedShapeSparseTensorArray, FixedShapeTensorArray, ImageArray, MapArray,
-            SparseTensorArray, TensorArray, TimeArray, TimestampArray,
+            DateArray, Decimal128Array, DurationArray, EmbeddingArray, FixedShapeImageArray,
+            FixedShapeTensorArray, ImageArray, LogicalArray, LogicalArrayImpl, MapArray,
+            TensorArray, TimeArray, TimestampArray,
         },
+        DaftArrowBackedType, DaftLogicalType, DataType, Field, ImageMode, Int64Array, TimeUnit,
+        UInt64Array, Utf8Array,
     },
-    file::{
-        DaftMediaType, MediaTypeAudio, MediaTypeHdf5, MediaTypeImage, MediaTypeUnknown,
-        MediaTypeVideo,
-    },
-    prelude::ExtensionArray,
     series::{IntoSeries, Series},
-    utils::display::display_time64,
-    with_match_numeric_daft_types,
+    utils::display_table::display_time64,
+    with_match_daft_logical_primitive_types,
 };
+use common_error::{DaftError, DaftResult};
+
+use arrow2::{
+    array::Array,
+    bitmap::utils::SlicesIterator,
+    compute::{
+        self,
+        cast::{can_cast_types, cast, CastOptions},
+    },
+    offset::Offsets,
+};
+use indexmap::IndexMap;
 
 #[cfg(feature = "python")]
-impl Series {
-    fn cast_to_python(&self) -> DaftResult<Self> {
-        let py_values = Python::attach(|py| {
-            use pyo3::IntoPyObjectExt;
+use {
+    crate::array::pseudo_arrow::PseudoArrowArray,
+    crate::datatypes::PythonArray,
+    crate::ffi,
+    crate::with_match_numeric_daft_types,
+    log,
+    ndarray::IntoDimension,
+    num_traits::{NumCast, ToPrimitive},
+    numpy::{PyArray3, PyReadonlyArrayDyn},
+    pyo3::prelude::*,
+    std::iter,
+    std::ops::Deref,
+};
 
-            self.to_literals()
-                .map(|lit| {
-                    use crate::lit::Literal;
+fn arrow_logical_cast<T>(
+    to_cast: &LogicalArrayImpl<T, DataArray<T::PhysicalType>>,
+    dtype: &DataType,
+) -> DaftResult<Series>
+where
+    T: DaftLogicalType,
+    T::PhysicalType: DaftArrowBackedType,
+{
+    // Cast from LogicalArray to the target DataType
+    // using Arrow's casting mechanisms.
 
-                    if matches!(lit, Literal::Null) {
-                        Ok(None)
-                    } else {
-                        Ok(Some(Arc::new(lit.into_py_any(py)?)))
-                    }
+    // Note that Arrow Logical->Logical direct casts (what this method exposes)
+    // have different behaviour than Arrow Logical->Physical->Logical casts.
+
+    let source_dtype = to_cast.data_type();
+    let source_arrow_type = source_dtype.to_arrow()?;
+    let target_arrow_type = dtype.to_arrow()?;
+
+    // Get the result of the Arrow Logical->Target cast.
+    let result_arrow_array = {
+        // First, get corresponding Arrow LogicalArray of source DataArray
+        use DataType::*;
+        let source_arrow_array = match source_dtype {
+            // Wrapped primitives
+            Decimal128(..) | Date | Timestamp(..) | Duration(..) | Time(..) => {
+                with_match_daft_logical_primitive_types!(source_dtype, |$T| {
+                    use arrow2::array::Array;
+                    to_cast
+                        .physical
+                        .data()
+                        .as_any()
+                        .downcast_ref::<arrow2::array::PrimitiveArray<$T>>()
+                        .unwrap()
+                        .clone()
+                        .to(source_arrow_type)
+                        .to_boxed()
                 })
-                .collect::<PyResult<Vec<_>>>()
-        })?;
+            }
+            _ => cast(
+                to_cast.physical.data(),
+                &source_arrow_type,
+                CastOptions {
+                    wrapped: true,
+                    partial: false,
+                },
+            )?,
+        };
 
-        Ok(PythonArray::from_iter(self.name(), py_values.into_iter()).into_series())
+        // Then, cast source Arrow LogicalArray to target Arrow LogicalArray.
+
+        cast(
+            source_arrow_array.as_ref(),
+            &target_arrow_type,
+            CastOptions {
+                wrapped: true,
+                partial: false,
+            },
+        )?
+    };
+
+    // If the target type is also Logical, get the Arrow Physical.
+    let result_arrow_physical_array = {
+        if dtype.is_logical() {
+            use DataType::*;
+            let target_physical_type = dtype.to_physical().to_arrow()?;
+            match dtype {
+                // Primitive wrapper types: change the arrow2 array's type field to primitive
+                Decimal128(..) | Date | Timestamp(..) | Duration(..) | Time(..) => {
+                    with_match_daft_logical_primitive_types!(dtype, |$P| {
+                        use arrow2::array::Array;
+                        result_arrow_array
+                            .as_any()
+                            .downcast_ref::<arrow2::array::PrimitiveArray<$P>>()
+                            .unwrap()
+                            .clone()
+                            .to(target_physical_type)
+                            .to_boxed()
+                    })
+                }
+                _ => cast(
+                    result_arrow_array.as_ref(),
+                    &target_physical_type,
+                    CastOptions {
+                        wrapped: true,
+                        partial: false,
+                    },
+                )?,
+            }
+        } else {
+            result_arrow_array
+        }
+    };
+
+    let new_field = Arc::new(Field::new(to_cast.name(), dtype.clone()));
+    Series::from_arrow(new_field, result_arrow_physical_array)
+}
+
+fn arrow_cast<T>(to_cast: &DataArray<T>, dtype: &DataType) -> DaftResult<Series>
+where
+    T: DaftArrowBackedType,
+{
+    // Cast from DataArray to the target DataType
+    // by using Arrow's casting mechanisms.
+
+    if !dtype.is_arrow() || !to_cast.data_type().is_arrow() {
+        return Err(DaftError::TypeError(format!(
+            "Can not cast {:?} to type: {:?}: not convertible to Arrow",
+            to_cast.data_type(),
+            dtype
+        )));
     }
+    let target_physical_type = dtype.to_physical();
+    let target_arrow_type = dtype.to_arrow()?;
+    let target_arrow_physical_type = target_physical_type.to_arrow()?;
+    let self_physical_type = to_cast.data_type().to_physical();
+    let self_arrow_type = to_cast.data_type().to_arrow()?;
+    let self_physical_arrow_type = self_physical_type.to_arrow()?;
+
+    let result_array = if target_arrow_physical_type == target_arrow_type {
+        if !can_cast_types(&self_arrow_type, &target_arrow_type) {
+            return Err(DaftError::TypeError(format!(
+                "can not cast {:?} to type: {:?}: Arrow types not castable, {:?}, {:?}",
+                to_cast.data_type(),
+                dtype,
+                self_arrow_type,
+                target_arrow_type,
+            )));
+        }
+        cast(
+            to_cast.data(),
+            &target_arrow_type,
+            CastOptions {
+                wrapped: true,
+                partial: false,
+            },
+        )?
+    } else if can_cast_types(&self_arrow_type, &target_arrow_type) {
+        // Cast from logical Arrow2 type to logical Arrow2 type.
+        cast(
+            to_cast.data(),
+            &target_arrow_type,
+            CastOptions {
+                wrapped: true,
+                partial: false,
+            },
+        )?
+    } else if can_cast_types(&self_physical_arrow_type, &target_arrow_physical_type) {
+        // Cast from physical Arrow2 type to physical Arrow2 type.
+        cast(
+            to_cast.data(),
+            &target_arrow_physical_type,
+            CastOptions {
+                wrapped: true,
+                partial: false,
+            },
+        )?
+    } else {
+        return Err(DaftError::TypeError(format!(
+            "can not cast {:?} to type: {:?}: Arrow types not castable.\n{:?}, {:?},\nPhysical types: {:?}, {:?}",
+            to_cast.data_type(),
+            dtype,
+            self_arrow_type,
+            target_arrow_type,
+            self_physical_arrow_type,
+            target_arrow_physical_type,
+        )));
+    };
+
+    let new_field = Arc::new(Field::new(to_cast.name(), dtype.clone()));
+    Series::from_arrow(new_field, result_array)
 }
 
 impl<T> DataArray<T>
@@ -70,204 +225,61 @@ where
     T: DaftArrowBackedType,
 {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
-        if self.data_type().is_null() || dtype.is_null() {
-            return Ok(Series::full_null(self.name(), dtype, self.len()));
-        }
-
         match dtype {
             #[cfg(feature = "python")]
             DataType::Python => {
-                Series::from_arrow(self.field().clone(), self.data.clone())?.cast_to_python()
+                use crate::python::PySeries;
+                use pyo3::prelude::*;
+                // Convert something to Python.
+
+                // Use the existing logic on the Python side of the PyO3 layer
+                // to create a Python list out of this series.
+                let old_pyseries =
+                    PySeries::from(Series::try_from((self.name(), self.data.clone()))?);
+
+                let new_pyseries: PySeries = Python::with_gil(|py| -> PyResult<PySeries> {
+                    PyModule::import(py, pyo3::intern!(py, "daft.series"))?
+                        .getattr(pyo3::intern!(py, "Series"))?
+                        .getattr(pyo3::intern!(py, "_from_pyseries"))?
+                        .call1((old_pyseries,))?
+                        .call_method0(pyo3::intern!(py, "_cast_to_python"))?
+                        .getattr(pyo3::intern!(py, "_series"))?
+                        .extract()
+                })?;
+                Ok(new_pyseries.into())
             }
-            DataType::Extension(name, storage_type, metadata) => {
-                let casted_to_storage = self.cast(storage_type.as_ref())?;
-                Ok(
-                    ExtensionArray::from_series(&casted_to_storage, name, metadata.as_deref())?
-                        .into_series(),
-                )
-            }
-            _ => {
-                // Cast from DataArray to the target DataType
-                // by using Arrow's casting mechanisms.
-
-                if !dtype.is_arrow() || !self.data_type().is_arrow() {
-                    return Err(DaftError::TypeError(format!(
-                        "Can not cast {:?} to type: {:?}: not convertible to Arrow",
-                        self.data_type(),
-                        dtype
-                    )));
-                }
-
-                // Arrow-rs numeric/bool <-> binary casts have different semantics from
-                // arrow2. Arrow-rs integer -> binary copies raw bytes (1i32 -> b'\x01\x00\x00\x00'),
-                // while arrow2 routed through string (1i32 -> b'1'). We preserve the arrow2
-                // string-representation semantics by routing all numeric/bool <-> binary
-                // casts through Utf8.
-                let src = self.data_type();
-                let is_binary_target = matches!(dtype, DataType::Binary);
-                let is_binary_source = matches!(src, DataType::Binary);
-
-                if src.is_boolean() && is_binary_target {
-                    // bool -> binary: arrow-rs cast(Bool, Utf8) produces "true"/"false"
-                    // but we want b"1"/b"0". Route through UInt8 first.
-                    let int_series = self.cast(&DataType::UInt8)?;
-                    let utf8_series = int_series.cast(&DataType::Utf8)?;
-                    return utf8_series.cast(dtype);
-                }
-                if src.is_numeric() && is_binary_target {
-                    let utf8_series = self.cast(&DataType::Utf8)?;
-                    return utf8_series.cast(dtype);
-                }
-                if is_binary_source && (dtype.is_numeric() || dtype.is_boolean()) {
-                    let utf8_series = self.cast(&DataType::Utf8)?;
-                    return utf8_series.cast(dtype);
-                }
-                if matches!(src, DataType::Utf8) && matches!(dtype, DataType::FixedSizeBinary(_)) {
-                    let binary_series = self.cast(&DataType::Binary)?;
-                    return binary_series.cast(dtype);
-                }
-
-                // Binary -> FixedSizeBinary: validate all non-null values match the target width
-                if let DataType::FixedSizeBinary(target_size) = dtype
-                    && is_binary_source
-                {
-                    let arrow_arr = self.to_arrow();
-                    let binary_arr = arrow_arr
-                        .as_any()
-                        .downcast_ref::<arrow::array::LargeBinaryArray>()
-                        .expect("Expected LargeBinary array for Binary DataType");
-                    for i in 0..binary_arr.len() {
-                        if !binary_arr.is_null(i) && binary_arr.value(i).len() != *target_size {
-                            return Err(DaftError::ComputeError(format!(
-                                "Cannot cast Binary to FixedSizeBinary({}): \
-                                 element at index {} has length {}",
-                                target_size,
-                                i,
-                                binary_arr.value(i).len()
-                            )));
-                        }
-                    }
-                }
-
-                // Extension types don't have an arrow-rs equivalent; use their storage type.
-                let resolve_arrow_type = |dt: &DataType| -> DaftResult<arrow::datatypes::DataType> {
-                    match dt {
-                        DataType::Extension(_, storage, _) => storage.to_arrow(),
-                        _ => dt.to_arrow(),
-                    }
-                };
-
-                let target_physical_type = dtype.to_physical();
-                let target_arrow_type = resolve_arrow_type(dtype)?;
-                let target_arrow_physical_type = resolve_arrow_type(&target_physical_type)?;
-                let self_physical_type = self.data_type().to_physical();
-                let self_arrow_type = resolve_arrow_type(self.data_type())?;
-                let self_physical_arrow_type = resolve_arrow_type(&self_physical_type)?;
-
-                // Special case: Utf8 -> numeric/temporal needs whitespace trimming
-                // This matches Python/Pandas/NumPy behavior
-                let data_to_cast: arrow::array::ArrayRef = if self.data_type() == &DataType::Utf8
-                    && (dtype.is_numeric() || dtype.is_temporal())
-                {
-                    let source = self.to_arrow();
-                    let utf8_arr = source
-                        .as_any()
-                        .downcast_ref::<arrow::array::LargeStringArray>()
-                        .expect("Expected LargeString array for Utf8 DataType");
-                    // Trim via .value(i) which skips per-element null checks
-                    let trimmed = arrow::array::LargeStringArray::from_iter_values(
-                        (0..utf8_arr.len()).map(|i| utf8_arr.value(i).trim()),
-                    );
-                    if self.null_count() == 0 {
-                        Arc::new(trimmed)
-                    } else {
-                        // Reapply original null bitmap
-                        // SAFETY: trimmed was built from valid UTF-8 (trim preserves validity),
-                        // and null buffer comes from a valid array.
-                        let data = unsafe {
-                            trimmed
-                                .into_data()
-                                .into_builder()
-                                .nulls(source.nulls().cloned())
-                                .build_unchecked()
-                        };
-                        Arc::new(arrow::array::LargeStringArray::from(data))
-                    }
-                } else {
-                    self.to_arrow()
-                };
-
-                let result_array =
-                    if arrow::compute::can_cast_types(&self_arrow_type, &target_arrow_type) {
-                        arrow::compute::cast(data_to_cast.as_ref(), &target_arrow_type)?
-                    } else if matches!(dtype, DataType::Float16)
-                        && arrow::compute::can_cast_types(
-                            &self_arrow_type,
-                            &arrow::datatypes::DataType::Float32,
-                        )
-                    {
-                        let intermediate = arrow::compute::cast(
-                            data_to_cast.as_ref(),
-                            &arrow::datatypes::DataType::Float32,
-                        )?;
-                        arrow::compute::cast(intermediate.as_ref(), &target_arrow_type)?
-                    } else if target_arrow_physical_type != target_arrow_type
-                        && arrow::compute::can_cast_types(
-                            &self_physical_arrow_type,
-                            &target_arrow_physical_type,
-                        )
-                    {
-                        // Cast to the physical type first (e.g. UInt16 -> Int32), then
-                        // reinterpret as the logical type (e.g. Int32 -> Date32) so that
-                        // downstream from_arrow receives the expected arrow type.
-                        let physical = arrow::compute::cast(
-                            data_to_cast.as_ref(),
-                            &target_arrow_physical_type,
-                        )?;
-                        let data = physical
-                            .into_data()
-                            .into_builder()
-                            .data_type(target_arrow_type)
-                            .build()?;
-                        arrow::array::make_array(data)
-                    } else {
-                        return Err(DaftError::TypeError(format!(
-                            "can not cast {:?} to type: {:?}: Arrow types not castable, {:?}, {:?}",
-                            self.data_type(),
-                            dtype,
-                            self_arrow_type,
-                            target_arrow_type,
-                        )));
-                    };
-
-                let new_field = Arc::new(Field::new(self.name(), dtype.clone()));
-                Series::from_arrow(new_field, result_array)
-            }
+            _ => arrow_cast(self, dtype),
         }
     }
 }
 
 impl DateArray {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
+        let date_array = self
+            .as_arrow()
+            .clone()
+            .to(arrow2::datatypes::DataType::Date32);
         match dtype {
-            DataType::Null => {
-                Ok(NullArray::full_null(self.name(), dtype, self.len()).into_series())
-            }
             DataType::Date => Ok(self.clone().into_series()),
             DataType::Utf8 => {
-                use chrono::Datelike;
-                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                Ok(Utf8Array::from_iter(
-                    self.name(),
-                    self.physical.iter().map(|opt_days| {
-                        opt_days.map(|days| {
-                            let date = epoch + chrono::TimeDelta::days(days as i64);
-                            format!("{}-{}-{}", date.year(), date.month(), date.day())
-                        })
-                    }),
-                )
-                .into_series())
+                // TODO: we should move this into our own strftime kernel
+                let year_array = compute::temporal::year(&date_array)?;
+                let month_array = compute::temporal::month(&date_array)?;
+                let day_array = compute::temporal::day(&date_array)?;
+                let date_str: arrow2::array::Utf8Array<i64> = year_array
+                    .iter()
+                    .zip(month_array.iter())
+                    .zip(day_array.iter())
+                    .map(|((y, m), d)| match (y, m, d) {
+                        (None, _, _) | (_, None, _) | (_, _, None) => None,
+                        (Some(y), Some(m), Some(d)) => Some(format!("{y}-{m}-{d}")),
+                    })
+                    .collect();
+                Ok(Utf8Array::from((self.name(), Box::new(date_str))).into_series())
             }
+            DataType::Int32 => Ok(self.physical.clone().into_series()),
+            DataType::Float32 => self.cast(&DataType::Int32)?.cast(&DataType::Float32),
+            DataType::Float64 => self.cast(&DataType::Int32)?.cast(&DataType::Float64),
             DataType::Timestamp(tu, _) => {
                 let days_to_unit: i64 = match tu {
                     TimeUnit::Nanoseconds => 24 * 3_600_000_000_000,
@@ -276,13 +288,12 @@ impl DateArray {
                     TimeUnit::Seconds => 24 * 3_600,
                 };
 
-                let units_per_day = Int64Array::from_slice("units", &[days_to_unit]).into_series();
+                let units_per_day = Int64Array::from(("units", vec![days_to_unit])).into_series();
                 let unit_since_epoch = ((&self.physical.clone().into_series()) * &units_per_day)?;
                 unit_since_epoch.cast(dtype)
             }
-            dtype if dtype.is_numeric() => self.physical.cast(dtype),
             #[cfg(feature = "python")]
-            DataType::Python => self.clone().into_series().cast_to_python(),
+            DataType::Python => cast_logical_to_python_array(self, dtype),
             _ => Err(DaftError::TypeError(format!(
                 "Cannot cast Date to {}",
                 dtype
@@ -291,96 +302,90 @@ impl DateArray {
     }
 }
 
-/// Formats a naive timestamp to a string in the format "%Y-%m-%d %H:%M:%S%.f".
-/// Example: 2021-01-01 00:00:00
-/// See https://docs.rs/chrono/latest/chrono/format/strftime/index.html for format string options.
-pub fn timestamp_to_str_naive(val: i64, unit: &TimeUnit) -> String {
-    let chrono_ts = daft_schema::time_unit::timestamp_to_naive_datetime(val, *unit);
-    let format_str = "%Y-%m-%d %H:%M:%S%.f";
+pub(crate) fn timestamp_to_str_naive(val: i64, unit: &TimeUnit) -> String {
+    let chrono_ts =
+        { arrow2::temporal_conversions::timestamp_to_naive_datetime(val, unit.to_arrow()) };
+    let format_str = match unit {
+        TimeUnit::Seconds => "%Y-%m-%dT%H:%M:%S",
+        TimeUnit::Milliseconds => "%Y-%m-%dT%H:%M:%S%.3f",
+        TimeUnit::Microseconds => "%Y-%m-%dT%H:%M:%S%.6f",
+        TimeUnit::Nanoseconds => "%Y-%m-%dT%H:%M:%S%.9f",
+    };
     chrono_ts.format(format_str).to_string()
 }
 
-/// Formats a timestamp with an offset to a string in the format "%Y-%m-%d %H:%M:%S%.f %:z".
-/// Example: 2021-01-01 00:00:00 -07:00
-/// See https://docs.rs/chrono/latest/chrono/format/strftime/index.html for format string options.
-pub fn timestamp_to_str_offset(val: i64, unit: &TimeUnit, offset: &chrono::FixedOffset) -> String {
-    let chrono_ts = daft_schema::time_unit::timestamp_to_datetime(val, *unit, offset);
-    let format_str = "%Y-%m-%d %H:%M:%S%.f %:z";
-    chrono_ts.format(format_str).to_string()
+pub(crate) fn timestamp_to_str_offset(
+    val: i64,
+    unit: &TimeUnit,
+    offset: &chrono::FixedOffset,
+) -> String {
+    let seconds_format = match unit {
+        TimeUnit::Seconds => chrono::SecondsFormat::Secs,
+        TimeUnit::Milliseconds => chrono::SecondsFormat::Millis,
+        TimeUnit::Microseconds => chrono::SecondsFormat::Micros,
+        TimeUnit::Nanoseconds => chrono::SecondsFormat::Nanos,
+    };
+    arrow2::temporal_conversions::timestamp_to_datetime(val, unit.to_arrow(), offset)
+        .to_rfc3339_opts(seconds_format, false)
 }
 
-/// Formats a timestamp with a timezone to a string in the format "%Y-%m-%d %H:%M:%S%.f %Z".
-/// Example: 2021-01-01 00:00:00 PST
-/// See https://docs.rs/chrono/latest/chrono/format/strftime/index.html for format string options.
-pub fn timestamp_to_str_tz(val: i64, unit: &TimeUnit, tz: &chrono_tz::Tz) -> String {
-    let chrono_ts = daft_schema::time_unit::timestamp_to_datetime(val, *unit, tz);
-    let format_str = "%Y-%m-%d %H:%M:%S%.f %Z";
-    chrono_ts.format(format_str).to_string()
+pub(crate) fn timestamp_to_str_tz(val: i64, unit: &TimeUnit, tz: &chrono_tz::Tz) -> String {
+    let seconds_format = match unit {
+        TimeUnit::Seconds => chrono::SecondsFormat::Secs,
+        TimeUnit::Milliseconds => chrono::SecondsFormat::Millis,
+        TimeUnit::Microseconds => chrono::SecondsFormat::Micros,
+        TimeUnit::Nanoseconds => chrono::SecondsFormat::Nanos,
+    };
+    arrow2::temporal_conversions::timestamp_to_datetime(val, unit.to_arrow(), tz)
+        .to_rfc3339_opts(seconds_format, false)
 }
 
 impl TimestampArray {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
         match dtype {
-            DataType::Null => {
-                Ok(NullArray::full_null(self.name(), dtype, self.len()).into_series())
-            }
-            DataType::Timestamp(tu, _) => {
-                let self_tu = match self.data_type() {
-                    DataType::Timestamp(tu, _) => tu,
-                    _ => panic!("Wrong dtype for TimestampArray: {}", self.data_type()),
-                };
-                let physical = match self_tu.cmp(tu) {
-                    std::cmp::Ordering::Equal => self.physical.clone(),
-                    std::cmp::Ordering::Greater => {
-                        let factor = tu.to_scale_factor() / self_tu.to_scale_factor();
-                        self.physical
-                            .mul(&Int64Array::from_slice("factor", &[factor]))?
-                    }
-                    std::cmp::Ordering::Less => {
-                        let factor = self_tu.to_scale_factor() / tu.to_scale_factor();
-                        self.physical
-                            .div(&Int64Array::from_slice("factor", &[factor]))?
-                    }
-                };
-                Ok(
-                    TimestampArray::new(Field::new(self.name(), dtype.clone()), physical)
-                        .into_series(),
-                )
-            }
+            DataType::Timestamp(..) => arrow_logical_cast(self, dtype),
             DataType::Date => Ok(self.date()?.into_series()),
             DataType::Time(tu) => Ok(self.time(tu)?.into_series()),
             DataType::Utf8 => {
                 let DataType::Timestamp(unit, timezone) = self.data_type() else {
                     panic!("Wrong dtype for TimestampArray: {}", self.data_type())
                 };
-                let tz_parsed = timezone.as_ref().map(|tz| {
-                    daft_schema::time_unit::parse_timezone(tz)
-                        .unwrap_or_else(|_| panic!("Unable to parse timezone string {tz}"))
-                });
-                let str_array = Utf8Array::from_iter(
-                    self.name(),
-                    self.physical.iter().map(|val| {
-                        val.map(|val| match &tz_parsed {
-                            Some(daft_schema::time_unit::ParsedTimezone::Fixed(offset)) => {
-                                timestamp_to_str_offset(val, unit, offset)
-                            }
-                            Some(daft_schema::time_unit::ParsedTimezone::Tz(tz)) => {
-                                timestamp_to_str_tz(val, unit, tz)
-                            }
-                            None => timestamp_to_str_naive(val, unit),
-                        })
-                    }),
+
+                let str_array: arrow2::array::Utf8Array<i64> = timezone.as_ref().map_or_else(
+                    || {
+                        self.as_arrow()
+                            .iter()
+                            .map(|val| val.map(|val| timestamp_to_str_naive(*val, unit)))
+                            .collect()
+                    },
+                    |timezone| {
+                        if let Ok(offset) = arrow2::temporal_conversions::parse_offset(timezone) {
+                            self.as_arrow()
+                                .iter()
+                                .map(|val| {
+                                    val.map(|val| timestamp_to_str_offset(*val, unit, &offset))
+                                })
+                                .collect()
+                        } else if let Ok(tz) =
+                            arrow2::temporal_conversions::parse_offset_tz(timezone)
+                        {
+                            self.as_arrow()
+                                .iter()
+                                .map(|val| val.map(|val| timestamp_to_str_tz(*val, unit, &tz)))
+                                .collect()
+                        } else {
+                            panic!("Unable to parse timezone string {}", timezone)
+                        }
+                    },
                 );
 
-                Ok(str_array.into_series())
+                Ok(Utf8Array::from((self.name(), Box::new(str_array))).into_series())
             }
-            dtype if dtype.is_numeric() => self.physical.cast(dtype),
+            DataType::Float32 => self.cast(&DataType::Int64)?.cast(&DataType::Float32),
+            DataType::Float64 => self.cast(&DataType::Int64)?.cast(&DataType::Float64),
             #[cfg(feature = "python")]
-            DataType::Python => self.clone().into_series().cast_to_python(),
-            _ => Err(DaftError::TypeError(format!(
-                "Cannot cast Timestamp to {}",
-                dtype
-            ))),
+            DataType::Python => cast_logical_to_python_array(self, dtype),
+            _ => arrow_cast(&self.physical, dtype),
         }
     }
 }
@@ -388,48 +393,28 @@ impl TimestampArray {
 impl TimeArray {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
         match dtype {
-            DataType::Null => {
-                Ok(NullArray::full_null(self.name(), dtype, self.len()).into_series())
-            }
-            DataType::Time(tu) => {
-                let self_tu = match self.data_type() {
-                    DataType::Time(tu) => tu,
-                    _ => panic!("Wrong dtype for TimeArray: {}", self.data_type()),
-                };
-                let physical = match self_tu.cmp(tu) {
-                    std::cmp::Ordering::Equal => self.physical.clone(),
-                    std::cmp::Ordering::Greater => {
-                        let factor = tu.to_scale_factor() / self_tu.to_scale_factor();
-                        self.physical
-                            .mul(&Int64Array::from_slice("factor", &[factor]))?
-                    }
-                    std::cmp::Ordering::Less => {
-                        let factor = self_tu.to_scale_factor() / tu.to_scale_factor();
-                        self.physical
-                            .div(&Int64Array::from_slice("factor", &[factor]))?
-                    }
-                };
-                Ok(TimeArray::new(Field::new(self.name(), dtype.clone()), physical).into_series())
-            }
-            DataType::Utf8 => Ok(Utf8Array::from_iter(
-                self.name(),
-                self.physical.iter().map(|val| {
-                    val.map(|val| {
-                        let DataType::Time(unit) = &self.field.dtype else {
-                            panic!("Wrong dtype for TimeArray: {}", self.field.dtype)
-                        };
-                        display_time64(val, unit)
+            DataType::Time(..) => arrow_logical_cast(self, dtype),
+            DataType::Utf8 => {
+                let time_array = self.as_arrow();
+                let time_str: arrow2::array::Utf8Array<i64> = time_array
+                    .iter()
+                    .map(|val| {
+                        val.map(|val| {
+                            let DataType::Time(unit) = &self.field.dtype else {
+                                panic!("Wrong dtype for TimeArray: {}", self.field.dtype)
+                            };
+                            display_time64(*val, unit)
+                        })
                     })
-                }),
-            )
-            .into_series()),
-            dtype if dtype.is_numeric() => self.physical.cast(dtype),
+                    .collect();
+                Ok(Utf8Array::from((self.name(), Box::new(time_str))).into_series())
+            }
+            DataType::Int64 => Ok(self.physical.clone().into_series()),
+            DataType::Float32 => self.cast(&DataType::Int64)?.cast(&DataType::Float32),
+            DataType::Float64 => self.cast(&DataType::Int64)?.cast(&DataType::Float64),
             #[cfg(feature = "python")]
-            DataType::Python => self.clone().into_series().cast_to_python(),
-            _ => Err(DaftError::TypeError(format!(
-                "Cannot cast Time to {}",
-                dtype
-            ))),
+            DataType::Python => cast_logical_to_python_array(self, dtype),
+            _ => arrow_cast(&self.physical, dtype),
         }
     }
 }
@@ -437,258 +422,676 @@ impl TimeArray {
 impl DurationArray {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
         match dtype {
-            DataType::Null => {
-                Ok(NullArray::full_null(self.name(), dtype, self.len()).into_series())
-            }
-            DataType::Duration(tu) => {
-                let self_tu = match self.data_type() {
-                    DataType::Duration(tu) => tu,
-                    ty => panic!("Wrong dtype for DurationArray: {ty}"),
-                };
-                let physical = match self_tu.cmp(tu) {
-                    std::cmp::Ordering::Equal => self.physical.clone(),
-                    std::cmp::Ordering::Greater => {
-                        let factor = tu.to_scale_factor() / self_tu.to_scale_factor();
-                        self.physical
-                            .mul(&Int64Array::from_slice("factor", &[factor]))?
-                    }
-                    std::cmp::Ordering::Less => {
-                        let factor = self_tu.to_scale_factor() / tu.to_scale_factor();
-                        self.physical
-                            .div(&Int64Array::from_slice("factor", &[factor]))?
-                    }
-                };
-                Ok(
-                    DurationArray::new(Field::new(self.name(), dtype.clone()), physical)
-                        .into_series(),
-                )
-            }
-            dtype if dtype.is_numeric() => self.physical.cast(dtype),
+            DataType::Duration(..) => arrow_logical_cast(self, dtype),
+            DataType::Float32 => self.cast(&DataType::Int64)?.cast(&DataType::Float32),
+            DataType::Float64 => self.cast(&DataType::Int64)?.cast(&DataType::Float64),
             #[cfg(feature = "python")]
-            DataType::Python => self.clone().into_series().cast_to_python(),
-            _ => Err(DaftError::TypeError(format!(
-                "Cannot cast Duration to {dtype}"
-            ))),
+            DataType::Python => cast_logical_to_python_array(self, dtype),
+            _ => arrow_cast(&self.physical, dtype),
         }
-    }
-
-    pub fn cast_to_seconds(&self) -> DaftResult<Int64Array> {
-        let tu = match self.data_type() {
-            DataType::Duration(tu) => tu,
-            _ => panic!("Wrong dtype for DurationArray: {}", self.data_type()),
-        };
-        let seconds = match tu {
-            TimeUnit::Seconds => self.physical.clone(),
-            TimeUnit::Milliseconds => self
-                .physical
-                .div(&Int64Array::from_slice("MillisecondsPerSecond", &[1000]))?,
-            TimeUnit::Microseconds => self.physical.div(&Int64Array::from_slice(
-                "MicrosecondsPerSecond",
-                &[1_000_000],
-            ))?,
-            TimeUnit::Nanoseconds => self.physical.div(&Int64Array::from_slice(
-                "NanosecondsPerSecond",
-                &[1_000_000_000],
-            ))?,
-        };
-        Ok(seconds)
-    }
-
-    pub fn cast_to_milliseconds(&self) -> DaftResult<Int64Array> {
-        let tu = match self.data_type() {
-            DataType::Duration(tu) => tu,
-            _ => panic!("Wrong dtype for DurationArray: {}", self.data_type()),
-        };
-        let milliseconds = match tu {
-            TimeUnit::Seconds => self
-                .physical
-                .mul(&Int64Array::from_slice("MillisecondsPerSecond", &[1000]))?,
-            TimeUnit::Milliseconds => self.physical.clone(),
-            TimeUnit::Microseconds => self.physical.div(&Int64Array::from_slice(
-                "MicrosecondsPerMillisecond",
-                &[1_000],
-            ))?,
-            TimeUnit::Nanoseconds => self.physical.div(&Int64Array::from_slice(
-                "NanosecondsPerMillisecond",
-                &[1_000_000],
-            ))?,
-        };
-        Ok(milliseconds)
-    }
-
-    pub fn cast_to_microseconds(&self) -> DaftResult<Int64Array> {
-        let tu = match self.data_type() {
-            DataType::Duration(tu) => tu,
-            _ => panic!("Wrong dtype for DurationArray: {}", self.data_type()),
-        };
-        let microseconds = match tu {
-            TimeUnit::Seconds => self.physical.mul(&Int64Array::from_slice(
-                "MicrosecondsPerSecond",
-                &[1_000_000],
-            ))?,
-            TimeUnit::Milliseconds => self.physical.mul(&Int64Array::from_slice(
-                "MicrosecondsPerMillisecond",
-                &[1_000],
-            ))?,
-            TimeUnit::Microseconds => self.physical.clone(),
-            TimeUnit::Nanoseconds => self.physical.div(&Int64Array::from_slice(
-                "NanosecondsPerMicrosecond",
-                &[1_000],
-            ))?,
-        };
-        Ok(microseconds)
-    }
-
-    pub fn cast_to_nanoseconds(&self) -> DaftResult<Int64Array> {
-        {
-            let tu = match self.data_type() {
-                DataType::Duration(tu) => tu,
-                _ => panic!("Wrong dtype for DurationArray: {}", self.data_type()),
-            };
-            let nanoseconds = match tu {
-                TimeUnit::Seconds => self.physical.mul(&Int64Array::from_slice(
-                    "NanosecondsPerSecond",
-                    &[1_000_000_000],
-                ))?,
-                TimeUnit::Milliseconds => self.physical.mul(&Int64Array::from_slice(
-                    "NanosecondsPerMillisecond",
-                    &[1_000_000],
-                ))?,
-                TimeUnit::Microseconds => self.physical.mul(&Int64Array::from_slice(
-                    "NanosecondsPerMicrosecond",
-                    &[1_000],
-                ))?,
-                TimeUnit::Nanoseconds => self.physical.clone(),
-            };
-            Ok(nanoseconds)
-        }
-    }
-    pub fn cast_to_minutes(&self) -> DaftResult<Int64Array> {
-        let tu = match self.data_type() {
-            DataType::Duration(tu) => tu,
-            _ => panic!("Wrong dtype for DurationArray: {}", self.data_type()),
-        };
-        let minutes = match tu {
-            TimeUnit::Seconds => self
-                .physical
-                .div(&Int64Array::from_slice("SecondsInMinute", &[60]))?,
-            TimeUnit::Milliseconds => self.physical.div(&Int64Array::from_slice(
-                "MillisecondsInMinute",
-                &[60 * 1000],
-            ))?,
-            TimeUnit::Microseconds => self.physical.div(&Int64Array::from_slice(
-                "MicrosecondsInMinute",
-                &[60 * 1_000_000],
-            ))?,
-            TimeUnit::Nanoseconds => self.physical.div(&Int64Array::from_slice(
-                "NanosecondsInMinute",
-                &[60 * 1_000_000_000],
-            ))?,
-        };
-        Ok(minutes)
-    }
-
-    pub fn cast_to_hours(&self) -> DaftResult<Int64Array> {
-        let tu = match self.data_type() {
-            DataType::Duration(tu) => tu,
-            _ => panic!("Wrong dtype for DurationArray: {}", self.data_type()),
-        };
-        let hours = match tu {
-            TimeUnit::Seconds => self
-                .physical
-                .div(&Int64Array::from_slice("SecondsInHour", &[60 * 60]))?,
-            TimeUnit::Milliseconds => self.physical.div(&Int64Array::from_slice(
-                "MillisecondsInHour",
-                &[60 * 60 * 1000],
-            ))?,
-            TimeUnit::Microseconds => self.physical.div(&Int64Array::from_slice(
-                "MicrosecondsInHour",
-                &[60 * 60 * 1_000_000],
-            ))?,
-            TimeUnit::Nanoseconds => self.physical.div(&Int64Array::from_slice(
-                "NanosecondsInHour",
-                &[60 * 60 * 1_000_000_000],
-            ))?,
-        };
-        Ok(hours)
-    }
-
-    pub fn cast_to_days(&self) -> DaftResult<Int64Array> {
-        let tu = match self.data_type() {
-            DataType::Duration(tu) => tu,
-            _ => panic!("Wrong dtype for DurationArray: {}", self.data_type()),
-        };
-        let days = match tu {
-            TimeUnit::Seconds => self
-                .physical
-                .div(&Int64Array::from_slice("SecondsPerDay", &[60 * 60 * 24]))?,
-            TimeUnit::Milliseconds => self.physical.div(&Int64Array::from_slice(
-                "MillisecondsPerDay",
-                &[1_000 * 60 * 60 * 24],
-            ))?,
-            TimeUnit::Microseconds => self.physical.div(&Int64Array::from_slice(
-                "MicrosecondsPerDay",
-                &[1_000_000 * 60 * 60 * 24],
-            ))?,
-            TimeUnit::Nanoseconds => self.physical.div(&Int64Array::from_slice(
-                "NanosecondsPerDay",
-                &[1_000_000_000 * 60 * 60 * 24],
-            ))?,
-        };
-        Ok(days)
     }
 }
 
-impl<T> FileArray<T>
-where
-    T: DaftMediaType,
-{
+impl Decimal128Array {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
-        use daft_schema::media_type::MediaType::*;
         match dtype {
-            DataType::File(media_type) => match (media_type, T::get_type()) {
-                (Unknown, Unknown)
-                | (Video, Video)
-                | (Audio, Audio)
-                | (Image, Image)
-                | (Hdf5, Hdf5) => Ok(self.clone().into_series()),
-                (Unknown, Video) | (Unknown, Audio) | (Unknown, Image) | (Unknown, Hdf5) => {
-                    Ok(self.clone().change_type::<MediaTypeUnknown>().into_series())
-                }
-                (Video, Unknown) => Ok(self.clone().change_type::<MediaTypeVideo>().into_series()),
-                (Audio, Unknown) => Ok(self.clone().change_type::<MediaTypeAudio>().into_series()),
-                (Image, Unknown) => Ok(self.clone().change_type::<MediaTypeImage>().into_series()),
-                (Hdf5, Unknown) => Ok(self.clone().change_type::<MediaTypeHdf5>().into_series()),
-                _ => Err(DaftError::TypeError("invalid cast".to_string())),
-            },
-            DataType::Null => {
-                Ok(NullArray::full_null(self.name(), dtype, self.len()).into_series())
-            }
-            dtype if dtype == self.data_type() => Ok(self.clone().into_series()),
-            _ => Err(DaftError::TypeError("invalid cast".to_string())),
+            #[cfg(feature = "python")]
+            DataType::Python => cast_logical_to_python_array(self, dtype),
+            DataType::Int128 => Ok(self.physical.clone().into_series()),
+            _ => arrow_logical_cast(self, dtype),
         }
     }
 }
 
 #[cfg(feature = "python")]
-impl PythonArray {
-    pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
-        if dtype.is_python() {
-            return Ok(self.clone().into_series());
+macro_rules! pycast_then_arrowcast {
+    ($self:expr, $daft_type:expr, $pytype_str:expr) => {
+        {
+            let old_pyseries = PySeries::from($self.clone().into_series());
+
+            let new_pyseries = Python::with_gil(|py| -> PyResult<PySeries> {
+                let old_daft_series = {
+                    PyModule::import(py, pyo3::intern!(py, "daft.series"))?
+                        .getattr(pyo3::intern!(py, "Series"))?
+                        .getattr(pyo3::intern!(py, "_from_pyseries"))?
+                        .call1((old_pyseries,))?
+                };
+
+                let py_type_fn = {
+                    PyModule::import(py, pyo3::intern!(py, "builtins"))?
+                        .getattr(pyo3::intern!(py, $pytype_str))?
+                };
+
+                old_daft_series
+                    .call_method1(
+                        pyo3::intern!(py, "_pycast_to_pynative"),
+                        (py_type_fn,),
+                    )?
+                    .getattr(pyo3::intern!(py, "_series"))?
+                    .extract()
+            })?;
+
+            let new_series: Series = new_pyseries.into();
+
+            if new_series.data_type() == &DataType::Python {
+                panic!("After casting, we expected an Arrow data type castable to {}, but got Python type again", $daft_type)
+            }
+            return new_series.cast(&$daft_type);
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+fn append_values_from_numpy<
+    Tgt: numpy::Element + NumCast + ToPrimitive + arrow2::types::NativeType,
+>(
+    pyarray: &PyAny,
+    index: usize,
+    from_numpy_dtype_fn: &PyAny,
+    enforce_dtype: Option<&DataType>,
+    values_vec: &mut Vec<Tgt>,
+    shapes_vec: &mut Vec<u64>,
+) -> DaftResult<(usize, usize)> {
+    use crate::python::PyDataType;
+    use std::num::Wrapping;
+
+    let np_dtype = pyarray.getattr(pyo3::intern!(pyarray.py(), "dtype"))?;
+
+    let datatype = from_numpy_dtype_fn
+        .call1((np_dtype,))?
+        .getattr(pyo3::intern!(pyarray.py(), "_dtype"))?
+        .extract::<PyDataType>()?;
+    let datatype = datatype.dtype;
+    if let Some(enforce_dtype) = enforce_dtype {
+        if enforce_dtype != &datatype {
+            return Err(DaftError::ValueError(format!(
+                "Expected Numpy array to be of type: {enforce_dtype} but is {datatype} at index: {index}",
+            )));
+        }
+    }
+    if !datatype.is_numeric() {
+        return Err(DaftError::ValueError(format!(
+            "Numpy array has unsupported type {} at index: {index}",
+            datatype
+        )));
+    }
+    with_match_numeric_daft_types!(datatype, |$N| {
+        type Src = <$N as DaftNumericType>::Native;
+        let pyarray: PyReadonlyArrayDyn<'_, Src> = pyarray.extract()?;
+        // All of the conditions given in the ndarray::ArrayView::from_shape_ptr() docstring must be met in order to do
+        // the pyarray.as_array conversion: https://docs.rs/ndarray/0.15.6/ndarray/type.ArrayView.html#method.from_shape_ptr
+        // Relevant:
+        //  1. Must have non-negative strides.
+
+        // TODO(Clark): Double-check that we're covering all bases here for this unsafe handoff.
+        if pyarray.strides().iter().any(|s| *s < 0) {
+            return Err(DaftError::ValueError(format!(
+                "we only support numpy arrays with non-negative strides, but got {:?} at index: {}",
+                pyarray.strides(), index
+            )));
         }
 
-        // TODO: optimize this.
-        // Currently this does PythonArray -> Vec<Literal> -> Series -> Series::cast
-        let literals = Python::attach(|py| {
-            self.values()
-                .iter()
-                .map(|ob| Literal::from_pyobj(ob.bind(py), Some(dtype)))
-                .collect::<PyResult<Vec<Literal>>>()
-        })?;
+        let pyarray = pyarray.as_array();
+        let owned_arr;
+        // Create 1D slice from potentially non-contiguous and non-C-order arrays.
+        // This will only create a copy if the ndarray is non-contiguous.
+        let sl: &[Src] = match pyarray.as_slice_memory_order() {
+            Some(sl) => sl,
+            None => {
+                owned_arr = pyarray.to_owned();
+                owned_arr.as_slice_memory_order().unwrap()
+            }
+        };
+        values_vec.extend(sl.iter().map(|v| <Wrapping<Tgt> as NumCast>::from(*v).unwrap().0));
+        shapes_vec.extend(pyarray.shape().iter().map(|v| *v as u64));
+        Ok((sl.len(), pyarray.shape().len()))
+    })
+}
 
-        Ok(Series::from_literals(literals)?
-            .cast(dtype)?
-            .rename(self.name()))
+type ArrayPayload<Tgt> = (
+    Vec<Tgt>,
+    Option<Vec<i64>>,
+    Option<Vec<u64>>,
+    Option<Vec<i64>>,
+);
+
+#[cfg(feature = "python")]
+fn extract_python_to_vec<
+    Tgt: numpy::Element + NumCast + ToPrimitive + arrow2::types::NativeType,
+>(
+    py: Python<'_>,
+    python_objects: &PythonArray,
+    child_dtype: &DataType,
+    enforce_dtype: Option<&DataType>,
+    list_size: Option<usize>,
+    shape_size: Option<usize>,
+) -> DaftResult<ArrayPayload<Tgt>> {
+    use std::num::Wrapping;
+
+    let mut values_vec: Vec<Tgt> =
+        Vec::with_capacity(list_size.unwrap_or(0) * python_objects.len());
+
+    let mut offsets_vec: Vec<i64> = vec![];
+    let mut shapes_vec: Vec<u64> = vec![];
+    let mut shape_offsets_vec: Vec<i64> = vec![];
+
+    if list_size.is_none() {
+        offsets_vec.reserve(python_objects.len() + 1);
+        offsets_vec.push(0);
+        shape_offsets_vec.reserve(python_objects.len() + 1);
+        shape_offsets_vec.push(0);
+    }
+
+    let from_numpy_dtype = {
+        PyModule::import(py, pyo3::intern!(py, "daft.datatype"))?
+            .getattr(pyo3::intern!(py, "DataType"))?
+            .getattr(pyo3::intern!(py, "from_numpy_dtype"))?
+    };
+
+    let pytype = match child_dtype {
+        dtype if dtype.is_integer() => Ok("int"),
+        dtype if dtype.is_floating() => Ok("float"),
+        dtype => Err(DaftError::ValueError(format!(
+            "We only support numeric types when converting to List or FixedSizeList, got {dtype}"
+        ))),
+    }?;
+
+    let py_type_fn = { PyModule::import(py, pyo3::intern!(py, "builtins"))?.getattr(pytype)? };
+    let py_memory_view = py
+        .import("builtins")?
+        .getattr(pyo3::intern!(py, "memoryview"))?;
+
+    // TODO: use this to extract our the image mode
+    // let py_pil_image_type = py
+    //     .import("PIL.Image")
+    //     .and_then(|m| m.getattr(pyo3::intern!(py, "Image")));
+
+    for (i, object) in python_objects.as_arrow().iter().enumerate() {
+        if let Some(object) = object {
+            let object = object.into_py(py);
+            let object = object.as_ref(py);
+
+            let supports_buffer_protocol = py_memory_view.call1((object,)).is_ok();
+            let supports_array_interface_protocol =
+                object.hasattr(pyo3::intern!(py, "__array_interface__"))?;
+            let supports_array_protocol = object.hasattr(pyo3::intern!(py, "__array__"))?;
+
+            if supports_buffer_protocol
+                || supports_array_interface_protocol
+                || supports_array_protocol
+            {
+                // Path if object supports buffer/array protocols.
+                let np_as_array_fn = py.import("numpy")?.getattr(pyo3::intern!(py, "asarray"))?;
+                let pyarray = np_as_array_fn.call1((object,))?;
+                let (num_values, shape_size) = append_values_from_numpy(
+                    pyarray,
+                    i,
+                    from_numpy_dtype,
+                    enforce_dtype,
+                    &mut values_vec,
+                    &mut shapes_vec,
+                )?;
+                if let Some(list_size) = list_size {
+                    if num_values != list_size {
+                        return Err(DaftError::ValueError(format!(
+                                "Expected Array-like Object to have {list_size} elements but got {} at index {}",
+                                num_values, i
+                            )));
+                    }
+                } else {
+                    offsets_vec.push(offsets_vec.last().unwrap() + num_values as i64);
+                    shape_offsets_vec.push(shape_offsets_vec.last().unwrap() + shape_size as i64);
+                }
+            } else {
+                // Path if object does not support buffer/array protocols.
+                // Try a best-effort conversion of the elements.
+                let pyiter = object.iter();
+                if let Ok(pyiter) = pyiter {
+                    // has an iter
+                    let casted_iter = pyiter.map(|v| v.and_then(|f| py_type_fn.call1((f,))));
+                    let collected = if child_dtype.is_integer() {
+                        let int_iter = casted_iter
+                            .map(|v| v.and_then(|v| v.extract::<i64>()))
+                            .map(|v| {
+                                v.and_then(|v| {
+                                    <Wrapping<Tgt> as NumCast>::from(v).ok_or(
+                                        DaftError::ComputeError(format!(
+                                            "Could not convert pyint to i64 at index {i}"
+                                        ))
+                                        .into(),
+                                    )
+                                })
+                            })
+                            .map(|v| v.map(|v| v.0));
+
+                        int_iter.collect::<PyResult<Vec<_>>>()
+                    } else if child_dtype.is_floating() {
+                        let float_iter = casted_iter
+                            .map(|v| v.and_then(|v| v.extract::<f64>()))
+                            .map(|v| {
+                                v.and_then(|v| {
+                                    <Wrapping<Tgt> as NumCast>::from(v).ok_or(
+                                        DaftError::ComputeError(
+                                            "Could not convert pyfloat to f64".into(),
+                                        )
+                                        .into(),
+                                    )
+                                })
+                            })
+                            .map(|v| v.map(|v| v.0));
+                        float_iter.collect::<PyResult<Vec<_>>>()
+                    } else {
+                        unreachable!(
+                            "dtype should either be int or float at this point; this is a bug"
+                        );
+                    };
+
+                    if collected.is_err() {
+                        log::warn!("Could not convert python object to list at index: {i} for input series: {}", python_objects.name())
+                    }
+                    let collected: Vec<Tgt> = collected?;
+                    if let Some(list_size) = list_size {
+                        if collected.len() != list_size {
+                            return Err(DaftError::ValueError(format!(
+                                "Expected Array-like Object to have {list_size} elements but got {} at index {}",
+                                collected.len(), i
+                            )));
+                        }
+                    } else {
+                        let offset = offsets_vec.last().unwrap() + collected.len() as i64;
+                        offsets_vec.push(offset);
+                        shapes_vec.extend(vec![1]);
+                        shape_offsets_vec.push(1i64);
+                    }
+                    values_vec.extend_from_slice(collected.as_slice());
+                } else {
+                    return Err(DaftError::ValueError(format!(
+                        "Python Object is neither array-like or an iterable at index {}. Can not convert to a list. object type: {}",
+                        i, object.getattr(pyo3::intern!(py, "__class__"))?)));
+                }
+            }
+        } else if let Some(list_size) = list_size {
+            values_vec.extend(iter::repeat(Tgt::default()).take(list_size));
+        } else {
+            let offset = offsets_vec.last().unwrap();
+            offsets_vec.push(*offset);
+            if let Some(shape_size) = shape_size {
+                shapes_vec.extend(iter::repeat(1).take(shape_size));
+                shape_offsets_vec.push(shape_offsets_vec.last().unwrap() + shape_size as i64);
+            } else {
+                shape_offsets_vec.push(*shape_offsets_vec.last().unwrap());
+            }
+        }
+    }
+    if list_size.is_some() {
+        Ok((values_vec, None, None, None))
+    } else {
+        Ok((
+            values_vec,
+            Some(offsets_vec),
+            Some(shapes_vec),
+            Some(shape_offsets_vec),
+        ))
+    }
+}
+
+#[cfg(feature = "python")]
+fn extract_python_like_to_fixed_size_list<
+    Tgt: numpy::Element + NumCast + ToPrimitive + arrow2::types::NativeType,
+>(
+    py: Python<'_>,
+    python_objects: &PythonArray,
+    child_dtype: &DataType,
+    list_size: usize,
+) -> DaftResult<FixedSizeListArray> {
+    let (values_vec, _, _, _) =
+        extract_python_to_vec::<Tgt>(py, python_objects, child_dtype, None, Some(list_size), None)?;
+
+    let values_array: Box<dyn arrow2::array::Array> =
+        Box::new(arrow2::array::PrimitiveArray::from_vec(values_vec));
+
+    let inner_dtype = child_dtype.to_arrow()?;
+    let list_dtype = arrow2::datatypes::DataType::FixedSizeList(
+        Box::new(arrow2::datatypes::Field::new("item", inner_dtype, true)),
+        list_size,
+    );
+    let daft_type = (&list_dtype).into();
+
+    let list_array = arrow2::array::FixedSizeListArray::new(
+        list_dtype,
+        values_array,
+        python_objects.as_arrow().validity().cloned(),
+    );
+
+    FixedSizeListArray::from_arrow(
+        Arc::new(Field::new(python_objects.name(), daft_type)),
+        Box::new(list_array),
+    )
+}
+
+#[cfg(feature = "python")]
+fn extract_python_like_to_list<
+    Tgt: numpy::Element + NumCast + ToPrimitive + arrow2::types::NativeType,
+>(
+    py: Python<'_>,
+    python_objects: &PythonArray,
+    child_dtype: &DataType,
+) -> DaftResult<ListArray> {
+    let (values_vec, offsets, _, _) =
+        extract_python_to_vec::<Tgt>(py, python_objects, child_dtype, None, None, None)?;
+
+    let offsets = offsets.expect("Offsets should but non-None for dynamic list");
+
+    let values_array: Box<dyn arrow2::array::Array> =
+        Box::new(arrow2::array::PrimitiveArray::from_vec(values_vec));
+
+    let inner_dtype = child_dtype.to_arrow()?;
+
+    let list_dtype = arrow2::datatypes::DataType::LargeList(Box::new(
+        arrow2::datatypes::Field::new("item", inner_dtype, true),
+    ));
+
+    let daft_type = (&list_dtype).into();
+
+    let list_arrow_array = arrow2::array::ListArray::new(
+        list_dtype,
+        arrow2::offset::OffsetsBuffer::try_from(offsets)?,
+        values_array,
+        python_objects.as_arrow().validity().cloned(),
+    );
+
+    ListArray::from_arrow(
+        Arc::new(Field::new(python_objects.name(), daft_type)),
+        Box::new(list_arrow_array),
+    )
+}
+
+#[cfg(feature = "python")]
+fn extract_python_like_to_image_array<
+    Tgt: numpy::Element + NumCast + ToPrimitive + arrow2::types::NativeType,
+>(
+    py: Python<'_>,
+    python_objects: &PythonArray,
+    dtype: &DataType,
+    child_dtype: &DataType,
+    mode_from_dtype: Option<ImageMode>,
+) -> DaftResult<ImageArray> {
+    // 3 dimensions - height x width x channel.
+
+    let shape_size = 3;
+    let (values_vec, offsets, shapes, shape_offsets) = extract_python_to_vec::<Tgt>(
+        py,
+        python_objects,
+        child_dtype,
+        Some(child_dtype),
+        None,
+        Some(shape_size),
+    )?;
+
+    let offsets = offsets.expect("Offsets should but non-None for image struct array");
+    let shapes = shapes.expect("Shapes should be non-None for image struct array");
+    let shape_offsets =
+        shape_offsets.expect("Shape offsets should be non-None for image struct array");
+
+    let validity = python_objects.as_arrow().validity();
+
+    let num_rows = offsets.len() - 1;
+
+    let mut channels = Vec::<u16>::with_capacity(num_rows);
+    let mut heights = Vec::<u32>::with_capacity(num_rows);
+    let mut widths = Vec::<u32>::with_capacity(num_rows);
+    let mut modes = Vec::<u8>::with_capacity(num_rows);
+    for i in 0..num_rows {
+        let is_valid = validity.map_or(true, |v| v.get_bit(i));
+        if !is_valid {
+            // Handle invalid row by populating dummy data.
+            channels.push(1);
+            heights.push(1);
+            widths.push(1);
+            modes.push(mode_from_dtype.unwrap_or(ImageMode::L) as u8);
+            continue;
+        }
+        let shape_start = shape_offsets[i] as usize;
+        let shape_end = shape_offsets[i + 1] as usize;
+        let shape = &mut shapes[shape_start..shape_end].to_owned();
+        if shape.len() == shape_size - 1 {
+            shape.push(1);
+        } else if shape.len() != shape_size {
+            return Err(DaftError::ValueError(format!(
+                "Image expected to have {} dimensions, but has {}. Image shape = {:?}",
+                shape_size,
+                shape.len(),
+                shape,
+            )));
+        }
+        assert!(shape.len() == shape_size);
+        heights.push(
+            shape[0]
+                .try_into()
+                .expect("Image height should fit into a uint16"),
+        );
+        widths.push(
+            shape[1]
+                .try_into()
+                .expect("Image width should fit into a uint16"),
+        );
+        channels.push(
+            shape[2]
+                .try_into()
+                .expect("Number of channels should fit into a uint8"),
+        );
+
+        modes.push(mode_from_dtype.unwrap_or(ImageMode::try_from_num_channels(
+            shape[2].try_into().unwrap(),
+            child_dtype,
+        )?) as u8);
+    }
+    ImageArray::from_vecs(
+        python_objects.name(),
+        dtype.clone(),
+        values_vec,
+        offsets,
+        ImageArraySidecarData {
+            channels,
+            heights,
+            widths,
+            modes,
+            validity: validity.cloned(),
+        },
+    )
+}
+
+#[cfg(feature = "python")]
+fn extract_python_like_to_tensor_array<
+    Tgt: numpy::Element + NumCast + ToPrimitive + arrow2::types::NativeType,
+>(
+    py: Python<'_>,
+    python_objects: &PythonArray,
+    dtype: &DataType,
+    child_dtype: &DataType,
+) -> DaftResult<TensorArray> {
+    let (data, offsets, shapes, shape_offsets) = extract_python_to_vec::<Tgt>(
+        py,
+        python_objects,
+        child_dtype,
+        Some(child_dtype),
+        None,
+        None,
+    )?;
+
+    let offsets = offsets.expect("Offsets should but non-None for image struct array");
+    let shapes = shapes.expect("Shapes should be non-None for image struct array");
+    let shape_offsets =
+        shape_offsets.expect("Shape offsets should be non-None for image struct array");
+
+    let validity = python_objects.as_arrow().validity();
+
+    let name = python_objects.name();
+    if data.is_empty() {
+        // Create an all-null array if the data array is empty.
+        let physical_type = dtype.to_physical();
+        let struct_array = StructArray::empty(name, &physical_type);
+        return Ok(TensorArray::new(
+            Field::new(name, dtype.clone()),
+            struct_array,
+        ));
+    }
+    let offsets = arrow2::offset::OffsetsBuffer::try_from(offsets)?;
+    let arrow_dtype: arrow2::datatypes::DataType = Tgt::PRIMITIVE.into();
+
+    let data_dtype = arrow2::datatypes::DataType::LargeList(Box::new(
+        arrow2::datatypes::Field::new("data", arrow_dtype, true),
+    ));
+    let data_array = Box::new(arrow2::array::ListArray::<i64>::new(
+        data_dtype,
+        offsets,
+        Box::new(arrow2::array::PrimitiveArray::from_vec(data)),
+        validity.cloned(),
+    ));
+    let shapes_dtype = arrow2::datatypes::DataType::LargeList(Box::new(
+        arrow2::datatypes::Field::new("shape", arrow2::datatypes::DataType::UInt64, true),
+    ));
+    let shape_offsets = arrow2::offset::OffsetsBuffer::try_from(shape_offsets)?;
+    let shapes_array = Box::new(arrow2::array::ListArray::<i64>::new(
+        shapes_dtype,
+        shape_offsets,
+        Box::new(arrow2::array::PrimitiveArray::from_vec(shapes)),
+        validity.cloned(),
+    ));
+    let physical_type = dtype.to_physical();
+
+    let struct_array = StructArray::new(
+        Field::new(name, physical_type),
+        vec![
+            ListArray::from_arrow(
+                Arc::new(Field::new("data", data_array.data_type().into())),
+                data_array,
+            )?
+            .into_series(),
+            ListArray::from_arrow(
+                Arc::new(Field::new("shape", shapes_array.data_type().into())),
+                shapes_array,
+            )?
+            .into_series(),
+        ],
+        validity.cloned(),
+    );
+    Ok(TensorArray::new(
+        Field::new(name, dtype.clone()),
+        struct_array,
+    ))
+}
+
+#[cfg(feature = "python")]
+impl PythonArray {
+    pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
+        use crate::python::PySeries;
+        use pyo3::prelude::*;
+        match dtype {
+            DataType::Python => Ok(self.clone().into_series()),
+
+            DataType::Null => {
+                // (Follow Arrow cast behaviour: turn all elements into Null.)
+                let null_array = crate::datatypes::NullArray::full_null(
+                    self.name(),
+                    &DataType::Null,
+                    self.len(),
+                );
+                Ok(null_array.into_series())
+            }
+            DataType::Boolean => pycast_then_arrowcast!(self, DataType::Boolean, "bool"),
+            DataType::Binary => pycast_then_arrowcast!(self, DataType::Binary, "bytes"),
+            DataType::Utf8 => pycast_then_arrowcast!(self, DataType::Utf8, "str"),
+            dt @ DataType::UInt8
+            | dt @ DataType::UInt16
+            | dt @ DataType::UInt32
+            | dt @ DataType::UInt64
+            | dt @ DataType::Int8
+            | dt @ DataType::Int16
+            | dt @ DataType::Int32
+            | dt @ DataType::Int64 => pycast_then_arrowcast!(self, dt, "int"),
+            // DataType::Float16 => todo!(),
+            dt @ DataType::Float32 | dt @ DataType::Float64 => {
+                pycast_then_arrowcast!(self, dt, "float")
+            }
+            DataType::List(child_dtype) => {
+                if !child_dtype.is_numeric() {
+                    return Err(DaftError::ValueError(format!(
+                        "We can only convert numeric python types to List, got {}",
+                        child_dtype
+                    )));
+                }
+                with_match_numeric_daft_types!(child_dtype.as_ref(), |$T| {
+                    type Tgt = <$T as DaftNumericType>::Native;
+                    pyo3::Python::with_gil(|py| {
+                        let result = extract_python_like_to_list::<Tgt>(py, self, child_dtype.as_ref())?;
+                        Ok(result.into_series())
+                    })
+                })
+            }
+            DataType::FixedSizeList(child_dtype, size) => {
+                if !child_dtype.is_numeric() {
+                    return Err(DaftError::ValueError(format!(
+                        "We can only convert numeric python types to FixedSizeList, got {}",
+                        child_dtype,
+                    )));
+                }
+                with_match_numeric_daft_types!(child_dtype.as_ref(), |$T| {
+                    type Tgt = <$T as DaftNumericType>::Native;
+                    pyo3::Python::with_gil(|py| {
+                        let result = extract_python_like_to_fixed_size_list::<Tgt>(py, self, child_dtype.as_ref(), *size)?;
+                        Ok(result.into_series())
+                    })
+                })
+            }
+            DataType::Struct(_) => unimplemented!(),
+            DataType::Embedding(..) => {
+                let result = self.cast(&dtype.to_physical())?;
+                let embedding_array = EmbeddingArray::new(
+                    Field::new(self.name(), dtype.clone()),
+                    result.fixed_size_list()?.clone(),
+                );
+                Ok(embedding_array.into_series())
+            }
+            DataType::Image(mode) => {
+                let inner_dtype = mode.map_or(DataType::UInt8, |m| m.get_dtype());
+                with_match_numeric_daft_types!(inner_dtype, |$T| {
+                    type Tgt = <$T as DaftNumericType>::Native;
+                    pyo3::Python::with_gil(|py| {
+                        let result = extract_python_like_to_image_array::<Tgt>(py, self, dtype, &inner_dtype, *mode)?;
+                        Ok(result.into_series())
+                    })
+                })
+            }
+            DataType::FixedShapeImage(..) => {
+                let result = self.cast(&dtype.to_physical())?;
+                let image_array = FixedShapeImageArray::new(
+                    Field::new(self.name(), dtype.clone()),
+                    result.fixed_size_list()?.clone(),
+                );
+                Ok(image_array.into_series())
+            }
+            DataType::Tensor(inner_dtype) => {
+                with_match_numeric_daft_types!(**inner_dtype, |$T| {
+                    type Tgt = <$T as DaftNumericType>::Native;
+                    pyo3::Python::with_gil(|py| {
+                        let result = extract_python_like_to_tensor_array::<Tgt>(py, self, dtype, &inner_dtype)?;
+                        Ok(result.into_series())
+                    })
+                })
+            }
+            DataType::FixedShapeTensor(..) => {
+                let result = self.cast(&dtype.to_physical())?;
+                let tensor_array = FixedShapeTensorArray::new(
+                    Field::new(self.name(), dtype.clone()),
+                    result.fixed_size_list()?.clone(),
+                );
+                Ok(tensor_array.into_series())
+            }
+            // TODO: Add implementations for these types
+            // DataType::Timestamp(_, _) => $self.timestamp().unwrap().$method($($args),*),
+            dt => unimplemented!("dtype {:?} not supported", dt),
+        }
     }
 }
 
@@ -696,7 +1099,30 @@ impl EmbeddingArray {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
         match (dtype, self.data_type()) {
             #[cfg(feature = "python")]
-            (DataType::Python, _) => self.clone().into_series().cast_to_python(),
+            (DataType::Python, DataType::Embedding(_, size)) => Python::with_gil(|py| {
+                let physical_arrow = self.physical.flat_child.to_arrow();
+                let shape = (self.len(), *size);
+                let pyarrow = py.import("pyarrow")?;
+                // Only go through FFI layer once instead of for every embedding.
+                // We create an ndarray view on the entire embeddings array
+                // buffer sans the validity mask, and then create a subndarray view
+                // for each embedding ndarray in the PythonArray.
+                let py_array = ffi::to_py_array(physical_arrow.with_validity(None), py, pyarrow)?
+                    .call_method1(py, pyo3::intern!(py, "to_numpy"), (false,))?
+                    .call_method1(py, pyo3::intern!(py, "reshape"), (shape,))?;
+                let ndarrays = py_array
+                    .as_ref(py)
+                    .iter()?
+                    .map(|a| a.unwrap().to_object(py))
+                    .collect::<Vec<PyObject>>();
+                let values_array =
+                    PseudoArrowArray::new(ndarrays.into(), self.physical.validity().cloned());
+                Ok(PythonArray::new(
+                    Field::new(self.name(), dtype.clone()).into(),
+                    values_array.to_boxed(),
+                )?
+                .into_series())
+            }),
             (DataType::Tensor(_), DataType::Embedding(inner_dtype, size)) => {
                 let image_shape = vec![*size as u64];
                 let fixed_shape_tensor_dtype =
@@ -716,7 +1142,38 @@ impl ImageArray {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
         match dtype {
             #[cfg(feature = "python")]
-            DataType::Python => self.clone().into_series().cast_to_python(),
+            DataType::Python => Python::with_gil(|py| {
+                let mut ndarrays = Vec::with_capacity(self.len());
+                let da = self.data_array();
+                let ca = self.channel_array();
+                let ha = self.height_array();
+                let wa = self.width_array();
+                let pyarrow = py.import("pyarrow")?;
+                for i in 0..da.len() {
+                    let element = da.get(i);
+                    let shape = (
+                        ha.value(i) as usize,
+                        wa.value(i) as usize,
+                        ca.value(i) as usize,
+                    );
+                    let py_array = match element {
+                        Some(element) => ffi::to_py_array(element.to_arrow(), py, pyarrow)?
+                            .call_method1(py, pyo3::intern!(py, "to_numpy"), (false,))?
+                            .call_method1(py, pyo3::intern!(py, "reshape"), (shape,))?,
+                        None => PyArray3::<u8>::zeros(py, shape.into_dimension(), false)
+                            .deref()
+                            .to_object(py),
+                    };
+                    ndarrays.push(py_array);
+                }
+                let values_array =
+                    PseudoArrowArray::new(ndarrays.into(), self.physical.validity().cloned());
+                Ok(PythonArray::new(
+                    Field::new(self.name(), dtype.clone()).into(),
+                    values_array.to_boxed(),
+                )?
+                .into_series())
+            }),
             DataType::FixedShapeImage(mode, height, width) => {
                 let num_channels = mode.num_channels();
                 let image_shape = vec![*height as u64, *width as u64, num_channels as u64];
@@ -739,42 +1196,42 @@ impl ImageArray {
                     fixed_shape_tensor_array.downcast::<FixedShapeTensorArray>()?;
                 fixed_shape_tensor_array.cast(dtype)
             }
-            DataType::Tensor(inner_dtype) => {
+            DataType::Tensor(_) => {
                 let ndim = 3;
                 let mut shapes = Vec::with_capacity(ndim * self.len());
                 let shape_offsets = (0..=ndim * self.len())
                     .step_by(ndim)
                     .map(|v| v as i64)
-                    .collect::<ScalarBuffer<i64>>();
-                let nulls = self.physical.nulls();
-                let data_series = self
-                    .data_array()
-                    .clone()
-                    .into_series()
-                    .cast(&DataType::List(inner_dtype.clone()))?;
-                let ha = self.heights().values();
-                let wa = self.widths().values();
-                let ca = self.channels().values();
+                    .collect::<Vec<i64>>();
+                let validity = self.physical.validity();
+                let data_array = self.data_array();
+                let ca = self.channel_array();
+                let ha = self.height_array();
+                let wa = self.width_array();
                 for i in 0..self.len() {
-                    shapes.push(ha[i] as u64);
-                    shapes.push(wa[i] as u64);
-                    shapes.push(ca[i] as u64);
+                    shapes.push(ha.value(i) as u64);
+                    shapes.push(wa.value(i) as u64);
+                    shapes.push(ca.value(i) as u64);
                 }
                 let shapes_dtype = DataType::List(Box::new(DataType::UInt64));
-                let shape_offsets = OffsetBuffer::new(shape_offsets);
+                let shape_offsets = arrow2::offset::OffsetsBuffer::try_from(shape_offsets)?;
                 let shapes_array = ListArray::new(
                     Field::new("shape", shapes_dtype),
-                    UInt64Array::from_vec("shape", shapes).into_series(),
+                    UInt64Array::from((
+                        "shape",
+                        Box::new(arrow2::array::PrimitiveArray::from_vec(shapes)),
+                    ))
+                    .into_series(),
                     shape_offsets,
-                    nulls.cloned(),
+                    validity.cloned(),
                 );
 
                 let physical_type = dtype.to_physical();
 
                 let struct_array = StructArray::new(
                     Field::new(self.name(), physical_type),
-                    vec![data_series, shapes_array.into_series()],
-                    nulls.cloned(),
+                    vec![data_array.clone().into_series(), shapes_array.into_series()],
+                    validity.cloned(),
                 );
                 Ok(
                     TensorArray::new(Field::new(self.name(), dtype.clone()), struct_array)
@@ -796,7 +1253,38 @@ impl FixedShapeImageArray {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
         match (dtype, self.data_type()) {
             #[cfg(feature = "python")]
-            (DataType::Python, _) => self.clone().into_series().cast_to_python(),
+            (DataType::Python, DataType::FixedShapeImage(mode, height, width)) => {
+                let physical_arrow = self.physical.flat_child.to_arrow();
+                pyo3::Python::with_gil(|py| {
+                    let shape = (
+                        self.len(),
+                        *height as usize,
+                        *width as usize,
+                        mode.num_channels() as usize,
+                    );
+                    let pyarrow = py.import("pyarrow")?;
+                    // Only go through FFI layer once instead of for every image.
+                    // We create an (N, H, W, C) ndarray view on the entire image array
+                    // buffer sans the validity mask, and then create a subndarray view
+                    // for each image ndarray in the PythonArray.
+                    let py_array =
+                        ffi::to_py_array(physical_arrow.with_validity(None), py, pyarrow)?
+                            .call_method1(py, pyo3::intern!(py, "to_numpy"), (false,))?
+                            .call_method1(py, pyo3::intern!(py, "reshape"), (shape,))?;
+                    let ndarrays = py_array
+                        .as_ref(py)
+                        .iter()?
+                        .map(|a| a.unwrap().to_object(py))
+                        .collect::<Vec<PyObject>>();
+                    let values_array =
+                        PseudoArrowArray::new(ndarrays.into(), self.physical.validity().cloned());
+                    Ok(PythonArray::new(
+                        Field::new(self.name(), dtype.clone()).into(),
+                        values_array.to_boxed(),
+                    )?
+                    .into_series())
+                })
+            }
             (DataType::Tensor(_), DataType::FixedShapeImage(mode, height, width)) => {
                 let num_channels = mode.num_channels();
                 let image_shape = vec![*height as u64, *width as u64, num_channels as u64];
@@ -835,166 +1323,73 @@ impl TensorArray {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
         match dtype {
             #[cfg(feature = "python")]
-            DataType::Python => self.clone().into_series().cast_to_python(),
+            DataType::Python => Python::with_gil(|py| {
+                let mut ndarrays = Vec::with_capacity(self.len());
+                let da = self.data_array();
+                let sa = self.shape_array();
+                let pyarrow = py.import("pyarrow")?;
+                for (arrow_array, shape_array) in (0..self.len()).map(|i| (da.get(i), sa.get(i))) {
+                    if let (Some(arrow_array), Some(shape_array)) = (arrow_array, shape_array) {
+                        let shape_array = shape_array.u64().unwrap().as_arrow();
+                        let shape = shape_array.values().to_vec();
+                        let py_array = ffi::to_py_array(arrow_array.to_arrow(), py, pyarrow)?
+                            .call_method1(py, pyo3::intern!(py, "to_numpy"), (false,))?
+                            .call_method1(py, pyo3::intern!(py, "reshape"), (shape,))?;
+                        ndarrays.push(py_array);
+                    } else {
+                        ndarrays.push(py.None())
+                    }
+                }
+                let values_array =
+                    PseudoArrowArray::new(ndarrays.into(), self.physical.validity().cloned());
+                Ok(PythonArray::new(
+                    Field::new(self.name(), dtype.clone()).into(),
+                    values_array.to_boxed(),
+                )?
+                .into_series())
+            }),
             DataType::FixedShapeTensor(inner_dtype, shape) => {
                 let da = self.data_array();
                 let sa = self.shape_array();
                 if !(0..self.len()).map(|i| sa.get(i)).all(|s| {
-                    s.is_none_or(|s| {
+                    s.map_or(true, |s| {
                         s.u64()
                             .unwrap()
-                            .into_iter()
-                            .eq(shape.iter().copied().map(Some))
+                            .as_arrow()
+                            .iter()
+                            .eq(shape.iter().map(Some))
                     })
                 }) {
                     return Err(DaftError::TypeError(format!(
                         "Can not cast Tensor array to FixedShapeTensor array with type {:?}: Tensor array has shapes different than {:?};",
-                        dtype, shape,
+                        dtype,
+                        shape,
                     )));
                 }
                 let size = shape.iter().product::<u64>() as usize;
 
-                let result = da
-                    .cast(&DataType::FixedSizeList(
-                        Box::new(inner_dtype.as_ref().clone()),
-                        size,
-                    ))?
-                    .rename(self.name());
+                let result = da.cast(&DataType::FixedSizeList(
+                    Box::new(inner_dtype.as_ref().clone()),
+                    size,
+                ))?;
                 let tensor_array = FixedShapeTensorArray::new(
                     Field::new(self.name(), dtype.clone()),
                     result.fixed_size_list().unwrap().clone(),
                 );
                 Ok(tensor_array.into_series())
             }
-            DataType::Embedding(inner_dtype, length) => self
-                .cast(&DataType::FixedShapeTensor(
-                    inner_dtype.clone(),
-                    vec![*length as u64],
-                ))?
-                .cast(dtype),
-            DataType::List(_) => self.data_array().cast(dtype),
-            DataType::FixedSizeList(inner_dtype, length) => self
-                .cast(&DataType::FixedShapeTensor(
-                    inner_dtype.clone(),
-                    vec![*length as u64],
-                ))?
-                .cast(dtype),
-            DataType::SparseTensor(inner_dtype, use_offset_indices) => {
-                let shape_iterator = self.shape_array().into_iter();
-                let data_iterator = self.data_array().into_iter();
-                let nulls = self.data_array().nulls();
-                let shape_and_data_iter = shape_iterator.zip(data_iterator);
-                let zero_series = Int64Array::from_slice("item", &[0]).into_series();
-                let mut non_zero_values = Vec::new();
-                let mut non_zero_indices = Vec::new();
-                for (i, (shape_series, data_series)) in shape_and_data_iter.enumerate() {
-                    let is_valid = nulls.is_none_or(|v| v.is_valid(i));
-                    if !is_valid {
-                        // Handle invalid row by populating dummy data.
-                        non_zero_values.push(Series::empty("dummy", inner_dtype.as_ref()));
-                        non_zero_indices.push(Series::empty("dummy", &DataType::UInt64));
-                        continue;
-                    }
-                    let shape_series = shape_series.unwrap();
-                    let data_series = data_series.unwrap();
-                    let shape_array = shape_series.u64().unwrap();
-                    assert_eq!(
-                        data_series.len(),
-                        shape_array.into_iter().flatten().product::<u64>() as usize
-                    );
-                    let non_zero_mask = data_series.not_equal(&zero_series)?;
-                    let data = data_series.filter(&non_zero_mask)?;
-                    let indices = UInt64Array::arange("item", 0, data_series.len() as i64, 1)?
-                        .into_series()
-                        .filter(&non_zero_mask)?;
-                    let indices_arr = match use_offset_indices {
-                        true => {
-                            let offsets_values = indices
-                                .u64()?
-                                .as_slice()
-                                .iter()
-                                .scan(0, |previous, &current| {
-                                    let offset = current - *previous;
-                                    *previous = current;
-                                    Some(offset)
-                                })
-                                .collect::<Vec<_>>();
-                            UInt64Array::from_slice("item", offsets_values.as_slice()).into_series()
-                        }
-                        false => indices,
-                    };
-                    non_zero_values.push(data);
-                    non_zero_indices.push(indices_arr);
-                }
-
-                let offsets = OffsetBuffer::from_lengths(non_zero_values.iter().map(|s| s.len()));
-                let non_zero_values_series =
-                    Series::concat(&non_zero_values.iter().collect::<Vec<&Series>>())?;
-                let non_zero_indices_series =
-                    Series::concat(&non_zero_indices.iter().collect::<Vec<&Series>>())?;
-                let offsets_cloned = offsets.clone();
-                let data_list_arr = ListArray::new(
-                    Field::new(
-                        "values",
-                        DataType::List(Box::new(non_zero_values_series.data_type().clone())),
-                    ),
-                    non_zero_values_series,
-                    offsets.into(),
-                    nulls.cloned(),
-                );
-                let indices_list_arr = ListArray::new(
-                    Field::new(
-                        "indices",
-                        DataType::List(Box::new(non_zero_indices_series.data_type().clone())),
-                    ),
-                    non_zero_indices_series,
-                    offsets_cloned.into(),
-                    nulls.cloned(),
-                );
-                // Shapes must be all valid to reproduce dense tensor.
-                let all_valid_shape_array = self.shape_array().with_nulls(None)?;
-                let sparse_struct_array = StructArray::new(
-                    Field::new(self.name(), dtype.to_physical()),
-                    vec![
-                        data_list_arr.into_series(),
-                        indices_list_arr.into_series(),
-                        all_valid_shape_array.into_series(),
-                    ],
-                    nulls.cloned(),
-                );
-                Ok(SparseTensorArray::new(
-                    Field::new(sparse_struct_array.name(), dtype.clone()),
-                    sparse_struct_array,
-                )
-                .into_series())
-            }
             DataType::Image(mode) => {
-                let DataType::Tensor(inner_dtype) = self.data_type() else {
-                    unreachable!("TensorArray should have Tensor datatype")
-                };
-
-                if let Some(m) = mode
-                    && **inner_dtype != m.get_dtype()
-                {
-                    return Err(DaftError::TypeError(format!(
-                        "Images with mode {} can only be created from tensors of type {}, found {}",
-                        m,
-                        m.get_dtype(),
-                        inner_dtype
-                    )));
-                }
-
                 let sa = self.shape_array();
                 if !(0..self.len()).map(|i| sa.get(i)).all(|s| {
-                    s.is_none_or(|s| {
+                    s.map_or(true, |s| {
                         if s.len() != 3 && s.len() != 2 {
                             // Images must have 2 or 3 dimensions: height x width or height x width x channel.
                             // If image is 2 dimensions, 8-bit grayscale is assumed.
                             return false;
                         }
-                        if let Some(mode) = mode
-                            && s.u64().unwrap().get(s.len() - 1).unwrap()
-                                != mode.num_channels() as u64
+                        if let Some(mode) = mode && s.u64().unwrap().as_arrow()
+                            .get(s.len() - 1)
+                            .unwrap() != mode.num_channels() as u64
                         {
                             // If type-level mode is defined, each image must have the implied number of channels.
                             return false;
@@ -1013,9 +1408,9 @@ impl TensorArray {
                 let mut widths = Vec::<u32>::with_capacity(num_rows);
                 let mut modes = Vec::<u8>::with_capacity(num_rows);
                 let da = self.data_array();
-                let nulls = da.nulls();
+                let validity = da.validity();
                 for i in 0..num_rows {
-                    let is_valid = nulls.is_none_or(|v| v.is_valid(i));
+                    let is_valid = validity.map_or(true, |v| v.get_bit(i));
                     if !is_valid {
                         // Handle invalid row by populating dummy data.
                         channels.push(1);
@@ -1025,8 +1420,8 @@ impl TensorArray {
                         continue;
                     }
                     let shape = sa.get(i).unwrap();
-                    let shape = shape.u64().unwrap();
-                    assert!(shape.nulls().is_none_or(|v| v.iter().all(|b| b)));
+                    let shape = shape.u64().unwrap().as_arrow();
+                    assert!(shape.validity().map_or(true, |v| v.iter().all(|b| b)));
                     let mut shape = shape.values().to_vec();
                     if shape.len() == 2 {
                         // Add unit channel dimension to grayscale height x width image.
@@ -1070,7 +1465,7 @@ impl TensorArray {
                         heights,
                         widths,
                         modes,
-                        nulls: nulls.cloned(),
+                        validity: validity.cloned(),
                     },
                 )?
                 .into_series())
@@ -1102,248 +1497,38 @@ impl TensorArray {
     }
 }
 
-fn cast_sparse_to_dense_for_inner_dtype(
-    inner_dtype: &DataType,
-    n_values: usize,
-    non_zero_indices_array: &ListArray,
-    non_zero_values_array: &ListArray,
-    offsets: &OffsetBuffer<i64>,
-    use_offset_indices: bool,
-) -> DaftResult<Series> {
-    let item: Series = with_match_numeric_daft_types!(inner_dtype, |$T| {
-            let mut values = vec![<<$T as DaftNumericType>::Native as num_traits::Zero>::zero(); n_values];
-            let nulls = non_zero_values_array.nulls();
-            for i in 0..non_zero_values_array.len() {
-                let is_valid = nulls.is_none_or(|v| v.is_valid(i));
-                if !is_valid {
-                    continue;
-                }
-                let index_series: Series = non_zero_indices_array.get(i).unwrap().cast(&DataType::UInt64)?;
-                let index_array = index_series.u64().unwrap();
-                let values_series: Series = non_zero_values_array.get(i).unwrap();
-                let values_da = values_series.downcast::<<$T as DaftDataType>::ArrayType>()
-                .unwrap();
-                let list_start_offset = offsets.inner()[i] as usize;
-                if use_offset_indices {
-                    let mut old_idx: u64 = 0;
-                    for (idx, val) in index_array.into_iter().zip(values_da.into_iter()) {
-                        let current_idx = idx.unwrap() + old_idx;
-                        old_idx = current_idx;
-                        values[list_start_offset + current_idx as usize] = val.unwrap();
-                    }
-                } else {
-                    for (idx, val) in index_array.into_iter().zip(values_da.into_iter()) {
-                        values[list_start_offset + idx.unwrap() as usize] = val.unwrap();
-                    }
-                }
-            }
-            DataArray::<$T>::from_vec("item", values).into_series()
-    });
-    Ok(item)
-}
-
-fn minimal_uint_dtype(value: u64) -> DataType {
-    if u8::try_from(value).is_ok() {
-        DataType::UInt8
-    } else if u16::try_from(value).is_ok() {
-        DataType::UInt16
-    } else if u32::try_from(value).is_ok() {
-        DataType::UInt32
-    } else {
-        DataType::UInt64
-    }
-}
-
-impl SparseTensorArray {
-    pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
-        match (dtype, self.data_type()) {
-            (DataType::Tensor(_), DataType::SparseTensor(inner_dtype, use_offset_indices)) => {
-                let non_zero_values_array = self.values_array();
-                let non_zero_indices_array = self.indices_array();
-                let shape_array = self.shape_array();
-                let sizes_vec: Vec<usize> = shape_array
-                    .into_iter()
-                    .map(|shape| {
-                        shape.map_or(0, |shape| {
-                            let shape = shape.u64().unwrap();
-                            shape.values().into_iter().product::<u64>() as usize
-                        })
-                    })
-                    .collect();
-                let offsets = OffsetBuffer::from_lengths(sizes_vec.iter().copied());
-                let n_values = sizes_vec.iter().sum::<usize>();
-                let nulls = non_zero_indices_array.nulls();
-                let item = cast_sparse_to_dense_for_inner_dtype(
-                    inner_dtype,
-                    n_values,
-                    non_zero_indices_array,
-                    non_zero_values_array,
-                    &offsets,
-                    *use_offset_indices,
-                )?;
-                let list_arr = ListArray::new(
-                    Field::new(
-                        "data",
-                        DataType::List(Box::new(inner_dtype.as_ref().clone())),
-                    ),
-                    item,
-                    offsets.into(),
-                    nulls.cloned(),
-                )
-                .into_series();
-                let physical_type = dtype.to_physical();
-                let struct_array = StructArray::new(
-                    Field::new(self.name(), physical_type),
-                    vec![list_arr, shape_array.clone().into_series()],
-                    nulls.cloned(),
-                );
-                Ok(
-                    TensorArray::new(Field::new(self.name(), dtype.clone()), struct_array)
-                        .into_series(),
-                )
-            }
-            (
-                DataType::FixedShapeSparseTensor(_, shape, _),
-                DataType::SparseTensor(inner_dtype, _),
-            ) => {
-                let sa = self.shape_array();
-                let va = self.values_array();
-                let ia = self.indices_array();
-                if !(0..self.len()).map(|i| sa.get(i)).all(|s| {
-                    s.is_none_or(|s| {
-                        s.u64()
-                            .unwrap()
-                            .into_iter()
-                            .eq(shape.iter().copied().map(Some))
-                    })
-                }) {
-                    return Err(DaftError::TypeError(format!(
-                        "Can not cast SparseTensor array to FixedShapeSparseTensor array with type {:?}: Tensor array has shapes different than {:?};",
-                        dtype, shape,
-                    )));
-                }
-
-                let largest_index = std::cmp::max(shape.iter().product::<u64>(), 1) - 1;
-                let indices_minimal_inner_dtype = minimal_uint_dtype(largest_index);
-                let values_array =
-                    va.cast(&DataType::List(Box::new(inner_dtype.as_ref().clone())))?;
-                let indices_array =
-                    ia.cast(&DataType::List(Box::new(indices_minimal_inner_dtype)))?;
-                let struct_array = StructArray::new(
-                    Field::new(self.name(), dtype.to_physical()),
-                    vec![values_array, indices_array],
-                    va.nulls().cloned(),
-                );
-                let sparse_tensor_array = FixedShapeSparseTensorArray::new(
-                    Field::new(self.name(), dtype.clone()),
-                    struct_array,
-                );
-                Ok(sparse_tensor_array.into_series())
-            }
-            #[cfg(feature = "python")]
-            (DataType::Python, _) => self.clone().into_series().cast_to_python(),
-            (_, _) => self.physical.cast(dtype),
-        }
-    }
-}
-
-impl FixedShapeSparseTensorArray {
-    pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
-        match (dtype, self.data_type()) {
-            (
-                DataType::SparseTensor(_, _),
-                DataType::FixedShapeSparseTensor(inner_dtype, tensor_shape, _),
-            ) => {
-                let ndim = tensor_shape.len();
-                let shapes = tensor_shape
-                    .iter()
-                    .cycle()
-                    .copied()
-                    .take(ndim * self.len())
-                    .collect();
-                let shape_offsets = (0..=ndim * self.len())
-                    .step_by(ndim)
-                    .map(|v| v as i64)
-                    .collect::<ScalarBuffer<i64>>();
-
-                let nulls = self.physical.nulls();
-
-                let va = self.values_array();
-                let ia = self.indices_array();
-
-                let values_arr =
-                    va.cast(&DataType::List(Box::new(inner_dtype.as_ref().clone())))?;
-                let indices_arr = ia.cast(&DataType::List(Box::new(DataType::UInt64)))?;
-
-                // List -> Struct
-                let shape_offsets = OffsetBuffer::new(shape_offsets);
-                let shapes_array = ListArray::new(
-                    Field::new("shape", DataType::List(Box::new(DataType::UInt64))),
-                    UInt64Array::from_vec("shape", shapes).into_series(),
-                    shape_offsets,
-                    nulls.cloned(),
-                );
-                let physical_type = dtype.to_physical();
-                let struct_array = StructArray::new(
-                    Field::new(self.name(), physical_type),
-                    vec![values_arr, indices_arr, shapes_array.into_series()],
-                    nulls.cloned(),
-                );
-                Ok(
-                    SparseTensorArray::new(Field::new(self.name(), dtype.clone()), struct_array)
-                        .into_series(),
-                )
-            }
-            (
-                DataType::FixedShapeTensor(_, target_tensor_shape),
-                DataType::FixedShapeSparseTensor(inner_dtype, tensor_shape, use_offset_indices),
-            ) => {
-                let non_zero_values_array = self.values_array();
-                let non_zero_indices_array = self.indices_array();
-                let size = tensor_shape.iter().product::<u64>() as usize;
-                let target_size = target_tensor_shape.iter().product::<u64>() as usize;
-                if size != target_size {
-                    return Err(DaftError::TypeError(format!(
-                        "Can not cast FixedShapeSparseTensor array to FixedShapeTensor array with type {:?}: FixedShapeSparseTensor array has shapes different than {:?};",
-                        dtype, tensor_shape,
-                    )));
-                }
-                let n_values = size * non_zero_values_array.len();
-                let offsets = OffsetBuffer::from_repeated_length(target_size, self.len());
-
-                let item = cast_sparse_to_dense_for_inner_dtype(
-                    inner_dtype,
-                    n_values,
-                    non_zero_indices_array,
-                    non_zero_values_array,
-                    &offsets,
-                    *use_offset_indices,
-                )?;
-                let nulls = non_zero_values_array.nulls();
-                let physical = FixedSizeListArray::new(
-                    Field::new(
-                        self.name(),
-                        DataType::FixedSizeList(Box::new(inner_dtype.as_ref().clone()), size),
-                    ),
-                    item,
-                    nulls.cloned(),
-                );
-                let fixed_shape_tensor_array =
-                    FixedShapeTensorArray::new(Field::new(self.name(), dtype.clone()), physical);
-                Ok(fixed_shape_tensor_array.into_series())
-            }
-            #[cfg(feature = "python")]
-            (DataType::Python, _) => self.clone().into_series().cast_to_python(),
-            (_, _) => self.physical.cast(dtype),
-        }
-    }
-}
-
 impl FixedShapeTensorArray {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
         match (dtype, self.data_type()) {
             #[cfg(feature = "python")]
-            (DataType::Python, _) => self.clone().into_series().cast_to_python(),
+            (DataType::Python, DataType::FixedShapeTensor(_, shape)) => {
+                let physical_arrow = self.physical.flat_child.to_arrow();
+                pyo3::Python::with_gil(|py| {
+                    let pyarrow = py.import("pyarrow")?;
+                    let mut np_shape: Vec<u64> = vec![self.len() as u64];
+                    np_shape.extend(shape);
+                    // Only go through FFI layer once instead of for every tensor element.
+                    // We create an (N, [shape..]) ndarray view on the entire tensor array buffer
+                    // sans the validity mask, and then create a subndarray view for each ndarray
+                    // element in the PythonArray.
+                    let py_array =
+                        ffi::to_py_array(physical_arrow.with_validity(None), py, pyarrow)?
+                            .call_method1(py, pyo3::intern!(py, "to_numpy"), (false,))?
+                            .call_method1(py, pyo3::intern!(py, "reshape"), (np_shape,))?;
+                    let ndarrays = py_array
+                        .as_ref(py)
+                        .iter()?
+                        .map(|a| a.unwrap().to_object(py))
+                        .collect::<Vec<PyObject>>();
+                    let values_array =
+                        PseudoArrowArray::new(ndarrays.into(), self.physical.validity().cloned());
+                    Ok(PythonArray::new(
+                        Field::new(self.name(), dtype.clone()).into(),
+                        values_array.to_boxed(),
+                    )?
+                    .into_series())
+                })
+            }
             (DataType::Tensor(_), DataType::FixedShapeTensor(inner_dtype, tensor_shape)) => {
                 let ndim = tensor_shape.len();
                 let shapes = tensor_shape
@@ -1355,10 +1540,10 @@ impl FixedShapeTensorArray {
                 let shape_offsets = (0..=ndim * self.len())
                     .step_by(ndim)
                     .map(|v| v as i64)
-                    .collect::<ScalarBuffer<i64>>();
+                    .collect::<Vec<i64>>();
 
                 let physical_arr = &self.physical;
-                let nulls = self.physical.nulls();
+                let validity = self.physical.validity();
 
                 // FixedSizeList -> List
                 let list_arr = physical_arr
@@ -1366,111 +1551,29 @@ impl FixedShapeTensorArray {
                     .rename("data");
 
                 // List -> Struct
-                let shape_offsets = OffsetBuffer::new(shape_offsets);
+                let shape_offsets = arrow2::offset::OffsetsBuffer::try_from(shape_offsets)?;
                 let shapes_array = ListArray::new(
                     Field::new("shape", DataType::List(Box::new(DataType::UInt64))),
-                    UInt64Array::from_vec("shape", shapes).into_series(),
+                    Series::try_from((
+                        "shape",
+                        Box::new(arrow2::array::PrimitiveArray::from_vec(shapes))
+                            as Box<dyn arrow2::array::Array>,
+                    ))?,
                     shape_offsets,
-                    nulls.cloned(),
+                    validity.cloned(),
                 );
                 let physical_type = dtype.to_physical();
                 let struct_array = StructArray::new(
                     Field::new(self.name(), physical_type),
                     vec![list_arr, shapes_array.into_series()],
-                    nulls.cloned(),
+                    validity.cloned(),
                 );
                 Ok(
                     TensorArray::new(Field::new(self.name(), dtype.clone()), struct_array)
                         .into_series(),
                 )
             }
-            (
-                DataType::FixedShapeSparseTensor(_, _, use_offset_indices),
-                DataType::FixedShapeTensor(inner_dtype, tensor_shape),
-            ) => {
-                let physical_arr = &self.physical;
-                let nulls = self.physical.nulls();
-                let zero_series = Int64Array::from_slice("item", &[0]).into_series();
-                let mut non_zero_values = Vec::new();
-                let mut non_zero_indices = Vec::new();
-                for (i, data_series) in physical_arr.into_iter().enumerate() {
-                    let is_valid = nulls.is_none_or(|v| v.is_valid(i));
-                    if !is_valid {
-                        // Handle invalid row by populating dummy data.
-                        non_zero_values.push(Series::empty("dummy", inner_dtype.as_ref()));
-                        non_zero_indices.push(Series::empty("dummy", &DataType::UInt64));
-                        continue;
-                    }
-                    let data_series = data_series.unwrap();
-                    assert_eq!(
-                        data_series.len(),
-                        tensor_shape.iter().product::<u64>() as usize
-                    );
-                    let non_zero_mask = data_series.not_equal(&zero_series)?;
-                    let data = data_series.filter(&non_zero_mask)?;
-                    let indices = UInt64Array::arange("item", 0, data_series.len() as i64, 1)?
-                        .into_series()
-                        .filter(&non_zero_mask)?;
-                    let indices_arr = match use_offset_indices {
-                        true => {
-                            let offsets_values = indices
-                                .u64()?
-                                .as_slice()
-                                .iter()
-                                .scan(0, |previous, &current| {
-                                    let offset = current - *previous;
-                                    *previous = current;
-                                    Some(offset)
-                                })
-                                .collect::<Vec<_>>();
-                            UInt64Array::from_vec("item", offsets_values).into_series()
-                        }
-                        false => indices,
-                    };
-                    non_zero_values.push(data);
-                    non_zero_indices.push(indices_arr);
-                }
-                let offsets = OffsetBuffer::from_lengths(non_zero_values.iter().map(|s| s.len()));
-                let non_zero_values_series =
-                    Series::concat(&non_zero_values.iter().collect::<Vec<&Series>>())?;
-                let non_zero_indices_series =
-                    Series::concat(&non_zero_indices.iter().collect::<Vec<&Series>>())?;
-                let offsets_cloned = offsets.clone();
-                let data_list_arr = ListArray::new(
-                    Field::new(
-                        "values",
-                        DataType::List(Box::new(non_zero_values_series.data_type().clone())),
-                    ),
-                    non_zero_values_series,
-                    offsets.into(),
-                    nulls.cloned(),
-                );
-                let indices_list_arr = ListArray::new(
-                    Field::new(
-                        "indices",
-                        DataType::List(Box::new(non_zero_indices_series.data_type().clone())),
-                    ),
-                    non_zero_indices_series,
-                    offsets_cloned.into(),
-                    nulls.cloned(),
-                );
-
-                let largest_index = std::cmp::max(tensor_shape.iter().product::<u64>(), 1) - 1;
-                let indices_minimal_inner_dtype = minimal_uint_dtype(largest_index);
-                let casted_indices = indices_list_arr
-                    .cast(&DataType::List(Box::new(indices_minimal_inner_dtype)))?;
-
-                let sparse_struct_array = StructArray::new(
-                    Field::new(self.name(), dtype.to_physical()),
-                    vec![data_list_arr.into_series(), casted_indices],
-                    nulls.cloned(),
-                );
-                Ok(FixedShapeSparseTensorArray::new(
-                    Field::new(sparse_struct_array.name(), dtype.clone()),
-                    sparse_struct_array,
-                )
-                .into_series())
-            }
+            // NOTE(Clark): Casting to FixedShapeImage is supported by the physical array cast.
             (_, _) => self.physical.cast(dtype),
         }
     }
@@ -1488,22 +1591,31 @@ impl FixedSizeListArray {
                     )));
                 }
                 let casted_child = self.flat_child.cast(child_dtype.as_ref())?;
-                Ok(Self::new(
+                Ok(FixedSizeListArray::new(
                     Field::new(self.name().to_string(), dtype.clone()),
                     casted_child,
-                    self.nulls().cloned(),
+                    self.validity().cloned(),
                 )
                 .into_series())
             }
             DataType::List(child_dtype) => {
                 let element_size = self.fixed_element_len();
                 let casted_child = self.flat_child.cast(child_dtype.as_ref())?;
-                let offsets = OffsetBuffer::from_repeated_length(element_size, self.len());
+                let offsets: Offsets<i64> = match self.validity() {
+                    None => Offsets::try_from_iter(repeat(element_size).take(self.len()))?,
+                    Some(validity) => Offsets::try_from_iter(validity.iter().map(|v| {
+                        if v {
+                            element_size
+                        } else {
+                            0
+                        }
+                    }))?,
+                };
                 Ok(ListArray::new(
                     Field::new(self.name().to_string(), dtype.clone()),
                     casted_child,
                     offsets.into(),
-                    self.nulls().cloned(),
+                    self.validity().cloned(),
                 )
                 .into_series())
             }
@@ -1522,14 +1634,6 @@ impl FixedSizeListArray {
                         dtype
                     )));
                 }
-                // TODO [mg]: I recall in testing that this shape is wrong. It flattens everything.
-                //            It needs to preserve the shape! Otherwise it is *strictly wrong*.
-                //            Why is this occurring when it deserializes??
-                //            Need to figure out how to trace the data flow / debug so I can
-                //            see where this incorrect decision occurs. Maybe because Parquet
-                //            saves it as a big ol' fixed list? We need to recognize this
-                //            by saving the type + shape in the Arrow schema, recognizing this, and
-                //            deserializing into a real n-dimensional tensor!
                 Ok(FixedShapeTensorArray::new(
                     Field::new(self.name().to_string(), dtype.clone()),
                     self.clone(),
@@ -1550,38 +1654,6 @@ impl FixedSizeListArray {
                 )
                 .into_series())
             }
-            DataType::Embedding(child_dtype, dimensionality) => {
-                if **child_dtype != *self.child_data_type() {
-                    return Err(DaftError::TypeError(format!(
-                        "Cannot cast {} to {}: mismatched child type. Found {} but expected {}",
-                        self.data_type(),
-                        dtype,
-                        child_dtype.as_ref(),
-                        self.child_data_type(),
-                    )));
-                }
-                if *dimensionality != self.fixed_element_len() {
-                    return Err(DaftError::TypeError(format!(
-                        "Cannot cast {} to {}: mismatched sizes. Found {} but expected {}",
-                        self.data_type(),
-                        dtype,
-                        dimensionality,
-                        self.fixed_element_len(),
-                    )));
-                }
-                Ok(EmbeddingArray::new(
-                    Field::new(self.name().to_string(), dtype.clone()),
-                    self.clone(),
-                )
-                .into_series())
-            }
-            DataType::Extension(name, storage_type, metadata) => {
-                let casted_to_storage = self.cast(storage_type.as_ref())?;
-                Ok(
-                    ExtensionArray::from_series(&casted_to_storage, name, metadata.as_deref())?
-                        .into_series(),
-                )
-            }
             _ => unimplemented!("FixedSizeList casting not implemented for dtype: {}", dtype),
         }
     }
@@ -1590,21 +1662,21 @@ impl FixedSizeListArray {
 impl ListArray {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
         match dtype {
-            DataType::List(child_dtype) => Ok(Self::new(
+            DataType::List(child_dtype) => Ok(ListArray::new(
                 Field::new(self.name(), dtype.clone()),
                 self.flat_child.cast(child_dtype.as_ref())?,
                 self.offsets().clone(),
-                self.nulls().cloned(),
+                self.validity().cloned(),
             )
             .into_series()),
             DataType::FixedSizeList(child_dtype, size) => {
                 // Validate lengths of elements are equal to `size`
-                let lengths_ok = match self.nulls() {
+                let lengths_ok = match self.validity() {
                     None => self.offsets().lengths().all(|l| l == *size),
-                    Some(nulls) => self
+                    Some(validity) => self
                         .offsets()
                         .lengths()
-                        .zip(nulls)
+                        .zip(validity)
                         .all(|(l, valid)| (l == 0 && !valid) || l == *size),
                 };
                 if !lengths_ok {
@@ -1615,87 +1687,51 @@ impl ListArray {
                 }
 
                 // Cast child
-                let mut casted_child = self.flat_child.cast(child_dtype.as_ref())?;
+                let casted_child = self.flat_child.cast(child_dtype.as_ref())?;
+
                 // Build a FixedSizeListArray
-                match self.nulls() {
+                match self.validity() {
                     // All valid, easy conversion -- everything is correctly sized and valid
-                    None => {
-                        // Slice child to match offsets if necessary
-                        if casted_child.len() / size > self.len() {
-                            casted_child = casted_child.slice(
-                                *self.offsets().first().unwrap() as usize,
-                                *self.offsets().last().unwrap() as usize,
-                            )?;
-                        }
-                        Ok(FixedSizeListArray::new(
-                            Field::new(self.name(), dtype.clone()),
-                            casted_child,
-                            None,
-                        )
-                        .into_series())
-                    }
+                    None => Ok(FixedSizeListArray::new(
+                        Field::new(self.name(), dtype.clone()),
+                        casted_child.clone(),
+                        None,
+                    )
+                    .into_series()),
                     // Some invalids, we need to insert nulls into the child
-                    // TODO(desmond): Migrate this to arrow-rs after migrating growable internals.
-                    Some(nulls) => {
+                    Some(validity) => {
                         let mut child_growable = make_growable(
                             "item",
                             child_dtype.as_ref(),
                             vec![&casted_child],
                             true,
-                            self.nulls().map_or(self.len() * size, |v| v.len() * size),
+                            self.validity()
+                                .map_or(self.len() * size, |v| v.len() * size),
                         );
 
                         let mut invalid_ptr = 0;
-                        for (start, end) in nulls.valid_slices() {
-                            let len = end - start;
+                        for (start, len) in SlicesIterator::new(validity) {
                             child_growable.add_nulls((start - invalid_ptr) * size);
-                            let child_start = self.offsets().inner()[start] as usize;
+                            let child_start = self.offsets().start_end(start).0;
                             child_growable.extend(0, child_start, len * size);
-                            invalid_ptr = end;
+                            invalid_ptr = start + len;
                         }
                         child_growable.add_nulls((self.len() - invalid_ptr) * size);
 
                         Ok(FixedSizeListArray::new(
                             Field::new(self.name(), dtype.clone()),
                             child_growable.build()?,
-                            self.nulls().cloned(),
+                            self.validity().cloned(),
                         )
                         .into_series())
                     }
                 }
             }
-            DataType::Map { key, value } => {
-                let physical_dtype = DataType::List(Box::new(DataType::Struct(vec![
-                    Field::new("key", *key.clone()),
-                    Field::new("value", *value.clone()),
-                ])));
-                let result = self.cast(&physical_dtype)?;
-                let map_array = MapArray::new(
-                    Field::new(self.name(), dtype.clone()),
-                    result.list()?.clone(),
-                );
-                Ok(map_array.into_series())
-            }
-            DataType::Embedding(..) => {
-                let result = self.cast(&dtype.to_physical())?;
-                let embedding_array = EmbeddingArray::new(
-                    Field::new(self.name(), dtype.clone()),
-                    result.fixed_size_list()?.clone(),
-                );
-                Ok(embedding_array.into_series())
-            }
-            DataType::FixedShapeTensor(_, _) => {
-                let result = self.cast(&dtype.to_physical())?;
-                let result = result.fixed_size_list()?;
-                result.cast(dtype)
-            }
-            DataType::Extension(name, storage_type, metadata) => {
-                let casted_to_storage = self.cast(storage_type.as_ref())?;
-                Ok(
-                    ExtensionArray::from_series(&casted_to_storage, name, metadata.as_deref())?
-                        .into_series(),
-                )
-            }
+            DataType::Map(..) => Ok(MapArray::new(
+                Field::new(self.name(), dtype.clone()),
+                self.clone(),
+            )
+            .into_series()),
             _ => unimplemented!("List casting not implemented for dtype: {}", dtype),
         }
     }
@@ -1707,42 +1743,6 @@ impl MapArray {
     }
 }
 
-impl UuidArray {
-    pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
-        match dtype {
-            DataType::Null => {
-                Ok(NullArray::full_null(self.name(), dtype, self.len()).into_series())
-            }
-            DataType::Uuid => Ok(self.clone().into_series()),
-            DataType::Utf8 => {
-                // Convert UUID to string representation
-                let uuid_strings = self
-                    .into_iter()
-                    .map(|opt_bytes| opt_bytes.map(|bytes| bytes.to_string()));
-                Ok(Utf8Array::from_iter(self.name(), uuid_strings).into_series())
-            }
-            DataType::FixedSizeBinary(16) => Ok(self.physical.clone().into_series()),
-            DataType::Binary => {
-                // Convert UUID to binary representation
-                let binary_values = self.physical.iter();
-                Ok(
-                    DataArray::<crate::datatypes::BinaryType>::from_iter(
-                        self.name(),
-                        binary_values,
-                    )
-                    .into_series(),
-                )
-            }
-            #[cfg(feature = "python")]
-            DataType::Python => self.clone().into_series().cast_to_python(),
-            _ => Err(DaftError::TypeError(format!(
-                "Cannot cast UUID to {}",
-                dtype
-            ))),
-        }
-    }
-}
-
 impl StructArray {
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
         match (self.data_type(), dtype) {
@@ -1751,27 +1751,27 @@ impl StructArray {
                     self_fields
                         .iter()
                         .enumerate()
-                        .map(|(i, f)| (f.name.as_ref(), i)),
+                        .map(|(i, f)| (f.name.as_str(), i)),
                 );
                 let casted_series = other_fields
                     .iter()
                     .map(
-                        |field| match self_field_names_to_idx.get(field.name.as_ref()) {
+                        |field| match self_field_names_to_idx.get(field.name.as_str()) {
                             None => Ok(Series::full_null(
-                                field.name.as_ref(),
+                                field.name.as_str(),
                                 &field.dtype,
                                 self.len(),
                             )),
                             Some(field_idx) => self.children[*field_idx].cast(&field.dtype),
                         },
                     )
-                    .collect::<DaftResult<Vec<Series>>>()?;
-                let field = Field::new(self.name(), dtype.clone());
-                if other_fields.is_empty() {
-                    Ok(Self::new_empty(field, self.len(), self.nulls().cloned()).into_series())
-                } else {
-                    Ok(Self::new(field, casted_series, self.nulls().cloned()).into_series())
-                }
+                    .collect::<DaftResult<Vec<Series>>>();
+                Ok(StructArray::new(
+                    Field::new(self.name(), dtype.clone()),
+                    casted_series?,
+                    self.validity().cloned(),
+                )
+                .into_series())
             }
             (DataType::Struct(..), DataType::Tensor(..)) => {
                 let casted_struct_array =
@@ -1781,114 +1781,11 @@ impl StructArray {
                         .into_series(),
                 )
             }
-            (DataType::Struct(..), DataType::SparseTensor(..)) => {
-                let casted_struct_array =
-                    self.cast(&dtype.to_physical())?.struct_().unwrap().clone();
-                Ok(SparseTensorArray::new(
-                    Field::new(self.name(), dtype.clone()),
-                    casted_struct_array,
-                )
-                .into_series())
-            }
-            (DataType::Struct(..), DataType::FixedShapeSparseTensor(..)) => {
-                let casted_struct_array =
-                    self.cast(&dtype.to_physical())?.struct_().unwrap().clone();
-                Ok(FixedShapeSparseTensorArray::new(
-                    Field::new(self.name(), dtype.clone()),
-                    casted_struct_array,
-                )
-                .into_series())
-            }
             (DataType::Struct(..), DataType::Image(..)) => {
                 let casted_struct_array =
                     self.cast(&dtype.to_physical())?.struct_().unwrap().clone();
                 Ok(
                     ImageArray::new(Field::new(self.name(), dtype.clone()), casted_struct_array)
-                        .into_series(),
-                )
-            }
-            (DataType::Struct(..), DataType::File(media_type)) => {
-                use daft_schema::media_type::MediaType;
-                let casted_struct_array = self.cast(&dtype.to_physical())?.struct_()?.clone();
-                match media_type {
-                    MediaType::Video => Ok(FileArray::<MediaTypeVideo>::new(
-                        Field::new(self.name(), dtype.clone()),
-                        casted_struct_array,
-                    )
-                    .into_series()),
-                    MediaType::Audio => Ok(FileArray::<MediaTypeAudio>::new(
-                        Field::new(self.name(), dtype.clone()),
-                        casted_struct_array,
-                    )
-                    .into_series()),
-                    MediaType::Hdf5 => Ok(FileArray::<MediaTypeHdf5>::new(
-                        Field::new(self.name(), dtype.clone()),
-                        casted_struct_array,
-                    )
-                    .into_series()),
-                    _ => Ok(FileArray::<MediaTypeUnknown>::new(
-                        Field::new(self.name(), dtype.clone()),
-                        casted_struct_array,
-                    )
-                    .into_series()),
-                }
-            }
-            (DataType::Struct(..), DataType::List(child_dtype)) => {
-                let casted_children = self
-                    .children
-                    .iter()
-                    .map(|c| c.cast(child_dtype))
-                    .collect::<DaftResult<Vec<_>>>()?;
-
-                let lists = (0..self.len())
-                    .map(|i| {
-                        if self.is_valid(i) {
-                            let slices_at_index = casted_children
-                                .iter()
-                                .map(|c| c.slice(i, i + 1))
-                                .collect::<DaftResult<Vec<_>>>()?;
-
-                            Some(Series::concat(&slices_at_index.iter().collect::<Vec<_>>()))
-                                .transpose()
-                        } else {
-                            Ok(None)
-                        }
-                    })
-                    .collect::<DaftResult<Vec<_>>>()?;
-
-                Ok(ListArray::from_series(self.name(), lists)?.into_series())
-            }
-            (DataType::Struct(..), DataType::FixedSizeList(child_dtype, length))
-                if *length == self.children.len() =>
-            {
-                let casted_children = self
-                    .children
-                    .iter()
-                    .map(|c| c.cast(child_dtype))
-                    .collect::<DaftResult<Vec<_>>>()?;
-
-                let flat_slices = (0..self.len())
-                    .flat_map(|i| casted_children.iter().map(move |c| c.slice(i, i + 1)))
-                    .collect::<DaftResult<Vec<_>>>()?;
-
-                let flat_child = Series::concat(&flat_slices.iter().collect::<Vec<_>>())?;
-
-                Ok(FixedSizeListArray::new(
-                    Field::new(self.name(), dtype.clone()),
-                    flat_child,
-                    self.nulls().cloned(),
-                )
-                .into_series())
-            }
-            (DataType::Struct(..), DataType::Embedding(_, length))
-                if *length == self.children.len() =>
-            {
-                self.cast(&dtype.to_physical())?.cast(dtype)
-            }
-            (_, DataType::Extension(name, storage_type, metadata)) => {
-                let casted_to_storage = self.cast(storage_type.as_ref())?;
-                Ok(
-                    ExtensionArray::from_series(&casted_to_storage, name, metadata.as_deref())?
                         .into_series(),
                 )
             }
@@ -1901,730 +1798,27 @@ impl StructArray {
     }
 }
 
-impl UnionArray {
-    pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
-        if dtype == self.data_type() {
-            return Ok(self.clone().into_series());
-        }
-
-        Err(DaftError::TypeError(format!(
-            "Union casting not implemented for dtype: {}",
-            dtype
-        )))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rand::{Rng, rng};
-
-    use super::*;
-    use crate::{
-        datatypes::DataArray,
-        hf16,
-        prelude::{
-            BinaryArray, BooleanArray, Decimal128Array, Decimal128Type, ExtensionArray,
-            Float16Array, Float32Array, Float64Array, Int32Array, Utf8Array,
-        },
-    };
-
-    fn create_test_decimal_array(
-        values: Vec<i128>,
-        precision: usize,
-        scale: usize,
-    ) -> DataArray<Decimal128Type> {
-        let field = Arc::new(Field::new(
-            "test_decimal",
-            DataType::Decimal128(precision, scale),
-        ));
-        Decimal128Array::from_field_and_values(field, values)
-    }
-
-    fn create_test_f64_array(values: Vec<f64>) -> Float64Array {
-        Float64Array::from_vec("test_float", values)
-    }
-
-    fn create_test_i64_array(values: Vec<i64>) -> Int64Array {
-        Int64Array::from_vec("test_int", values)
-    }
-
-    // For a Decimal(p, s) to be valid, p, s, and max_val must satisfy:
-    //   p > ceil(log_9(max_val * 10^s)) - 1
-    // So with a max_val of 10^10, we get:
-    //   p > ceil(log_9(10^(10+s))) - 1
-    // Since p <= 32, for this inequality to hold, we need s <= 20.
-    const MAX_VAL: f64 = 1e10;
-    const MAX_SCALE: usize = 20;
-    const MIN_DIFF_FOR_PRECISION: usize = 12;
-    #[test]
-    fn test_decimal_to_decimal_cast() {
-        let mut rng = rng();
-        let mut values: Vec<f64> = (0..100)
-            .map(|_| rng.random_range(-MAX_VAL..MAX_VAL))
-            .collect();
-        values.extend_from_slice(&[0.0, -0.0]);
-
-        let initial_scale: usize = rng.random_range(0..=MAX_SCALE);
-        let initial_precision: usize =
-            rng.random_range(initial_scale + MIN_DIFF_FOR_PRECISION..=32);
-        let min_integral_comp = initial_precision - initial_scale;
-        let i128_values: Vec<i128> = values
-            .iter()
-            .map(|&x| (x * 10_f64.powi(initial_scale as i32) as f64) as i128)
-            .collect();
-        let original = create_test_decimal_array(i128_values, initial_precision, initial_scale);
-
-        // We always widen the Decimal, otherwise we lose information and can no longer compare with the original Decimal values.
-        let intermediate_scale: usize = rng.random_range(initial_scale..=32 - min_integral_comp);
-        let intermediate_precision: usize =
-            rng.random_range(intermediate_scale + min_integral_comp..=32);
-
-        let result = original
-            .cast(&DataType::Decimal128(
-                intermediate_precision,
-                intermediate_scale,
-            ))
-            .expect("Failed to cast to intermediate decimal")
-            .cast(&DataType::Decimal128(initial_precision, initial_scale))
-            .expect("Failed to cast back to original decimal");
-
-        assert!(
-            original.into_series() == result,
-            "Failed with intermediate decimal({}, {})",
-            intermediate_precision,
-            intermediate_scale,
-        );
-    }
-
-    // We do fuzzy equality when comparing floats converted to and from decimals. This test is
-    // primarily sanity checking that we don't repeat the mistake of shifting the scale and precision
-    // of floats during casting, while avoiding flakiness due small differences in floats.
-    #[test]
-    fn test_decimal_to_float() {
-        let mut rng = rng();
-        let mut values: Vec<f64> = (0..100)
-            .map(|_| rng.random_range(-MAX_VAL..MAX_VAL))
-            .collect();
-        values.extend_from_slice(&[0.0, -0.0]);
-        let num_values = values.len();
-
-        let scale: usize = rng.random_range(0..=MAX_SCALE);
-        let precision: usize = rng.random_range(scale + MIN_DIFF_FOR_PRECISION..=32);
-        // when the scale is 0, the created decimal values are integers, the epsilon should be 1
-        let epsilon = if scale == 0 { 1f64 } else { 0.1f64 };
-
-        let i128_values: Vec<i128> = values
-            .iter()
-            .map(|&x| (x * 10_f64.powi(scale as i32) as f64) as i128)
-            .collect();
-        let original = create_test_decimal_array(i128_values, precision, scale);
-
-        let result = original
-            .cast(&DataType::Float64)
-            .expect("Failed to cast to float");
-        let original = create_test_f64_array(values);
-
-        let epsilon_series = create_test_f64_array(vec![epsilon; num_values]).into_series();
-
-        assert!(
-            result.fuzzy_eq(&original.into_series(), &epsilon_series),
-            "Failed with decimal({}, {})",
-            precision,
-            scale,
-        );
-    }
-
-    // 2^63 gives us 18 unrestricted digits. So precision - scale has to be <= 18.
-    const MAX_DIFF_FOR_PRECISION: usize = 18;
-    #[test]
-    fn test_decimal_to_int() {
-        let mut rng = rng();
-        let mut values: Vec<f64> = (0..100)
-            .map(|_| rng.random_range(-MAX_VAL..MAX_VAL))
-            .collect();
-        values.extend_from_slice(&[0.0, -0.0]);
-
-        let scale: usize = rng.random_range(0..=MAX_SCALE);
-        let precision: usize =
-            rng.random_range(scale + MIN_DIFF_FOR_PRECISION..=scale + MAX_DIFF_FOR_PRECISION);
-        let i128_values: Vec<i128> = values
-            .iter()
-            .map(|&x| (x * 10_f64.powi(scale as i32) as f64) as i128)
-            .collect();
-        let original = create_test_decimal_array(i128_values, precision, scale);
-
-        let result = original
-            .cast(&DataType::Int64)
-            .expect("Failed to cast to int64");
-
-        // Convert the original floats directly to integers.
-        let values = values.into_iter().map(|f| f as i64).collect();
-        let original = create_test_i64_array(values);
-
-        assert!(
-            original.into_series() == result,
-            "Failed with decimal({}, {})",
-            precision,
-            scale,
-        );
-    }
-
-    #[test]
-    fn cast_fsl_into_embedding() {
-        let fsl = FixedSizeListArray::new(
-            Arc::new(Field::new(
-                "item",
-                DataType::FixedSizeList(Box::new(DataType::Int64), 0),
-            )),
-            Series::empty("item", &DataType::Int64),
-            None,
-        );
-
-        assert!(
-            fsl.cast(&DataType::Embedding(Box::new(DataType::Int64), 0))
-                .is_ok(),
-            "Expected to be able to cast FixedSizeList into Embedding of same datatype & size."
-        );
-        assert!(
-            fsl.cast(&DataType::Embedding(Box::new(DataType::Int64), 1))
-                .is_err(),
-            "Not expected to be able to cast FixedSizeList into Embedding with different size."
-        );
-
-        assert!(
-            fsl.cast(&DataType::Embedding(Box::new(DataType::Float32), 0))
-                .is_err(),
-            "Not expected to be able to cast FixedSizeList into Embedding with different element type."
-        );
-    }
-
-    // Tests for Utf8 to numeric casting with whitespace handling
-    // These tests verify that leading/trailing whitespace is trimmed before parsing,
-    // matching Python/Pandas/NumPy behavior.
-
-    #[test]
-    fn test_utf8_to_int32_with_whitespace() {
-        let utf8_array = Utf8Array::from_iter(
-            "test",
-            vec![Some("  42  "), Some("-1"), Some("  100  "), None],
-        );
-        let result = utf8_array
-            .cast(&DataType::Int32)
-            .expect("Failed to cast Utf8 to Int32");
-
-        let values: Vec<Option<i32>> = result.i32().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(42), Some(-1), Some(100), None]);
-    }
-
-    #[test]
-    fn test_utf8_to_int64_with_whitespace() {
-        let utf8_array = Utf8Array::from_iter(
-            "test",
-            vec![Some("  42  "), Some("  -9999999999  "), Some("\t123\n")].into_iter(),
-        );
-        let result = utf8_array
-            .cast(&DataType::Int64)
-            .expect("Failed to cast Utf8 to Int64");
-
-        let values: Vec<Option<i64>> = result.i64().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(42), Some(-9999999999), Some(123)]);
-    }
-
-    #[test]
-    fn test_utf8_to_float64_with_whitespace() {
-        let utf8_array = Utf8Array::from_iter(
-            "test",
-            vec![Some("  3.13  "), Some("-2.5"), Some("  1e10  "), None],
-        );
-        let result = utf8_array
-            .cast(&DataType::Float64)
-            .expect("Failed to cast Utf8 to Float64");
-
-        let values: Vec<Option<f64>> = result.f64().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(3.13), Some(-2.5), Some(1e10), None]);
-    }
-
-    #[test]
-    fn test_utf8_to_float32_with_whitespace() {
-        let utf8_array =
-            Utf8Array::from_iter("test", vec![Some("  3.13  "), Some("  -2.5  ")].into_iter());
-        let result = utf8_array
-            .cast(&DataType::Float32)
-            .expect("Failed to cast Utf8 to Float32");
-
-        let values: Vec<Option<f32>> = result.f32().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(3.13_f32), Some(-2.5_f32)]);
-    }
-
-    #[test]
-    fn test_utf8_to_int_invalid_returns_none() {
-        // Invalid strings should return None, not error
-        let utf8_array = Utf8Array::from_iter(
-            "test",
-            vec![Some("  42  "), Some("not_a_number"), Some("  ")],
-        );
-        let result = utf8_array
-            .cast(&DataType::Int32)
-            .expect("Failed to cast Utf8 to Int32");
-
-        let values: Vec<Option<i32>> = result.i32().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(42), None, None]);
-    }
-
-    // Tests for Utf8 to Date casting with whitespace handling
-    // Note: Date parsing already handles whitespace (this test documents existing behavior)
-
-    #[test]
-    fn test_utf8_to_date_with_whitespace() {
-        let utf8_array = Utf8Array::from_iter(
-            "test",
-            vec![
-                Some("  2024-01-01  "),
-                Some("2024-06-15"),
-                Some("  2024-12-31  "),
-                None,
-            ],
-        );
-        let result = utf8_array
-            .cast(&DataType::Date)
-            .expect("Failed to cast Utf8 to Date");
-
-        // Date is stored as days since epoch (1970-01-01)
-        // 2024-01-01 = 19723 days, 2024-06-15 = 19889 days, 2024-12-31 = 20088 days
-        let date_array = result.date().unwrap();
-        let values: Vec<Option<i32>> = date_array.physical.iter().collect();
-        // Check that we got valid dates (not None from failed parse)
-        assert!(values[0].is_some(), "First date should parse successfully");
-        assert!(values[1].is_some(), "Second date should parse successfully");
-        assert!(values[2].is_some(), "Third date should parse successfully");
-    }
-
-    #[test]
-    fn test_float16_to_float32() {
-        let arr = Float16Array::from_vec("test", vec![hf16!(1.0), hf16!(2.5), hf16!(-3.0)]);
-        let result = arr.cast(&DataType::Float32).unwrap();
-        let values: Vec<Option<f32>> = result.f32().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(1.0), Some(2.5), Some(-3.0)]);
-    }
-
-    #[test]
-    fn test_float32_to_float16() {
-        let arr = Float32Array::from_vec("test", vec![1.0, 2.5, -3.0]);
-        let result = arr.cast(&DataType::Float16).unwrap();
-        let values: Vec<Option<half::f16>> = result.f16().unwrap().into_iter().collect();
-        assert_eq!(
-            values,
-            vec![Some(hf16!(1.0)), Some(hf16!(2.5)), Some(hf16!(-3.0))]
-        );
-    }
-
-    #[test]
-    fn test_float16_to_int32() {
-        let arr = Float16Array::from_vec("test", vec![hf16!(1.0), hf16!(2.5), hf16!(-3.0)]);
-        let result = arr.cast(&DataType::Int32).unwrap();
-        let values: Vec<Option<i32>> = result.i32().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(1), Some(2), Some(-3)]);
-    }
-
-    #[test]
-    fn test_int32_to_float16() {
-        let arr = Int32Array::from_vec("test", vec![1, 2, -3]);
-        let result = arr.cast(&DataType::Float16).unwrap();
-        let values: Vec<Option<half::f16>> = result.f16().unwrap().into_iter().collect();
-        assert_eq!(
-            values,
-            vec![Some(hf16!(1.0)), Some(hf16!(2.0)), Some(hf16!(-3.0))]
-        );
-    }
-
-    #[test]
-    fn test_utf8_to_float16() {
-        let arr = Utf8Array::from_iter(
-            "test",
-            vec![Some("  1.5  "), Some("-2.5"), None].into_iter(),
-        );
-        let result = arr.cast(&DataType::Float16).unwrap();
-        let values: Vec<Option<half::f16>> = result.f16().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(hf16!(1.5)), Some(hf16!(-2.5)), None]);
-    }
-
-    #[test]
-    fn test_float16_to_float64() {
-        let arr = Float16Array::from_vec("test", vec![hf16!(1.0), hf16!(0.0), hf16!(-0.5)]);
-        let result = arr.cast(&DataType::Float64).unwrap();
-        let values: Vec<Option<f64>> = result.f64().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(1.0), Some(0.0), Some(-0.5)]);
-    }
-
-    #[test]
-    fn test_float16_with_nulls() {
-        let arr = Float16Array::from_iter(
-            Field::new("test", DataType::Float16),
-            vec![Some(hf16!(1.0)), None, Some(hf16!(3.0))].into_iter(),
-        );
-        let result = arr.cast(&DataType::Float32).unwrap();
-        let values: Vec<Option<f32>> = result.f32().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(1.0), None, Some(3.0)]);
-    }
-
-    #[test]
-    fn test_float16_roundtrip_through_float32() {
-        let original = Float16Array::from_vec("test", vec![hf16!(1.0), hf16!(2.5), hf16!(-3.0)]);
-        let as_f32 = original.cast(&DataType::Float32).unwrap();
-        let back = as_f32.cast(&DataType::Float16).unwrap();
-        let values: Vec<Option<half::f16>> = back.f16().unwrap().into_iter().collect();
-        assert_eq!(
-            values,
-            vec![Some(hf16!(1.0)), Some(hf16!(2.5)), Some(hf16!(-3.0))]
-        );
-    }
-
-    #[test]
-    fn test_bool_to_float16() {
-        let arr = BooleanArray::from_iter("test", vec![Some(true), Some(false), None].into_iter());
-        let result = arr.cast(&DataType::Float16).unwrap();
-        let values: Vec<Option<half::f16>> = result.f16().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(hf16!(1.0)), Some(hf16!(0.0)), None]);
-    }
-
-    #[test]
-    fn test_cast_utf8_to_extension() {
-        let extension_type =
-            DataType::Extension("test".to_string(), Box::new(DataType::Utf8), None);
-        let arr = Utf8Array::from_iter("test", vec![Some("test"), Some("test2"), Some("test3")]);
-
-        let result = arr
-            .cast(&extension_type)
-            .expect("Failed to cast Utf8 to Extension");
-        let extension_array = result.downcast::<ExtensionArray>().unwrap();
-        assert_eq!(extension_array.data_type(), &extension_type);
-    }
-
-    #[test]
-    fn test_cast_extension_to_storage_type() {
-        let extension_type =
-            DataType::Extension("test.utf8".to_string(), Box::new(DataType::Utf8), None);
-        let arr = Utf8Array::from_iter("col", vec![Some("hello"), Some("world")]);
-
-        // Utf8 -> Extension
-        let ext_series = arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-
-        // Extension -> Utf8
-        let unwrapped = ext_series.cast(&DataType::Utf8).unwrap();
-        assert_eq!(unwrapped.data_type(), &DataType::Utf8);
-        assert_eq!(unwrapped.utf8().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn test_cast_int64_to_extension_and_back() {
-        let extension_type =
-            DataType::Extension("test.counter".to_string(), Box::new(DataType::Int64), None);
-        let arr = Int64Array::from_values("col", vec![1i64, 2, 3]);
-
-        // Int64 -> Extension(Int64)
-        let ext_series = arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-
-        // Extension(Int64) -> Int64
-        let unwrapped = ext_series.cast(&DataType::Int64).unwrap();
-        assert_eq!(unwrapped.data_type(), &DataType::Int64);
-        let values: Vec<i64> = unwrapped.i64().unwrap().into_iter().flatten().collect();
-        assert_eq!(values, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn test_cast_float64_to_extension_and_back() {
-        let extension_type = DataType::Extension(
-            "test.measurement".to_string(),
-            Box::new(DataType::Float64),
-            None,
-        );
-        let arr = Float64Array::from_values("col", vec![1.5, 2.5, 3.5]);
-
-        let ext_series = arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-
-        let unwrapped = ext_series.cast(&DataType::Float64).unwrap();
-        let values: Vec<f64> = unwrapped.f64().unwrap().into_iter().flatten().collect();
-        assert_eq!(values, vec![1.5, 2.5, 3.5]);
-    }
-
-    #[test]
-    fn test_cast_extension_with_metadata() {
-        let metadata = Some(r#"{"crs":"WGS84"}"#.to_string());
-        let extension_type = DataType::Extension(
-            "geo.point".to_string(),
-            Box::new(DataType::Utf8),
-            metadata.clone(),
-        );
-        let arr = Utf8Array::from_iter("col", vec![Some("POINT(0 0)"), Some("POINT(1 1)")]);
-
-        let ext_series = arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-
-        // Verify metadata survives cast
-        match ext_series.data_type() {
-            DataType::Extension(name, _, meta) => {
-                assert_eq!(name, "geo.point");
-                assert_eq!(meta, &metadata);
-            }
-            _ => panic!("Expected Extension type"),
-        }
-    }
-
-    #[test]
-    fn test_cast_extension_with_nulls() {
-        let extension_type =
-            DataType::Extension("test.nullable".to_string(), Box::new(DataType::Int64), None);
-        let arr = Int64Array::from_iter(
-            Field::new("col".to_string(), DataType::Int64),
-            vec![Some(1i64), None, Some(3)].into_iter(),
-        );
-
-        let ext_series = arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-        assert_eq!(ext_series.len(), 3);
-
-        let unwrapped = ext_series.cast(&DataType::Int64).unwrap();
-        let values: Vec<Option<i64>> = unwrapped.i64().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(1), None, Some(3)]);
-    }
-
-    #[test]
-    fn test_cast_extension_to_different_extension() {
-        let ext_a = DataType::Extension("type.a".to_string(), Box::new(DataType::Int64), None);
-        let ext_b = DataType::Extension(
-            "type.b".to_string(),
-            Box::new(DataType::Int64),
-            Some("meta_b".to_string()),
-        );
-        let arr = Int64Array::from_values("col", vec![10i64, 20]);
-
-        // Int64 -> Extension A
-        let series_a = arr.cast(&ext_a).unwrap();
-        assert_eq!(series_a.data_type(), &ext_a);
-
-        // Extension A -> Extension B (same storage type, different name/metadata)
-        let series_b = series_a.cast(&ext_b).unwrap();
-        assert_eq!(series_b.data_type(), &ext_b);
-
-        // Extension B -> Int64
-        let unwrapped = series_b.cast(&DataType::Int64).unwrap();
-        let values: Vec<i64> = unwrapped.i64().unwrap().into_iter().flatten().collect();
-        assert_eq!(values, vec![10, 20]);
-    }
-
-    #[test]
-    fn test_cast_with_storage_type_coercion() {
-        // Extension with Int32 storage, cast from Int64 source
-        // This tests that the storage type cast happens correctly
-        let extension_type = DataType::Extension(
-            "test.small_int".to_string(),
-            Box::new(DataType::Int32),
-            None,
-        );
-        let arr = Int64Array::from_values("col", vec![1i64, 2, 3]);
-
-        let ext_series = arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-
-        // Extension(Int32) -> Int32
-        let unwrapped = ext_series.cast(&DataType::Int32).unwrap();
-        let values: Vec<i32> = unwrapped.i32().unwrap().into_iter().flatten().collect();
-        assert_eq!(values, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn test_cast_binary_to_extension_and_back() {
-        let extension_type =
-            DataType::Extension("test.uuid".to_string(), Box::new(DataType::Binary), None);
-        let arr = BinaryArray::from_iter(
-            "col",
-            vec![Some(b"abc".as_slice()), Some(b"def".as_slice())],
-        );
-
-        let ext_series = arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-
-        let unwrapped = ext_series.cast(&DataType::Binary).unwrap();
-        assert_eq!(unwrapped.data_type(), &DataType::Binary);
-        assert_eq!(unwrapped.len(), 2);
-    }
-
-    #[test]
-    fn test_cast_boolean_to_extension_and_back() {
-        let extension_type =
-            DataType::Extension("test.flag".to_string(), Box::new(DataType::Boolean), None);
-        let arr = BooleanArray::from_iter("col", vec![Some(true), Some(false), None].into_iter());
-
-        let ext_series = arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-
-        let unwrapped = ext_series.cast(&DataType::Boolean).unwrap();
-        let values: Vec<Option<bool>> = unwrapped.bool().unwrap().into_iter().collect();
-        assert_eq!(values, vec![Some(true), Some(false), None]);
-    }
-
-    #[test]
-    fn test_cast_fixed_size_list_to_extension_and_back() {
-        let fsl_dtype = DataType::FixedSizeList(Box::new(DataType::Float64), 2);
-        let extension_type = DataType::Extension(
-            "geo.point".to_string(),
-            Box::new(fsl_dtype.clone()),
-            Some(r#"{"crs":"WGS84"}"#.to_string()),
-        );
-
-        let flat_child = Float64Array::from_values("item", vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let fsl_arr = FixedSizeListArray::new(
-            Field::new("col", fsl_dtype.clone()),
-            flat_child.into_series(),
-            None,
-        );
-
-        // FixedSizeList -> Extension(FixedSizeList)
-        let ext_series = fsl_arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-
-        // Extension(FixedSizeList) -> FixedSizeList
-        let unwrapped = ext_series.cast(&fsl_dtype).unwrap();
-        assert_eq!(unwrapped.data_type(), &fsl_dtype);
-        assert_eq!(unwrapped.len(), 3);
-    }
-
-    #[test]
-    fn test_cast_list_to_extension_and_back() {
-        let list_dtype = DataType::List(Box::new(DataType::Int64));
-        let extension_type =
-            DataType::Extension("test.tags".to_string(), Box::new(list_dtype.clone()), None);
-
-        let flat_child = Int64Array::from_values("item", vec![10i64, 20, 30, 40, 50]);
-        let list_arr = ListArray::new(
-            Field::new("col", list_dtype.clone()),
-            flat_child.into_series(),
-            arrow::buffer::OffsetBuffer::from_lengths(vec![2, 3]),
-            None,
-        );
-
-        // List -> Extension(List)
-        let ext_series = list_arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-
-        // Extension(List) -> List
-        let unwrapped = ext_series.cast(&list_dtype).unwrap();
-        assert_eq!(unwrapped.data_type(), &list_dtype);
-        assert_eq!(unwrapped.len(), 2);
-    }
-
-    #[test]
-    fn test_cast_struct_to_extension_and_back() {
-        let struct_dtype = DataType::Struct(vec![
-            Field::new("x", DataType::Float64),
-            Field::new("y", DataType::Float64),
-        ]);
-        let extension_type = DataType::Extension(
-            "geo.coordinate".to_string(),
-            Box::new(struct_dtype.clone()),
-            None,
-        );
-
-        let x_child = Float64Array::from_values("x", vec![1.0, 2.0]).into_series();
-        let y_child = Float64Array::from_values("y", vec![3.0, 4.0]).into_series();
-        let struct_arr = StructArray::new(
-            Arc::new(Field::new("col", struct_dtype.clone())),
-            vec![x_child, y_child],
-            None,
-        );
-
-        // Struct -> Extension(Struct)
-        let ext_series = struct_arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-
-        // Extension(Struct) -> Struct
-        let unwrapped = ext_series.cast(&struct_dtype).unwrap();
-        assert_eq!(unwrapped.data_type(), &struct_dtype);
-        assert_eq!(unwrapped.len(), 2);
-    }
-
-    #[test]
-    fn test_cast_fixed_size_list_to_extension_with_nulls() {
-        let fsl_dtype = DataType::FixedSizeList(Box::new(DataType::Int32), 3);
-        let extension_type =
-            DataType::Extension("test.triple".to_string(), Box::new(fsl_dtype.clone()), None);
-
-        let flat_child = crate::datatypes::Int32Array::from_values(
-            "item",
-            (0..9i32).collect::<Vec<i32>>().into_iter(),
-        );
-        let nulls = arrow::buffer::NullBuffer::from(vec![true, false, true]);
-        let fsl_arr = FixedSizeListArray::new(
-            Field::new("col", fsl_dtype.clone()),
-            flat_child.into_series(),
-            Some(nulls),
-        );
-
-        let ext_series = fsl_arr.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-        assert_eq!(ext_series.len(), 3);
-
-        let unwrapped = ext_series.cast(&fsl_dtype).unwrap();
-        assert_eq!(unwrapped.data_type(), &fsl_dtype);
-        assert_eq!(unwrapped.len(), 3);
-    }
-
-    #[test]
-    fn test_cast_embedding_to_extension_and_back() {
-        let embedding_dtype = DataType::Embedding(Box::new(DataType::Float64), 3);
-        let extension_type = DataType::Extension(
-            "ml.embedding".to_string(),
-            Box::new(embedding_dtype.to_physical()),
-            Some(r#"{"model":"test"}"#.to_string()),
-        );
-
-        let flat_child = Float64Array::from_values("item", vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
-        let fsl_arr = FixedSizeListArray::new(
-            Field::new(
-                "col",
-                DataType::FixedSizeList(Box::new(DataType::Float64), 3),
-            ),
-            flat_child.into_series(),
-            None,
-        );
-        let embedding_arr =
-            EmbeddingArray::new(Field::new("col", embedding_dtype.clone()), fsl_arr);
-        let embedding_series = embedding_arr.into_series();
-
-        // Embedding -> Extension(FixedSizeList) via physical fallthrough
-        let ext_series = embedding_series.cast(&extension_type).unwrap();
-        assert_eq!(ext_series.data_type(), &extension_type);
-
-        // Extension -> FixedSizeList
-        let unwrapped = ext_series.cast(&embedding_dtype.to_physical()).unwrap();
-        assert_eq!(unwrapped.len(), 2);
-    }
-
-    #[test]
-    fn test_cast_extension_to_extension_different_storage() {
-        // Extension(Int64) -> Extension(Float64) should work via storage coercion
-        let ext_int =
-            DataType::Extension("test.int_val".to_string(), Box::new(DataType::Int64), None);
-        let ext_float = DataType::Extension(
-            "test.float_val".to_string(),
-            Box::new(DataType::Float64),
-            None,
-        );
-
-        let arr = Int64Array::from_values("col", vec![1i64, 2, 3]);
-        let ext_int_series = arr.cast(&ext_int).unwrap();
-        assert_eq!(ext_int_series.data_type(), &ext_int);
-
-        // Extension(Int64) -> Extension(Float64)
-        let ext_float_series = ext_int_series.cast(&ext_float).unwrap();
-        assert_eq!(ext_float_series.data_type(), &ext_float);
-
-        // Unwrap and verify values
-        let unwrapped = ext_float_series.cast(&DataType::Float64).unwrap();
-        let values: Vec<f64> = unwrapped.f64().unwrap().into_iter().flatten().collect();
-        assert_eq!(values, vec![1.0, 2.0, 3.0]);
-    }
+#[cfg(feature = "python")]
+fn cast_logical_to_python_array<T>(array: &LogicalArray<T>, dtype: &DataType) -> DaftResult<Series>
+where
+    T: DaftLogicalType,
+    T::PhysicalType: DaftArrowBackedType,
+    LogicalArray<T>: AsArrow,
+    <LogicalArray<T> as AsArrow>::Output: arrow2::array::Array,
+{
+    Python::with_gil(|py| {
+        let arrow_dtype = array.data_type().to_arrow()?;
+        let arrow_array = array.as_arrow().to_type(arrow_dtype).with_validity(None);
+        let pyarrow = py.import("pyarrow")?;
+        let py_array: Vec<PyObject> = ffi::to_py_array(arrow_array.to_boxed(), py, pyarrow)?
+            .call_method0(py, pyo3::intern!(py, "to_pylist"))?
+            .extract(py)?;
+        let values_array =
+            PseudoArrowArray::new(py_array.into(), array.as_arrow().validity().cloned());
+        Ok(PythonArray::new(
+            Field::new(array.name(), dtype.clone()).into(),
+            values_array.to_boxed(),
+        )?
+        .into_series())
+    })
 }

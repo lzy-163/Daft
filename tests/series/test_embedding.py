@@ -5,15 +5,13 @@ import copy
 import numpy as np
 import pandas as pd
 
-from daft.datatype import DataType, get_super_ext_type
+from daft.datatype import DaftExtension, DataType
 from daft.series import Series
-
-DaftExtension = get_super_ext_type()
 
 
 def test_embedding_arrow_round_trip():
     data = [[1, 2, 3], np.arange(3), ["1", "2", "3"], [1, "2", 3.0], pd.Series([1.1, 2, 3]), (1, 2, 3), None]
-    s = Series.from_pylist(data, dtype=DataType.python())
+    s = Series.from_pylist(data, pyobj="force")
 
     target_dtype = DataType.embedding(DataType.int32(), 3)
 

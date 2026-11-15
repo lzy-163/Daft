@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import itertools
-import uuid
 
 import numpy as np
 import pyarrow as pa
 import pytest
+from ray.data.extensions import ArrowTensorArray
 
 from daft import DataType, Series
-from tests.conftest import DaftUuidType, get_tests_daft_runner_name
+from daft.context import get_context
+from daft.utils import pyarrow_supports_fixed_shape_tensor
+from tests.conftest import UuidType
 from tests.series import ARROW_FLOAT_TYPES, ARROW_INT_TYPES, ARROW_STRING_TYPES
+
+ARROW_VERSION = tuple(int(s) for s in pa.__version__.split(".") if s.isnumeric())
 
 
 class MockObject:
@@ -99,30 +103,13 @@ def test_series_concat_map_array(chunks) -> None:
     concated = Series.concat(series)
 
     assert concated.datatype() == DataType.map(DataType.string(), DataType.float64())
-    concated_list = concated.to_pylist(maps_as_pydicts="lossy")
+    concated_list = concated.to_pylist()
     counter = 0
     for i in range(chunks):
         for j in range(i):
-            assert concated_list[counter]["a"] == i + j
-            assert concated_list[counter]["b"] == float(i * j)
+            assert concated_list[counter][0][1] == i + j
+            assert concated_list[counter][1][1] == float(i * j)
             counter += 1
-
-
-def test_series_map_to_pylist_modes() -> None:
-    series = Series.from_arrow(
-        pa.array(
-            [[("a", 1), ("a", 2)], [("b", 3), ("c", 4)]],
-            type=pa.map_(pa.string(), pa.int64()),
-        )
-    )
-
-    assert series.to_pylist() == [[("a", 1), ("a", 2)], [("b", 3), ("c", 4)]]
-
-    with pytest.warns(UserWarning, match="Duplicate key encountered"):
-        assert series.to_pylist(maps_as_pydicts="lossy") == [{"a": 2}, {"b": 3, "c": 4}]
-
-    with pytest.raises(ValueError, match="maps_as_pydicts='strict'"):
-        series.to_pylist(maps_as_pydicts="strict")
 
 
 @pytest.mark.parametrize("chunks", [1, 2, 3, 10])
@@ -151,25 +138,31 @@ def test_series_concat_struct_array(chunks) -> None:
             counter += 1
 
 
-@pytest.mark.skipif(
-    not hasattr(pa, "uuid"),
-    reason="Arrow version doesn't support the uuid extension type.",
-)
 @pytest.mark.parametrize("chunks", [1, 2, 3, 10])
-def test_series_concat_uuid_array(chunks) -> None:
-    data = []
-    for i in range(chunks):
-        data.append([uuid.uuid4().bytes for _ in range(i)])
-
-    series = []
-    for i in range(chunks):
-        series.append(Series.from_arrow(pa.array(data[i], type=pa.uuid())))
+def test_series_concat_tensor_array_ray(chunks) -> None:
+    element_shape = (2, 2)
+    num_elements_per_tensor = np.prod(element_shape)
+    chunk_size = 3
+    chunk_shape = (chunk_size,) + element_shape
+    chunks = [
+        np.arange(
+            i * chunk_size * num_elements_per_tensor, (i + 1) * chunk_size * num_elements_per_tensor, dtype=np.int64
+        ).reshape(chunk_shape)
+        for i in range(chunks)
+    ]
+    series = [Series.from_arrow(ArrowTensorArray.from_numpy(chunk)) for chunk in chunks]
 
     concated = Series.concat(series)
-    assert concated.datatype() == DataType.uuid()
-    assert concated.to_arrow() == pa.array([item for d in data for item in d], type=pa.uuid())
+
+    assert concated.datatype() == DataType.tensor(DataType.int64(), element_shape)
+    expected = [chunk[i] for chunk in chunks for i in range(len(chunk))]
+    np.testing.assert_equal(concated.to_pylist(), expected)
 
 
+@pytest.mark.skipif(
+    not pyarrow_supports_fixed_shape_tensor(),
+    reason=f"Arrow version {ARROW_VERSION} doesn't support the canonical tensor extension type.",
+)
 @pytest.mark.parametrize("chunks", [1, 2, 3, 10])
 def test_series_concat_tensor_array_canonical(chunks) -> None:
     element_shape = (2, 2)
@@ -197,7 +190,7 @@ def test_series_concat_tensor_array_canonical(chunks) -> None:
 
 
 @pytest.mark.skipif(
-    get_tests_daft_runner_name() == "ray",
+    get_context().runner_config.name == "ray",
     reason="pyarrow extension types aren't supported on Ray clusters.",
 )
 @pytest.mark.parametrize("chunks", [1, 2, 3, 10])
@@ -215,7 +208,7 @@ def test_series_concat_extension_type(uuid_ext_type, chunks) -> None:
         uuid_ext_type.NAME, DataType.from_arrow_type(uuid_ext_type.storage_type), ""
     )
     concated_arrow = concated.to_arrow()
-    assert isinstance(concated_arrow.type, DaftUuidType)
+    assert isinstance(concated_arrow.type, UuidType)
     assert concated_arrow.type == uuid_ext_type
 
     expected = uuid_ext_type.wrap_array(pa.concat_arrays(storage_arrays))
@@ -227,7 +220,7 @@ def test_series_concat_extension_type(uuid_ext_type, chunks) -> None:
 def test_series_concat_pyobj(chunks) -> None:
     series = []
     for i in range(chunks):
-        series.append(Series.from_pylist([MockObject(i * j) for j in range(i)], dtype=DataType.python()))
+        series.append(Series.from_pylist([MockObject(i * j) for j in range(i)], pyobj="force"))
 
     concated = Series.concat(series)
 
@@ -256,109 +249,3 @@ def test_series_concat_dtype_mismatch() -> None:
 
     with pytest.raises(ValueError, match="concat requires all data types to match"):
         Series.concat(mix_types_series)
-
-
-def _make_sparse_union() -> pa.Array:
-    type_ids = pa.array([0, 1, 2, 0, 1, 2], type=pa.int8())
-    int_child = pa.array([10, 0, 0, 40, 0, 0], type=pa.int32())
-    float_child = pa.array([0.0, 2.2, 0.0, 0.0, 5.5, 0.0], type=pa.float64())
-    str_child = pa.array(["", "", "c", "", "", "f"], type=pa.large_utf8())
-    return pa.UnionArray.from_sparse(type_ids, [int_child, float_child, str_child], field_names=["i", "f", "s"])
-
-
-def _make_dense_union() -> pa.Array:
-    type_ids = pa.array([0, 1, 0, 0, 1], type=pa.int8())
-    offsets = pa.array([0, 0, 1, 2, 1], type=pa.int32())
-    int_child = pa.array([10, 30, 40], type=pa.int32())
-    float_child = pa.array([2.2, 5.5], type=pa.float64())
-    return pa.UnionArray.from_dense(type_ids, offsets, [int_child, float_child], field_names=["i", "f"])
-
-
-@pytest.mark.parametrize("chunks", [1, 2, 3])
-def test_series_concat_sparse_union(chunks) -> None:
-    series = [Series.from_arrow(_make_sparse_union()) for _ in range(chunks)]
-
-    result = Series.concat(series)
-
-    assert result.datatype() == series[0].datatype()
-    assert result.to_pylist() == [10, 2.2, "c", 40, 5.5, "f"] * chunks
-
-
-@pytest.mark.parametrize("chunks", [1, 2, 3])
-def test_series_concat_dense_union(chunks) -> None:
-    series = [Series.from_arrow(_make_dense_union()) for _ in range(chunks)]
-
-    result = Series.concat(series)
-
-    assert result.datatype() == series[0].datatype()
-    assert result.to_pylist() == [10, 2.2, 30, 40, 5.5] * chunks
-
-
-def test_series_concat_sparse_union_with_slice() -> None:
-    """Concatenating sliced sparse union Series works correctly."""
-    s = Series.from_arrow(_make_sparse_union())
-    sliced = s.slice(1, 4)  # [2.2, 'c', 40]
-
-    result = Series.concat([sliced, sliced])
-
-    assert result.datatype() == s.datatype()
-    assert result.to_pylist() == [2.2, "c", 40, 2.2, "c", 40]
-
-
-def test_series_concat_dense_union_with_slice() -> None:
-    """Concatenating sliced dense union Series works correctly."""
-    s = Series.from_arrow(_make_dense_union())
-    sliced = s.slice(1, 4)  # [2.2, 30, 40]
-
-    result = Series.concat([sliced, sliced])
-
-    assert result.datatype() == s.datatype()
-    assert result.to_pylist() == [2.2, 30, 40, 2.2, 30, 40]
-
-
-def test_series_concat_sparse_union_different_arrays() -> None:
-    """Concatenating two different sparse union Series yields all elements in order."""
-    type_ids_a = pa.array([0, 1, 0], type=pa.int8())
-    int_child_a = pa.array([10, 0, 30], type=pa.int32())
-    float_child_a = pa.array([0.0, 2.2, 0.0], type=pa.float64())
-    a = Series.from_arrow(pa.UnionArray.from_sparse(type_ids_a, [int_child_a, float_child_a], field_names=["i", "f"]))
-
-    type_ids_b = pa.array([1, 0, 1], type=pa.int8())
-    int_child_b = pa.array([0, 99, 0], type=pa.int32())
-    float_child_b = pa.array([9.9, 0.0, 5.5], type=pa.float64())
-    b = Series.from_arrow(pa.UnionArray.from_sparse(type_ids_b, [int_child_b, float_child_b], field_names=["i", "f"]))
-
-    result = Series.concat([a, b])
-
-    assert result.datatype() == a.datatype()
-    assert result.to_pylist() == [10, 2.2, 30, 9.9, 99, 5.5]
-
-
-def test_series_concat_dense_union_different_arrays() -> None:
-    """Concatenating two different dense union Series yields all elements in order."""
-    type_ids_a = pa.array([0, 1, 0], type=pa.int8())
-    offsets_a = pa.array([0, 0, 1], type=pa.int32())
-    a = Series.from_arrow(
-        pa.UnionArray.from_dense(
-            type_ids_a,
-            offsets_a,
-            [pa.array([10, 30], type=pa.int32()), pa.array([2.2], type=pa.float64())],
-            field_names=["i", "f"],
-        )
-    )
-
-    type_ids_b = pa.array([1, 0, 1], type=pa.int8())
-    offsets_b = pa.array([0, 0, 1], type=pa.int32())
-    b = Series.from_arrow(
-        pa.UnionArray.from_dense(
-            type_ids_b,
-            offsets_b,
-            [pa.array([99], type=pa.int32()), pa.array([9.9, 5.5], type=pa.float64())],
-            field_names=["i", "f"],
-        )
-    )
-
-    result = Series.concat([a, b])
-
-    assert result.datatype() == a.datatype()
-    assert result.to_pylist() == [10, 2.2, 30, 9.9, 99, 5.5]

@@ -12,13 +12,14 @@ import socket
 import subprocess
 import warnings
 from datetime import datetime, timezone
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
 import ray
 
 import daft
 from benchmarking.tpch import answers, data_generation
 from daft import DataFrame
+from daft.context import get_context
 from daft.runners.profiler import profiler
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ ALL_TABLES = [
 
 
 class MetricsBuilder:
-    NUM_TPCH_QUESTIONS = 22
+    NUM_TPCH_QUESTIONS = 10
 
     HEADERS = [
         "started_at",
@@ -122,16 +123,21 @@ def get_df_with_parquet_folder(parquet_folder: str) -> Callable[[str], DataFrame
 
 def run_all_benchmarks(
     parquet_folder: str,
-    questions: list[int],
+    skip_questions: set[int],
     csv_output_location: str | None,
     ray_job_dashboard_url: str | None = None,
     requirements: str | None = None,
 ):
     get_df = get_df_with_parquet_folder(parquet_folder)
 
-    metrics_builder = MetricsBuilder(get_daft_benchmark_runner_name())
+    daft_context = get_context()
+    metrics_builder = MetricsBuilder(daft_context.runner_config.name)
 
-    for i in questions:
+    for i in range(1, 11):
+        if i in skip_questions:
+            logger.warning("Skipping TPC-H q%s", i)
+            continue
+
         # Run as a Ray Job if dashboard URL is provided
         if ray_job_dashboard_url is not None:
             from benchmarking.tpch import ray_job_runner
@@ -175,7 +181,7 @@ def run_all_benchmarks(
 
 
 def generate_parquet_data(tpch_gen_folder: str, scale_factor: float, num_parts: int) -> str:
-    """Generates Parquet data and returns the path to the folder.
+    """Generates Parquet data and returns the path to the folder
 
     Args:
         tpch_gen_folder (str): Path to the folder containing the TPCH dbgen tool and generated data
@@ -192,24 +198,11 @@ def get_daft_version() -> str:
     return daft.get_version()
 
 
-def get_daft_benchmark_runner_name() -> Literal["ray"] | Literal["native"]:
-    """Test utility that checks the environment variable for the runner that is being used for the benchmarking."""
-    name = os.getenv("DAFT_RUNNER")
-    assert name is not None, "Tests must be run with $DAFT_RUNNER env var"
-    name = name.lower()
-
-    assert name in {"ray", "native"}, f"Runner name not recognized: {name}"
-    return name
-
-
 def get_ray_runtime_env(requirements: str | None) -> dict:
     runtime_env = {
         "py_modules": [daft],
         "eager_install": True,
-        "env_vars": {
-            "DAFT_PROGRESS_BAR": "0",
-            "DAFT_RUNNER": "ray",
-        },
+        "env_vars": {"DAFT_PROGRESS_BAR": "0"},
     }
     if requirements:
         runtime_env.update({"pip": requirements})
@@ -217,11 +210,14 @@ def get_ray_runtime_env(requirements: str | None) -> dict:
 
 
 def warmup_environment(requirements: str | None, parquet_folder: str):
-    """Performs necessary setup of Daft on the current benchmarking environment."""
-    if get_daft_benchmark_runner_name() == "ray":
+    """Performs necessary setup of Daft on the current benchmarking environment"""
+    ctx = daft.context.get_context()
+
+    if ctx.runner_config.name == "ray":
         runtime_env = get_ray_runtime_env(requirements)
 
         ray.init(
+            address=ctx.runner_config.address,
             runtime_env=runtime_env,
         )
 
@@ -270,7 +266,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_parts", default=None, help="Number of parts to generate (defaults to 1 part per GB)", type=int
     )
-    parser.add_argument("--questions", type=str, default=None, help="Comma-separated list of questions to run")
     parser.add_argument("--skip_questions", type=str, default=None, help="Comma-separated list of questions to skip")
     parser.add_argument("--output_csv", default=None, type=str, help="Location to output CSV file")
     parser.add_argument(
@@ -315,19 +310,9 @@ if __name__ == "__main__":
     else:
         warmup_environment(args.requirements, parquet_folder)
 
-    if args.skip_questions is not None:
-        if args.questions is not None:
-            raise ValueError("Cannot specify both --questions and --skip_questions")
-        skip_questions = {int(s) for s in args.skip_questions.split(",")}
-        questions = [q for q in range(1, MetricsBuilder.NUM_TPCH_QUESTIONS + 1) if q not in skip_questions]
-    elif args.questions is not None:
-        questions = sorted(set(int(s) for s in args.questions.split(",")))
-    else:
-        questions = list(range(1, MetricsBuilder.NUM_TPCH_QUESTIONS + 1))
-
     run_all_benchmarks(
         parquet_folder,
-        questions=questions,
+        skip_questions={int(s) for s in args.skip_questions.split(",")} if args.skip_questions is not None else set(),
         csv_output_location=args.output_csv,
         ray_job_dashboard_url=args.ray_job_dashboard_url,
         requirements=args.requirements,

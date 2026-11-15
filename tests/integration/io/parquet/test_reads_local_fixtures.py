@@ -4,9 +4,9 @@ import uuid
 
 import pytest
 
-from daft.recordbatch import MicroPartition
+from daft.table import MicroPartition
 
-BUCKETS = ["retries-parquet-bucket"]
+BUCKETS = ["head-retries-parquet-bucket", "get-retries-parquet-bucket"]
 
 
 @pytest.mark.integration()

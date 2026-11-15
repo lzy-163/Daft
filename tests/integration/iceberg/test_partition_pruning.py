@@ -16,9 +16,8 @@ from tests.conftest import assert_df_equals
 
 @pytest.mark.integration()
 def test_daft_iceberg_table_predicate_pushdown_days(local_iceberg_catalog):
-    catalog_name, pyiceberg_catalog = local_iceberg_catalog
-    tab = pyiceberg_catalog.load_table("default.test_partitioned_by_days")
-    df = daft.read_table(f"{catalog_name}.default.test_partitioned_by_days")
+    tab = local_iceberg_catalog.load_table("default.test_partitioned_by_days")
+    df = daft.read_iceberg(tab)
     df = df.where(df["ts"] < date(2023, 3, 6))
     df.collect()
     daft_pandas = df.to_pandas()
@@ -26,7 +25,7 @@ def test_daft_iceberg_table_predicate_pushdown_days(local_iceberg_catalog):
     # need to use datetime here
     iceberg_pandas = iceberg_pandas[iceberg_pandas["ts"] < datetime(2023, 3, 6, tzinfo=pytz.utc)]
 
-    assert_df_equals(daft_pandas, iceberg_pandas, sort_key=["ts"])
+    assert_df_equals(daft_pandas, iceberg_pandas, sort_key=[])
 
 
 def is_null(obj):
@@ -71,23 +70,19 @@ def udf_func(obj):
     ),
 )
 def test_daft_iceberg_table_predicate_pushdown_on_date_column(predicate, table, limit, local_iceberg_catalog):
-    catalog_name, pyiceberg_catalog = local_iceberg_catalog
-    tab = pyiceberg_catalog.load_table(f"default.{table}")
-    df = daft.read_table(f"{catalog_name}.default.{table}")
+    tab = local_iceberg_catalog.load_table(f"default.{table}")
+    df = daft.read_iceberg(tab)
     df = df.where(predicate(df["dt"]))
     if limit:
-        # Sort before limit so the truncated set is deterministic across
-        # PyIceberg's manifest iteration order and Daft's distributed
-        # scan-task execution order. See `_on_number` below for context.
-        df = df.sort("dt").limit(limit)
+        df = df.limit(limit)
     df.collect()
 
     daft_pandas = df.to_pandas()
     iceberg_pandas = tab.scan().to_arrow().to_pandas()
     iceberg_pandas = iceberg_pandas[predicate(iceberg_pandas["dt"])]
     if limit:
-        iceberg_pandas = iceberg_pandas.sort_values("dt").reset_index(drop=True)[:limit]
-    assert_df_equals(daft_pandas, iceberg_pandas, sort_key=["dt"])
+        iceberg_pandas = iceberg_pandas[:limit]
+    assert_df_equals(daft_pandas, iceberg_pandas, sort_key=[])
 
 
 @pytest.mark.integration()
@@ -115,22 +110,20 @@ def test_daft_iceberg_table_predicate_pushdown_on_date_column(predicate, table, 
     ),
 )
 def test_daft_iceberg_table_predicate_pushdown_on_timestamp_column(predicate, table, limit, local_iceberg_catalog):
-    catalog_name, pyiceberg_catalog = local_iceberg_catalog
-    tab = pyiceberg_catalog.load_table(f"default.{table}")
-    df = daft.read_table(f"{catalog_name}.default.{table}")
+    tab = local_iceberg_catalog.load_table(f"default.{table}")
+    df = daft.read_iceberg(tab)
     df = df.where(predicate(df["ts"]))
     if limit:
-        # Sort before limit; see `_on_number` below for context.
-        df = df.sort("ts").limit(limit)
+        df = df.limit(limit)
     df.collect()
 
     daft_pandas = df.to_pandas()
     iceberg_pandas = tab.scan().to_arrow().to_pandas()
     iceberg_pandas = iceberg_pandas[predicate(iceberg_pandas["ts"])]
     if limit:
-        iceberg_pandas = iceberg_pandas.sort_values("ts").reset_index(drop=True)[:limit]
+        iceberg_pandas = iceberg_pandas[:limit]
 
-    assert_df_equals(daft_pandas, iceberg_pandas, sort_key=["ts"])
+    assert_df_equals(daft_pandas, iceberg_pandas, sort_key=[])
 
 
 @pytest.mark.integration()
@@ -158,21 +151,19 @@ def test_daft_iceberg_table_predicate_pushdown_on_timestamp_column(predicate, ta
     ),
 )
 def test_daft_iceberg_table_predicate_pushdown_on_letter(predicate, table, limit, local_iceberg_catalog):
-    catalog_name, pyiceberg_catalog = local_iceberg_catalog
-    tab = pyiceberg_catalog.load_table(f"default.{table}")
-    df = daft.read_table(f"{catalog_name}.default.{table}")
+    tab = local_iceberg_catalog.load_table(f"default.{table}")
+    df = daft.read_iceberg(tab)
     df = df.where(predicate(df["letter"]))
     if limit:
-        # Sort before limit; see `_on_number` below for context.
-        df = df.sort("letter").limit(limit)
+        df = df.limit(limit)
     df.collect()
     daft_pandas = df.to_pandas()
     iceberg_pandas = tab.scan().to_arrow().to_pandas()
     iceberg_pandas = iceberg_pandas[predicate(iceberg_pandas["letter"])]
     if limit:
-        iceberg_pandas = iceberg_pandas.sort_values("letter").reset_index(drop=True)[:limit]
+        iceberg_pandas = iceberg_pandas[:limit]
 
-    assert_df_equals(daft_pandas, iceberg_pandas, sort_key=["letter"])
+    assert_df_equals(daft_pandas, iceberg_pandas, sort_key=[])
 
 
 @pytest.mark.integration()
@@ -200,31 +191,24 @@ def test_daft_iceberg_table_predicate_pushdown_on_letter(predicate, table, limit
     ),
 )
 def test_daft_iceberg_table_predicate_pushdown_on_number(predicate, table, limit, local_iceberg_catalog):
-    catalog_name, pyiceberg_catalog = local_iceberg_catalog
-    tab = pyiceberg_catalog.load_table(f"default.{table}")
-    df = daft.read_table(f"{catalog_name}.default.{table}")
+    tab = local_iceberg_catalog.load_table(f"default.{table}")
+    df = daft.read_iceberg(tab)
     df = df.where(predicate(df["number"]))
     if limit:
-        # Sort before limit so the truncated set is deterministic across
-        # PyIceberg's manifest iteration order and Daft's distributed
-        # scan-task execution order. Without a sort, LIMIT N picks
-        # whichever rows happen to be read first, which differs between
-        # implementations and is fragile to scheduling changes.
-        df = df.sort("number").limit(limit)
+        df = df.limit(limit)
     df.collect()
     daft_pandas = df.to_pandas()
     iceberg_pandas = tab.scan().to_arrow().to_pandas()
     iceberg_pandas = iceberg_pandas[predicate(iceberg_pandas["number"])]
     if limit:
-        iceberg_pandas = iceberg_pandas.sort_values("number").reset_index(drop=True)[:limit]
+        iceberg_pandas = iceberg_pandas[:limit]
 
-    assert_df_equals(daft_pandas, iceberg_pandas, sort_key=["number"])
+    assert_df_equals(daft_pandas, iceberg_pandas, sort_key=[])
 
 
 @pytest.mark.integration()
 def test_daft_iceberg_table_predicate_pushdown_empty_scan(local_iceberg_catalog):
-    _, pyiceberg_catalog = local_iceberg_catalog
-    tab = pyiceberg_catalog.load_table("default.test_partitioned_by_months")
+    tab = local_iceberg_catalog.load_table("default.test_partitioned_by_months")
     df = daft.read_iceberg(tab)
     df = df.where(df["dt"] > date(2030, 1, 1))
     df.collect()

@@ -4,15 +4,14 @@ import os
 import pathlib
 
 import pandas as pd
-import pytest
 
 import daft
 from tests.conftest import assert_df_equals
 from tests.cookbook.assets import COOKBOOK_DATA_CSV
 
 
-def test_load(daft_df, service_requests_csv_pd_df, repartition_nparts, with_morsel_size):
-    """Loading data from a CSV or Parquet works."""
+def test_load(daft_df, service_requests_csv_pd_df, repartition_nparts):
+    """Loading data from a CSV or Parquet works"""
     pd_slice = service_requests_csv_pd_df
     daft_slice = daft_df.repartition(repartition_nparts)
     daft_pd_df = daft_slice.to_pandas()
@@ -20,7 +19,7 @@ def test_load(daft_df, service_requests_csv_pd_df, repartition_nparts, with_mors
 
 
 def test_load_csv_no_headers(tmp_path: pathlib.Path):
-    """Generate a default set of headers `f0, f1, ... f{n}` when loading a CSV that has no headers."""
+    """Generate a default set of headers `f0, f1, ... f{n}` when loading a CSV that has no headers"""
     csv = tmp_path / "headerless_iris.csv"
     csv.write_text("\n".join(pathlib.Path(COOKBOOK_DATA_CSV).read_text().split("\n")[1:]))
     daft_df = daft.read_csv(str(csv), has_headers=False)
@@ -31,7 +30,7 @@ def test_load_csv_no_headers(tmp_path: pathlib.Path):
 
 
 def test_load_csv_tab_delimited(tmp_path: pathlib.Path):
-    """Generate a default set of headers `col_0, col_1, ... col_{n}` when loading a CSV that has no headers."""
+    """Generate a default set of headers `col_0, col_1, ... col_{n}` when loading a CSV that has no headers"""
     csv = tmp_path / "headerless_iris.csv"
     csv.write_text(pathlib.Path(COOKBOOK_DATA_CSV).read_text().replace(",", "\t"))
     daft_df = daft.read_csv(str(csv), delimiter="\t")
@@ -41,7 +40,7 @@ def test_load_csv_tab_delimited(tmp_path: pathlib.Path):
 
 
 def test_load_json(tmp_path: pathlib.Path):
-    """Generate a default set of headers `col_0, col_1, ... col_{n}` when loading a JSON file."""
+    """Generate a default set of headers `col_0, col_1, ... col_{n}` when loading a JSON file"""
     json_file = tmp_path / "iris.json"
     pd_df = pd.read_csv(COOKBOOK_DATA_CSV)
     pd_df.to_json(json_file, lines=True, orient="records")
@@ -89,12 +88,6 @@ def test_glob_files(tmpdir):
     pd_df = pd_df[~pd_df["path"].str.endswith(".bar")]
     pd_df = pd_df.astype({"num_rows": float})
     assert_df_equals(daft_pd_df, pd_df, sort_key="path")
-
-
-def test_glob_files_with_empty_path():
-    with pytest.raises(ValueError) as excinfo:
-        daft.from_glob_path(path=[]).collect()
-    assert "Must specify at least one glob path" in str(excinfo.value)
 
 
 def test_glob_files_single_file(tmpdir):
@@ -152,80 +145,3 @@ def test_glob_files_recursive(tmpdir):
     pd_df = pd_df.astype({"num_rows": float})
 
     assert_df_equals(daft_pd_df, pd_df, sort_key="path")
-
-
-def test_glob_files_from_multiple_path(tmpdir):
-    folder_a = pathlib.Path(tmpdir) / "abc"
-    folder_b = pathlib.Path(tmpdir) / "bca"
-    folder_c = pathlib.Path(tmpdir) / "cab"
-    folder_a.mkdir()
-    folder_b.mkdir()
-    folder_c.mkdir()
-
-    paths = []
-    for i in range(5):
-        for prefix in [folder_a, folder_b]:
-            filepath = prefix / f"file_{i}.foo"
-            filepath.write_text("a" * i)
-            paths.append(filepath)
-
-        filepath = folder_c / f"file_{i}.foo"
-        filepath.write_text("a" * i)
-
-    # glob files from folder a & b and a non-exist path
-    daft_df = daft.from_glob_path([str(folder_a), str(folder_b), "/not_exists"])
-    daft_pd_df = daft_df.to_pandas()
-
-    listing_records = [
-        {"path": "file://" + str(path.as_posix()), "size": size, "num_rows": None}
-        for path, size in zip(paths, [i for i in range(5) for _ in range(2)])
-    ]
-    pd_df = pd.DataFrame.from_records(listing_records)
-    pd_df = pd_df.astype({"num_rows": float})
-    assert_df_equals(daft_pd_df, pd_df, sort_key="path")
-
-    # glob files from folder a and b twice
-    daft_df = daft.from_glob_path([str(folder_a), str(folder_b), str(folder_a), str(folder_b)])
-    assert_df_equals(daft_df.to_pandas(), pd_df, sort_key="path")
-
-    # glob files with different glob paths with same results.
-    daft_df = daft.from_glob_path([str(folder_a), str(folder_b), str(folder_a) + "/*.foo"])
-    assert_df_equals(daft_df.to_pandas(), pd_df, sort_key="path")
-
-    daft_df = daft.from_glob_path(str(pathlib.Path(tmpdir))).collect()
-    assert 0 == len(daft_df)
-
-    daft_df = daft.from_glob_path("/not_exists").collect()
-    assert 0 == len(daft_df)
-
-
-@pytest.mark.parametrize("batch_size", list(range(1, 10)))
-def test_glob_files_with_limit(batch_size, tmpdir):
-    folder_a = pathlib.Path(tmpdir) / "ab"
-    folder_b = pathlib.Path(tmpdir) / "ac"
-    folder_a.mkdir()
-    folder_b.mkdir()
-
-    filepaths = []
-    for i in range(10):
-        for folder in [folder_a, folder_b]:
-            filepath = folder / f"file_{i}.foo"
-            filepath.write_text("a" * i)
-            filepaths.append(str(filepath))
-    assert 20 == len(filepaths)
-
-    glob_df = daft.from_glob_path(path=[str(folder_a), str(folder_b)]).collect()
-    assert 20 == len(glob_df)
-
-    df = daft.from_glob_path(path=[str(folder_a), str(folder_b), f"{folder_a}/*.foo", f"{folder_b}/*.foo"])
-    glob_df = df.collect()
-    assert 20 == len(glob_df)
-
-    glob_df = df.limit(7).into_batches(batch_size).collect()
-    assert 7 == len(glob_df)
-
-    glob_df = df.limit(17).into_batches(batch_size).collect()
-    assert 17 == len(glob_df)
-
-    glob_df = df.limit(27).into_batches(batch_size).collect()
-    assert 20 == len(glob_df)

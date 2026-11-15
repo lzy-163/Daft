@@ -1,13 +1,14 @@
 use bytes::Bytes;
-use futures::{StreamExt, stream::BoxStream};
 
 use crate::stats::{IOStatsByteStreamContextHandle, IOStatsRef};
 
-pub fn io_stats_on_bytestream(
+use futures::{stream::BoxStream, StreamExt};
+
+pub(crate) fn io_stats_on_bytestream(
     mut s: impl futures::stream::Stream<Item = super::Result<Bytes>>
-    + Unpin
-    + std::marker::Send
-    + 'static,
+        + Unpin
+        + std::marker::Send
+        + 'static,
     io_stats: Option<IOStatsRef>,
 ) -> BoxStream<'static, super::Result<Bytes>> {
     if let Some(io_stats) = io_stats {

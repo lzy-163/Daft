@@ -1,39 +1,38 @@
-use std::{
-    collections::HashSet,
-    path::Path,
-    sync::{Arc, LazyLock},
-};
-
 use async_stream::stream;
 use futures::stream::{BoxStream, StreamExt};
-use globset::{GlobBuilder, GlobMatcher};
 use itertools::Itertools;
+use std::{collections::HashSet, path::Path, sync::Arc};
 use tokio::sync::mpsc::Sender;
+
+use globset::{GlobBuilder, GlobMatcher};
+use lazy_static::lazy_static;
 
 use crate::{
     object_io::{FileMetadata, FileType, ObjectSource},
-    range_expansion::expand_numeric_ranges,
     stats::IOStatsRef,
-    utils::{GLOB_DELIMITER, verify_glob},
 };
 
-/// Check if a given char is considered a special glob character
-/// NOTE: we use the `globset` crate which defines the following glob behavior:
-/// https://docs.rs/globset/latest/globset/index.html#syntax
-static GLOB_SPECIAL_CHARACTERS: LazyLock<HashSet<char>> =
-    LazyLock::new(|| HashSet::from(['*', '?', '{', '}', '[', ']']));
+lazy_static! {
+    /// Check if a given char is considered a special glob character
+    /// NOTE: we use the `globset` crate which defines the following glob behavior:
+    /// https://docs.rs/globset/latest/globset/index.html#syntax
+    static ref GLOB_SPECIAL_CHARACTERS: HashSet<char> = HashSet::from(['*', '?', '{', '}', '[', ']']);
+}
 
 const SCHEME_SUFFIX_LEN: usize = "://".len();
 
-// NOTE: We use the following suffixes to filter out Spark/Databricks marker files
+/// NOTE: Our globbing logic makes very strong assumptions about the delimiter being used to denote
+/// directories. The concept of a "glob" is a Unix concept anyways, and so even for Windows machines
+/// the `glob` utility can only be used with POSIX-style paths.
+const GLOB_DELIMITER: &str = "/";
+
+// NOTE: We use the following suffixes to filter out Spark marker files
 const MARKER_SUFFIXES: [&str; 1] = [".crc"];
-// NOTE: We use the following file names to filter out Spark/Databricks marker files
+// NOTE: We use the following file names to filter out Spark marker files
 const MARKER_FILES: [&str; 3] = ["_metadata", "_common_metadata", "_success"];
-// NOTE: We use the following prefixes to filter out Spark/Databricks marker files
-const MARKER_PREFIXES: [&str; 2] = ["_started", "_committed"];
 
 #[derive(Clone)]
-pub struct GlobState {
+pub(crate) struct GlobState {
     // Current path in dirtree and glob_fragments
     pub current_path: String,
     pub current_fragment_idx: usize,
@@ -57,16 +56,16 @@ impl GlobState {
     }
 
     pub fn advance(self, path: String, idx: usize, fanout_factor: usize) -> Self {
-        Self {
+        GlobState {
             current_path: path,
             current_fragment_idx: idx,
             current_fanout: self.current_fanout * fanout_factor,
-            ..self
+            ..self.clone()
         }
     }
 
     pub fn with_wildcard_mode(self) -> Self {
-        Self {
+        GlobState {
             wildcard_mode: true,
             ..self
         }
@@ -74,7 +73,7 @@ impl GlobState {
 }
 
 #[derive(Debug, Clone)]
-pub struct GlobFragment {
+pub(crate) struct GlobFragment {
     data: String,
     escaped_data: String,
     first_wildcard_idx: Option<usize>,
@@ -112,17 +111,20 @@ impl GlobFragment {
         let mut ptr = 0;
         while ptr < data.len() {
             let remaining = &data[ptr..];
-            if let Some(backslash_idx) = remaining.find(r"\\") {
-                escaped_data.push_str(&remaining[..backslash_idx].replace('\\', ""));
-                escaped_data.extend(std::iter::once('\\'));
-                ptr += backslash_idx + 2;
-            } else {
-                escaped_data.push_str(&remaining.replace('\\', ""));
-                break;
+            match remaining.find(r"\\") {
+                Some(backslash_idx) => {
+                    escaped_data.push_str(&remaining[..backslash_idx].replace('\\', ""));
+                    escaped_data.extend(std::iter::once('\\'));
+                    ptr += backslash_idx + 2;
+                }
+                None => {
+                    escaped_data.push_str(&remaining.replace('\\', ""));
+                    break;
+                }
             }
         }
 
-        Self {
+        GlobFragment {
             data: data.to_string(),
             first_wildcard_idx,
             escaped_data,
@@ -135,11 +137,11 @@ impl GlobFragment {
     }
 
     /// Joins a slice of GlobFragments together with a separator
-    pub fn join(fragments: &[Self], sep: &str) -> Self {
-        Self::new(
+    pub fn join(fragments: &[GlobFragment], sep: &str) -> Self {
+        GlobFragment::new(
             fragments
                 .iter()
-                .map(|frag: &Self| frag.data.as_str())
+                .map(|frag: &GlobFragment| frag.data.as_str())
                 .join(sep)
                 .as_str(),
         )
@@ -164,7 +166,7 @@ impl GlobFragment {
 ///   2. Non-wildcard fragments are joined and coalesced by delimiter
 ///   3. The first fragment is prefixed by "{scheme}://"
 ///   4. Preserves any leading delimiters
-pub fn to_glob_fragments(glob_str: &str) -> super::Result<Vec<GlobFragment>> {
+pub(crate) fn to_glob_fragments(glob_str: &str) -> super::Result<Vec<GlobFragment>> {
     // NOTE: We only use the URL parse library to get the scheme, because it will escape some of our glob special characters
     // such as ? and {}
     let glob_url = url::Url::parse(glob_str).map_err(|e| super::Error::InvalidUrl {
@@ -226,7 +228,7 @@ pub fn to_glob_fragments(glob_str: &str) -> super::Result<Vec<GlobFragment>> {
 ///
 /// * First attempts to non-recursively list all Files and Directories under the current `uri`
 /// * If during iteration we detect the number of Directories being returned exceeds `max_dirs`, we
-///   fall back onto a prefix list of all Files with the current `uri` as the prefix
+///     fall back onto a prefix list of all Files with the current `uri` as the prefix
 ///
 /// Returns a tuple `(file_metadata_stream: BoxStream<...>, dir_count: usize)` where the second element
 /// indicates the number of Directory entries contained within the stream
@@ -276,18 +278,21 @@ async fn ls_with_prefix_fallback(
     // Iterate and collect results into the `results_buffer`, but terminate early if too many directories are found
     let mut dir_count_so_far = 0;
     while let Some(fm) = fm_stream.next().await {
-        if let Ok(fm) = &fm
-            && matches!(fm.filetype, FileType::Directory)
-        {
-            dir_count_so_far += 1;
-            // STOP EARLY!!
-            // If the number of directory results are more than `max_dirs`, we terminate the function early,
-            // throw away our results buffer and return a stream of FileType::File files using `prefix_ls` instead
-            if max_dirs.is_some_and(|max_dirs| dir_count_so_far > max_dirs) {
-                return (
-                    prefix_ls(source.clone(), uri.to_string(), page_size, io_stats),
-                    0,
-                );
+        if let Ok(fm) = &fm {
+            if matches!(fm.filetype, FileType::Directory) {
+                dir_count_so_far += 1;
+                // STOP EARLY!!
+                // If the number of directory results are more than `max_dirs`, we terminate the function early,
+                // throw away our results buffer and return a stream of FileType::File files using `prefix_ls` instead
+                if max_dirs
+                    .map(|max_dirs| dir_count_so_far > max_dirs)
+                    .unwrap_or(false)
+                {
+                    return (
+                        prefix_ls(source.clone(), uri.to_string(), page_size, io_stats),
+                        0,
+                    );
+                }
             }
         }
         results_buffer.push(fm);
@@ -299,7 +304,7 @@ async fn ls_with_prefix_fallback(
 }
 
 /// Helper to filter FileMetadata entries that should not be returned by globbing
-fn should_return(fm: &FileMetadata) -> bool {
+fn _should_return(fm: &FileMetadata) -> bool {
     let file_path = fm.filepath.to_lowercase();
     let file_name = Path::new(&file_path).file_name().and_then(|f| f.to_str());
     match fm.filetype {
@@ -316,12 +321,8 @@ fn should_return(fm: &FileMetadata) -> bool {
             if MARKER_SUFFIXES
                 .iter()
                 .any(|suffix| file_path.ends_with(suffix))
-                || file_name.is_some_and(|file| MARKER_FILES.contains(&file))
-                || file_name.is_some_and(|file| {
-                    MARKER_PREFIXES
-                        .iter()
-                        .any(|m_prefix| file.starts_with(m_prefix))
-                }) =>
+                || file_name
+                    .is_some_and(|file| MARKER_FILES.iter().any(|m_file| file == *m_file)) =>
         {
             false
         }
@@ -345,11 +346,11 @@ fn should_return(fm: &FileMetadata) -> bool {
 /// * source: the ObjectSource to use for file listing
 /// * glob: the string to glob
 /// * fanout_limit: number of directories at which to fallback onto prefix listing, or None to never fall back.
-///   A reasonable number here for a remote object store is something like 1024, which saturates the number of
-///   parallel connections (usually defaulting to 64).
+///     A reasonable number here for a remote object store is something like 1024, which saturates the number of
+///     parallel connections (usually defaulting to 64).
 /// * page_size: control the returned results page size, or None to use the ObjectSource's defaults. Usually only used for testing
-///   but may yield some performance improvements depending on the workload.
-pub async fn glob(
+///     but may yield some performance improvements depending on the workload.
+pub(crate) async fn glob(
     source: Arc<dyn ObjectSource>,
     glob: &str,
     fanout_limit: Option<usize>,
@@ -357,10 +358,6 @@ pub async fn glob(
     limit: Option<usize>,
     io_stats: Option<IOStatsRef>,
 ) -> super::Result<BoxStream<'static, super::Result<FileMetadata>>> {
-    // Expand numeric ranges like {0..10} to {0,1,2,...,10} before processing
-    let expanded_glob = expand_numeric_ranges(glob)?;
-    let glob = &*expanded_glob;
-
     // If no special characters, we fall back to ls behavior
     let full_fragment = GlobFragment::new(glob);
     if !full_fragment.has_special_character() {
@@ -381,10 +378,10 @@ pub async fn glob(
             }
             if attempt_as_dir {
                 let mut results = source.iter_dir(glob.as_str(), true, page_size, io_stats).await?;
-                while let Some(result) = results.next().await && remaining_results.is_none_or(|rr| rr > 0) {
+                while let Some(result) = results.next().await && remaining_results.map(|rr| rr > 0).unwrap_or(true) {
                     match result {
                         Ok(fm) => {
-                            if should_return(&fm) {
+                            if _should_return(&fm) {
                                 remaining_results = remaining_results.map(|rr| rr - 1);
                                 yield Ok(fm)
                             }
@@ -405,10 +402,6 @@ pub async fn glob(
         glob.to_string()
     };
     let glob = glob.as_str();
-
-    // Validate the glob pattern, this is necessary since the `globset` crate is overly permissive and happily compiles patterns
-    // like "/foo/bar/**.txt" which don't make sense.
-    verify_glob(glob)?;
 
     let glob_fragments = to_glob_fragments(glob)?;
     let full_glob_matcher = GlobBuilder::new(glob)
@@ -438,7 +431,7 @@ pub async fn glob(
             log::debug!(
                 target: "glob",
                 "Visiting '{}' with glob_fragments: {:?}",
-                state.current_path, state.glob_fragments
+                &state.current_path, &state.glob_fragments
             );
             let current_fragment = state.current_glob_fragment();
 
@@ -479,10 +472,8 @@ pub async fn glob(
                                     if state.full_glob_matcher.is_match(fm.filepath.as_str()) =>
                                 {
                                     if let Some(e) = result_tx.send(Ok(fm)).await.err() {
-                                        log::debug!(
-                                            "Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}"
-                                        );
-                                    }
+                                        log::debug!("Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}");
+                                    };
                                 }
                                 _ => (),
                             }
@@ -491,9 +482,7 @@ pub async fn glob(
                         Err(super::Error::NotFound { .. }) if state.wildcard_mode => (),
                         Err(e) => {
                             if let Some(e) = result_tx.send(Err(e)).await.err() {
-                                log::debug!(
-                                    "Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}"
-                                );
+                                log::debug!("Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}");
                             }
                         }
                     }
@@ -512,20 +501,17 @@ pub async fn glob(
                             Ok(fm) => {
                                 if matches!(fm.filetype, FileType::File)
                                     && state.full_glob_matcher.is_match(fm.filepath.as_str())
-                                    && let Some(e) = result_tx.send(Ok(fm)).await.err()
                                 {
-                                    log::debug!(
-                                        "Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}"
-                                    );
+                                    if let Some(e) = result_tx.send(Ok(fm)).await.err() {
+                                        log::debug!("Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}");
+                                    }
                                 }
                             }
                             // Silence NotFound errors when in wildcard "search" mode
                             Err(super::Error::NotFound { .. }) if state.wildcard_mode => (),
                             Err(e) => {
                                 if let Some(e) = result_tx.send(Err(e)).await.err() {
-                                    log::debug!(
-                                        "Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}"
-                                    );
+                                    log::debug!("Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}");
                                 }
                             }
                         }
@@ -549,9 +535,7 @@ pub async fn glob(
                             {
                                 let fm = single_file_ls.files.drain(..).next().unwrap();
                                 if let Some(e) = result_tx.send(Ok(fm)).await.err() {
-                                    log::debug!(
-                                        "Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}"
-                                    );
+                                    log::debug!("Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}");
                                 }
                             }
                         }
@@ -559,19 +543,17 @@ pub async fn glob(
                         Err(super::Error::NotFound { .. }) if state.wildcard_mode => (),
                         Err(e) => {
                             if let Some(e) = result_tx.send(Err(e)).await.err() {
-                                log::debug!(
-                                    "Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}"
-                                );
+                                log::debug!("Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}");
                             }
                         }
-                    }
+                    };
                 }
 
             // RECURSIVE CASE: current_fragment contains a special character (e.g. *)
             } else if current_fragment.has_special_character() {
                 let partial_glob_matcher = GlobBuilder::new(
                     GlobFragment::join(
-                        &state.glob_fragments[..=state.current_fragment_idx],
+                        &state.glob_fragments[..state.current_fragment_idx + 1],
                         GLOB_DELIMITER,
                     )
                     .raw_str(),
@@ -618,9 +600,7 @@ pub async fn glob(
                                 if state.full_glob_matcher.is_match(fm.filepath.as_str()) =>
                             {
                                 if let Some(e) = result_tx.send(Ok(fm)).await.err() {
-                                    log::debug!(
-                                        "Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}"
-                                    );
+                                    log::debug!("Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}");
                                 }
                             }
                             _ => (),
@@ -629,9 +609,7 @@ pub async fn glob(
                         Err(super::Error::NotFound { .. }) => (),
                         Err(e) => {
                             if let Some(e) = result_tx.send(Err(e)).await.err() {
-                                log::debug!(
-                                    "Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}"
-                                );
+                                log::debug!("Sender unable to send results into channel during glob (this is expected if a limit was applied, which results in early termination): {e}");
                             }
                         }
                     }
@@ -656,7 +634,7 @@ pub async fn glob(
         to_rtn_tx,
         source.clone(),
         GlobState {
-            current_path: String::new(),
+            current_path: "".to_string(),
             current_fragment_idx: 0,
             glob_fragments: Arc::new(glob_fragments),
             full_glob_matcher: Arc::new(full_glob_matcher),
@@ -670,9 +648,9 @@ pub async fn glob(
 
     let to_rtn_stream = stream! {
         let mut remaining_results = limit;
-        while remaining_results.is_none_or(|rr| rr > 0) && let Some(v) = to_rtn_rx.recv().await {
+        while remaining_results.map(|rr| rr > 0).unwrap_or(true) && let Some(v) = to_rtn_rx.recv().await {
 
-            if v.as_ref().is_ok_and(|v| !should_return(v)) {
+            if v.as_ref().is_ok_and(|v| !_should_return(v)) {
                 continue
             }
 

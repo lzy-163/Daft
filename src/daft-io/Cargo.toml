@@ -1,74 +1,60 @@
 [dependencies]
 async-recursion = "1.0.4"
-async-stream = {workspace = true}
-async-trait = {workspace = true}
-aws-config = "1.12.0"
-aws-credential-types = {version = "1.2.7", features = ["hardcoded-credentials"]}
-aws-sdk-s3 = {version = "1.152.0", features = ["default-https-client", "rt-tokio", "sigv4a"], default-features = false}
-aws-smithy-http-client = "1.1.2"
-aws-smithy-runtime-api = "1.8.0"
-azure_core = {version = "1.1.0", features = ["reqwest", "reqwest_rustls", "tokio", "hmac_rust", "xml"], default-features = false}
-azure_identity = {version = "1.0.0", features = ["tokio"], default-features = false}
-azure_storage_blob = {version = "1.1.0", default-features = false}
+async-stream = "0.3.5"
+async-trait = "0.1.79"
+aws-config = {version = "0.55.3", features = ["native-tls", "rt-tokio", "client-hyper", "credentials-sso"], default-features = false}
+aws-credential-types = {version = "0.55.3", features = ["hardcoded-credentials"]}
+aws-sdk-s3 = {version = "0.28.0", features = ["native-tls", "rt-tokio"], default-features = false}
+aws-sig-auth = "0.55.3"
+aws-sigv4 = "0.55.3"
+aws-smithy-async = "0.55.3"
+aws-smithy-client = "0.55.3"
+azure_storage = {version = "0.17.0", features = ["enable_reqwest"], default-features = false}
+azure_storage_blobs = {version = "0.17.0", features = ["enable_reqwest"], default-features = false}
 bytes = {workspace = true}
 common-error = {path = "../common/error", default-features = false}
-common-file-formats = {path = "../common/file-formats", default-features = false}
 common-io-config = {path = "../common/io-config", default-features = false}
-common-runtime = {path = "../common/runtime", default-features = false}
+daft-core = {path = "../daft-core", default-features = false}
 futures = {workspace = true}
 globset = "0.4"
-gcloud-storage = {version = "=1.3.0", default-features = false, features = ["rustls-tls", "auth", "jwt-aws-lc-rs"]}
-token-source = "=1.0.0"
-hf-xet = "=1.7"
-home = "0.5.12"
+hyper = "0.14.27"
+hyper-tls = "0.5.0"
 itertools = {workspace = true}
+lazy_static = {workspace = true}
 log = {workspace = true}
-opendal = {version = "0.58", default-features = false, features = [
-  "executors-tokio",  # Use tokio for async execution
-  "http-transport-reqwest",  # Reqwest HTTP transport (required for cloud services in 0.58+)
-  "layers-timeout",  # TimeoutLayer guarding against stalled IO (no default timeouts otherwise)
-  "services-oss",  # Alibaba Cloud Object Storage Service
-  "services-cos",  # Tencent Cloud Object Storage
-  "services-obs",  # Huawei Cloud Object Storage
-  "services-tos",  # Volcengine TOS (Torch Object Storage)
-  "services-goosefs",  # Tencent Cloud GooseFS distributed cache
-  "services-memory",  # In-memory backend (used for testing)
-  "services-fs",  # Local filesystem (used for integration testing)
-  "services-github"  # GitHub repository contents
-]}
+openssl-sys = {version = "0.9.102", features = ["vendored"]}
 pyo3 = {workspace = true, optional = true}
-rand = {workspace = true}
-regex = {workspace = true}
-reqwest = {workspace = true, default-features = false, features = ["stream", "json"]}
-reqwest-middleware = "0.5"
-reqwest-retry = "0.9"
+pyo3-log = {workspace = true, optional = true}
+rand = "0.8.5"
+regex = {version = "1.9.5"}
 serde = {workspace = true}
+serde_json = {workspace = true}
 snafu = {workspace = true}
-thiserror = {workspace = true}
 tokio = {workspace = true}
 tokio-stream = {workspace = true}
-tracing = {workspace = true}
 url = {workspace = true}
-uuid = {workspace = true}
+
+[dependencies.google-cloud-storage]
+default-features = false
+features = ["default-tls", "auth"]
+# branch = "main"
+git = "https://github.com/yoshidan/google-cloud-rust"
+package = "google-cloud-storage"
+rev = "65251957f6aed2eb8adb62b9a9a1b9996150d265"
+version = "0.15.0"
+
+[dependencies.reqwest]
+default-features = false
+features = ["stream", "native-tls"]
+version = "0.11.18"
 
 [dev-dependencies]
-md5 = "0.8.0"
-opendal = {version = "0.58", default-features = false, features = [
-  "services-http"  # HTTP backend (used for stalled-response timeout tests)
-]}
-tempfile = "3.23.0"
+md5 = "0.7.0"
+tempfile = "3.8.1"
 
 [features]
-hdfs = ["opendal/services-hdfs"]
-python = [
-  "dep:pyo3",
-  "common-error/python",
-  "common-io-config/python",
-  "common-file-formats/python"
-]
-
-[lints]
-workspace = true
+default = ["python"]
+python = ["dep:pyo3", "dep:pyo3-log", "common-error/python", "daft-core/python", "common-io-config/python"]
 
 [package]
 edition = {workspace = true}

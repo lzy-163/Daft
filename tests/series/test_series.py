@@ -1,21 +1,15 @@
 from __future__ import annotations
 
 import copy
-import gc
-import os
-import uuid
 from collections import Counter
 from datetime import date, datetime
 
 import numpy as np
-import psutil
 import pyarrow as pa
 import pytest
 
 from daft import DataType, Series
 from tests.series import ARROW_FLOAT_TYPES, ARROW_INT_TYPES, ARROW_STRING_TYPES
-
-IS_CI = True if os.getenv("CI") else False
 
 
 class CustomTestObject:
@@ -77,14 +71,14 @@ def test_series_pyobj_roundtrip() -> None:
 def test_series_pyobj_strict_arrow_err() -> None:
     objects = [0, CustomTestObject(1)]
 
-    with pytest.raises(TypeError):
+    with pytest.raises(pa.lib.ArrowInvalid):
         Series.from_pylist(objects, pyobj="disallow")
 
 
 def test_series_pyobj_explicit_roundtrip() -> None:
     objects = [0, 1.1, "foo"]
 
-    s = Series.from_pylist(objects, dtype=DataType.python())
+    s = Series.from_pylist(objects, pyobj="force")
 
     result = s.to_pylist()
 
@@ -118,30 +112,8 @@ def test_series_pylist_round_trip_null() -> None:
     assert words["None"] == 2
 
 
-def test_series_pylist_round_trip_all_null_list_with_explicit_dtype() -> None:
-    s = Series.from_pylist([None, None], dtype=DataType.list(DataType.string()))
-
-    assert s.datatype() == DataType.list(DataType.string())
-    assert s.to_pylist() == [None, None]
-
-
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        DataType.list(DataType.extension("test.tags", DataType.string())),
-        DataType.list(DataType.list(DataType.extension("test.tags", DataType.string()))),
-    ],
-)
-def test_series_pylist_round_trip_all_null_extension_list_with_explicit_dtype(dtype) -> None:
-    s = Series.from_pylist([None, None], dtype=dtype)
-
-    assert s.datatype() == dtype
-    assert s.to_pylist() == [None, None]
-
-
-@pytest.mark.parametrize("type", [pa.binary(), pa.binary(1)])
-def test_series_pylist_round_trip_binary(type) -> None:
-    data = pa.array([b"a", b"b", b"c", None, b"d", None], type=type)
+def test_series_pylist_round_trip_binary() -> None:
+    data = pa.array([b"a", b"b", b"c", None, b"d", None])
 
     s = Series.from_arrow(data)
 
@@ -170,16 +142,6 @@ def test_series_bincode_serdes(dtype) -> None:
     assert s.to_pylist() == copied_s.to_pylist()
 
 
-def test_series_bincode_serdes_fixed_size_binary() -> None:
-    s = Series.from_arrow(pa.array([b"a", b"b", b"c", None, b"d", None], type=pa.binary(1)))
-    serialized = s._debug_bincode_serialize()
-    copied_s = Series._debug_bincode_deserialize(serialized)
-
-    assert s.name() == copied_s.name()
-    assert s.datatype() == copied_s.datatype()
-    assert s.to_pylist() == copied_s.to_pylist()
-
-
 @pytest.mark.parametrize(
     "data",
     [
@@ -194,20 +156,6 @@ def test_series_bincode_serdes_on_data(data) -> None:
     serialized = s._debug_bincode_serialize()
     copied_s = Series._debug_bincode_deserialize(serialized)
 
-    assert s.name() == copied_s.name()
-    assert s.datatype() == copied_s.datatype()
-    assert s.to_pylist() == copied_s.to_pylist()
-
-
-@pytest.mark.skipif(
-    not hasattr(pa, "uuid"),
-    reason="Arrow version doesn't support the uuid extension type.",
-)
-def test_series_bincode_serdes_on_uuid_array(uuid_ext_type) -> None:
-    data = pa.array([uuid.uuid4().bytes for _ in range(5)], type=pa.uuid())
-    s = Series.from_arrow(data)
-    serialized = s._debug_bincode_serialize()
-    copied_s = Series._debug_bincode_deserialize(serialized)
     assert s.name() == copied_s.name()
     assert s.datatype() == copied_s.datatype()
     assert s.to_pylist() == copied_s.to_pylist()
@@ -243,166 +191,3 @@ def test_series_bincode_serdes_on_null_types() -> None:
     assert s.name() == copied_s.name()
     assert s.datatype() == copied_s.datatype()
     assert s.to_pylist() == copied_s.to_pylist()
-
-
-def test_series_numpy_datetime64_datetime():
-    from datetime import datetime
-
-    py_datetimes = [
-        datetime(2020, 10, 1, 12, 30, 45),
-        datetime(2021, 10, 2, 13, 31, 46),
-        datetime(2022, 10, 3, 14, 32, 47),
-        datetime(2023, 10, 4, 15, 33, 48),
-        datetime(2024, 10, 5, 16, 34, 49),
-        datetime(2025, 10, 6, 17, 35, 50),
-    ]
-    for format_ in ["s", "ms", "us", "ns"]:
-        list_from_datetimes = [np.datetime64(dt, format_) for dt in py_datetimes]
-        # test from_pylist
-        s1 = Series.from_pylist(list_from_datetimes)
-        assert s1.to_pylist() == py_datetimes
-        # test from_numpy
-        s2 = Series.from_numpy(np.array(list_from_datetimes))
-        assert s2.to_pylist() == py_datetimes
-
-
-def test_series_numpy_datetime64_date():
-    from datetime import datetime
-
-    py_datetimes = [
-        datetime(2020, 10, 1, 12, 30, 45),
-        datetime(2021, 10, 2, 13, 31, 46),
-        datetime(2022, 10, 3, 14, 32, 47),
-        datetime(2023, 10, 4, 15, 33, 48),
-        datetime(2024, 10, 5, 16, 34, 49),
-        datetime(2025, 10, 6, 17, 35, 50),
-    ]
-    py_dates = [dt.date() for dt in py_datetimes]
-    for format_ in ["D"]:
-        # make list of numpy datetime64
-        list_from_datetimes = [np.datetime64(dt, format_) for dt in py_datetimes]
-        list_from_dates = [np.datetime64(d, format_) for d in py_dates]
-        # test from_pylist
-        s1 = Series.from_pylist(list_from_datetimes)
-        s2 = Series.from_pylist(list_from_dates)
-        assert s1.to_pylist() == py_dates
-        assert s2.to_pylist() == py_dates
-        # test from_numpy
-        s3 = Series.from_numpy(np.array(list_from_datetimes))
-        s4 = Series.from_numpy(np.array(list_from_dates))
-        assert s3.to_pylist() == py_dates
-        assert s4.to_pylist() == py_dates
-
-
-def test_series_iter() -> None:
-    arrow = pa.array([1, 2, 3, None, 5, None])
-    s = Series.from_arrow(arrow)
-    for original, iterated in zip(arrow, s):
-        assert original.as_py() == iterated
-
-
-def get_memory_usage() -> float:
-    """Get the current memory usage in MiB."""
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / (1024 * 1024)
-
-
-@pytest.mark.skipif(IS_CI, reason="Memory usage test is flaky in CI environments")
-def test_series_iter_memory_efficiency() -> None:
-    # Create a Series with 1 million elements.
-    n = 1000_000
-    arrow = pa.array(list(range(n)))
-    s = Series.from_arrow(arrow)
-    sum_using_iter = 0
-    sum_using_pylist = 0
-
-    # Force garbage collection before measurements.
-    gc.collect()
-
-    # Test 1: Using iterator.
-    iter_memory_before = get_memory_usage()
-    iter_peak_memory = 0
-    for i, item in enumerate(s):
-        sum_using_iter += item or 0
-        # Periodically check peak memory usage.
-        if i % 100_000 == 0:
-            current_memory = get_memory_usage() - iter_memory_before
-            iter_peak_memory = max(iter_peak_memory, current_memory)
-
-    current_memory = get_memory_usage() - iter_memory_before
-    iter_peak_memory = max(iter_peak_memory, current_memory)
-
-    # Force garbage collection before the next test.
-    gc.collect()
-
-    # Test 2: Using to_pylist().
-    pylist_memory_before = get_memory_usage()
-    pylist_peak_memory = 0
-    py_list = s.to_pylist()
-    for i, item in enumerate(py_list):
-        sum_using_pylist += item or 0
-        # Periodically check peak memory usage.
-        if i % 100_000 == 0:
-            current_memory = get_memory_usage() - pylist_memory_before
-            pylist_peak_memory = max(pylist_peak_memory, current_memory)
-
-    current_memory = get_memory_usage() - pylist_memory_before
-    pylist_peak_memory = max(pylist_peak_memory, current_memory)
-
-    # Check correctness.
-    assert sum_using_iter == sum_using_pylist
-    # Assert that the iterator uses less memory.
-    assert iter_peak_memory < pylist_peak_memory, "Iterator should use less memory than to_pylist()"
-
-
-def test_series_getitem() -> None:
-    s = Series.from_pylist([1, 2, 3, 4, 5, 6])
-    # Basic indexing
-    assert s[0] == 1
-    assert s[3] == 4
-    assert s[5] == 6
-
-    # Negative indexing
-    assert s[-1] == 6
-    assert s[-3] == 4
-    assert s[-5] == 2
-
-    # index out of range
-    with pytest.raises(IndexError, match="Series index out of range"):
-        _ = s[6]
-    with pytest.raises(IndexError, match="Series index out of range"):
-        _ = s[-7]
-
-    # Basic slicing
-    res = s[1:4]
-    assert isinstance(res, Series)
-    assert res.to_pylist() == [2, 3, 4]
-    assert s[:3].to_pylist() == [1, 2, 3]
-    assert s[3:].to_pylist() == [4, 5, 6]
-    assert s[:].to_pylist() == [1, 2, 3, 4, 5, 6]
-
-    # Negative indices
-    assert s[-2:].to_pylist() == [5, 6]
-    assert s[:-1].to_pylist() == [1, 2, 3, 4, 5]
-    assert s[-4:-1].to_pylist() == [3, 4, 5]
-    assert s[-6:2].to_pylist() == [1, 2]
-    assert s[2:-1].to_pylist() == [3, 4, 5]
-
-    # Out-of-bounds and empty slices
-    assert s[-100:100].to_pylist() == [1, 2, 3, 4, 5, 6]
-    assert s[100:200].to_pylist() == []
-    assert s[-10:-10].to_pylist() == []
-    assert s[-7:10].to_pylist() == [1, 2, 3, 4, 5, 6]
-    assert s[2:2].to_pylist() == []
-
-    # slice step error
-    with pytest.raises(IndexError, match="slice step not supported"):
-        _ = s[::2]
-    with pytest.raises(IndexError, match="slice step not supported"):
-        _ = s[1:5:1]
-
-    # type error
-    with pytest.raises(Exception):
-        _ = s[0.1:1.8]
-    with pytest.raises(TypeError, match="expected int or slice for index"):
-        _ = s[1.1]

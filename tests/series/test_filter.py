@@ -4,10 +4,13 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
+from daft.context import get_context
 from daft.datatype import DataType
 from daft.series import Series
-from tests.conftest import get_tests_daft_runner_name
+from daft.utils import pyarrow_supports_fixed_shape_tensor
 from tests.series import ARROW_FLOAT_TYPES, ARROW_INT_TYPES, ARROW_STRING_TYPES
+
+ARROW_VERSION = tuple(int(s) for s in pa.__version__.split(".") if s.isnumeric())
 
 
 @pytest.mark.parametrize("dtype", ARROW_INT_TYPES + ARROW_FLOAT_TYPES + ARROW_STRING_TYPES)
@@ -51,9 +54,8 @@ def test_series_filter_on_bool() -> None:
     assert result.to_pylist() == expected
 
 
-@pytest.mark.parametrize("type", [pa.binary(), pa.binary(1)])
-def test_series_filter_on_binary(type) -> None:
-    s = Series.from_arrow(pa.array([b"Y", b"N", None, b"Y", None, b"N"], type=type))
+def test_series_filter_on_binary() -> None:
+    s = Series.from_pylist([b"Y", b"N", None, b"Y", None, b"N"])
     pymask = [False, True, True, None, False, False]
     mask = Series.from_pylist(pymask)
 
@@ -114,7 +116,7 @@ def test_series_filter_on_struct_array() -> None:
 
 
 @pytest.mark.skipif(
-    get_tests_daft_runner_name() == "ray",
+    get_context().runner_config.name == "ray",
     reason="pyarrow extension types aren't supported on Ray clusters.",
 )
 def test_series_filter_on_extension_array(uuid_ext_type) -> None:
@@ -132,6 +134,10 @@ def test_series_filter_on_extension_array(uuid_ext_type) -> None:
     assert result.to_pylist() == expected
 
 
+@pytest.mark.skipif(
+    not pyarrow_supports_fixed_shape_tensor(),
+    reason=f"Arrow version {ARROW_VERSION} doesn't support the canonical tensor extension type.",
+)
 def test_series_filter_on_canonical_tensor_extension_array() -> None:
     arr = np.arange(20).reshape((5, 2, 2))
     data = pa.FixedShapeTensorArray.from_numpy_ndarray(arr)
@@ -172,61 +178,6 @@ def test_series_filter_broadcast(dtype) -> None:
     assert s.datatype() == result.datatype()
 
     assert result.to_pylist() == s.to_pylist()
-
-
-def test_series_filter_sparse_union() -> None:
-    type_ids = pa.array([0, 1, 2, 0, 1, 2], type=pa.int8())
-    int_child = pa.array([10, 0, 0, 40, 0, 0], type=pa.int32())
-    float_child = pa.array([0.0, 2.2, 0.0, 0.0, 5.5, 0.0], type=pa.float64())
-    str_child = pa.array(["", "", "c", "", "", "f"], type=pa.large_utf8())
-    arrow_arr = pa.UnionArray.from_sparse(type_ids, [int_child, float_child, str_child], field_names=["i", "f", "s"])
-    s = Series.from_arrow(arrow_arr)
-    # s = [10, 2.2, 'c', 40, 5.5, 'f']
-    pymask = [True, False, True, False, True, False]
-    mask = Series.from_pylist(pymask)
-
-    result = s.filter(mask)
-
-    assert result.datatype() == s.datatype()
-    expected = [v for v, keep in zip(s.to_pylist(), pymask) if keep]
-    assert result.to_pylist() == expected  # [10, 'c', 5.5]
-
-
-def test_series_filter_dense_union() -> None:
-    type_ids = pa.array([0, 1, 0, 0, 1], type=pa.int8())
-    offsets = pa.array([0, 0, 1, 2, 1], type=pa.int32())
-    int_child = pa.array([10, 30, 40], type=pa.int32())
-    float_child = pa.array([2.2, 5.5], type=pa.float64())
-    arrow_arr = pa.UnionArray.from_dense(type_ids, offsets, [int_child, float_child], field_names=["i", "f"])
-    s = Series.from_arrow(arrow_arr)
-    # s = [10, 2.2, 30, 40, 5.5]
-    pymask = [True, False, True, True, False]
-    mask = Series.from_pylist(pymask)
-
-    result = s.filter(mask)
-
-    assert result.datatype() == s.datatype()
-    expected = [v for v, keep in zip(s.to_pylist(), pymask) if keep]
-    assert result.to_pylist() == expected  # [10, 30, 40]
-
-
-def test_series_filter_sparse_union_none_mask() -> None:
-    """None in the mask is treated as False (element is dropped)."""
-    type_ids = pa.array([0, 1, 2], type=pa.int8())
-    int_child = pa.array([10, 0, 0], type=pa.int32())
-    float_child = pa.array([0.0, 2.2, 0.0], type=pa.float64())
-    str_child = pa.array(["", "", "c"], type=pa.large_utf8())
-    arrow_arr = pa.UnionArray.from_sparse(type_ids, [int_child, float_child, str_child], field_names=["i", "f", "s"])
-    s = Series.from_arrow(arrow_arr)
-    # s = [10, 2.2, 'c']; None mask → dropped
-    pymask = [True, None, True]
-    mask = Series.from_pylist(pymask)
-
-    result = s.filter(mask)
-
-    assert result.datatype() == s.datatype()
-    expected = [v for v, keep in zip(s.to_pylist(), pymask) if keep]
-    assert result.to_pylist() == expected  # [10, 'c']
 
 
 def test_series_filter_bad_input() -> None:

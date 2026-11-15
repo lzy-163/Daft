@@ -1,4 +1,5 @@
 use crate::series::Series;
+use common_error::DaftResult;
 
 impl Series {
     pub fn len(&self) -> usize {
@@ -9,7 +10,7 @@ impl Series {
         self.len() == 0
     }
 
-    pub fn size_bytes(&self) -> usize {
+    pub fn size_bytes(&self) -> DaftResult<usize> {
         self.inner.size_bytes()
     }
 }
