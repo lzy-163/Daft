@@ -1,8 +1,14 @@
+use daft_core::{
+    datatypes::{DataType, Field},
+    schema::Schema,
+    series::Series,
+};
+
+use crate::{functions::partitioning::PartitioningExpr, Expr};
+
 use common_error::{DaftError, DaftResult};
-use daft_core::prelude::*;
 
 use super::super::FunctionEvaluator;
-use crate::{ExprRef, functions::partitioning::PartitioningExpr};
 
 macro_rules! impl_func_evaluator_for_partitioning {
     ($name:ident, $op:ident, $kernel:ident, $result_type:ident) => {
@@ -15,7 +21,7 @@ macro_rules! impl_func_evaluator_for_partitioning {
 
             fn to_field(
                 &self,
-                inputs: &[ExprRef],
+                inputs: &[Expr],
                 schema: &Schema,
                 _: &FunctionExpr,
             ) -> DaftResult<Field> {
@@ -52,10 +58,8 @@ macro_rules! impl_func_evaluator_for_partitioning {
         }
     };
 }
-
-use DataType::{Date, Int32};
-
 use crate::functions::FunctionExpr;
+use DataType::{Date, Int32};
 impl_func_evaluator_for_partitioning!(YearsEvaluator, years, partitioning_years, Int32);
 impl_func_evaluator_for_partitioning!(MonthsEvaluator, months, partitioning_months, Int32);
 impl_func_evaluator_for_partitioning!(DaysEvaluator, days, partitioning_days, Date);
@@ -68,7 +72,7 @@ impl FunctionEvaluator for IcebergBucketEvaluator {
         "partitioning_iceberg_bucket"
     }
 
-    fn to_field(&self, inputs: &[ExprRef], schema: &Schema, _: &FunctionExpr) -> DaftResult<Field> {
+    fn to_field(&self, inputs: &[Expr], schema: &Schema, _: &FunctionExpr) -> DaftResult<Field> {
         match inputs {
             [input] => match input.to_field(schema) {
                 Ok(field) => match field.dtype {
@@ -121,18 +125,15 @@ impl FunctionEvaluator for IcebergTruncateEvaluator {
         "partitioning_iceberg_truncate"
     }
 
-    fn to_field(&self, inputs: &[ExprRef], schema: &Schema, _: &FunctionExpr) -> DaftResult<Field> {
+    fn to_field(&self, inputs: &[Expr], schema: &Schema, _: &FunctionExpr) -> DaftResult<Field> {
         match inputs {
             [input] => match input.to_field(schema) {
                 Ok(field) => match &field.dtype {
-                    DataType::Decimal128(_, _) | DataType::Utf8 | DataType::Binary => {
-                        Ok(Field::new(format!("{}_trunc", field.name), field.dtype))
-                    }
-                    v if v.is_integer() => {
-                        Ok(Field::new(format!("{}_trunc", field.name), field.dtype))
-                    }
+                    DataType::Decimal128(_, _)
+                    | DataType::Utf8 => Ok(Field::new(format!("{}_truncate", field.name), field.dtype)),
+                    v if v.is_integer() => Ok(Field::new(format!("{}_truncate", field.name), field.dtype)),
                     _ => Err(DaftError::TypeError(format!(
-                        "Expected input to IcebergTruncate to be an Integer, Utf8, Decimal, or Binary, got {}",
+                        "Expected input to IcebergTruncate to be an Integer, Utf8 or Decimal, got {}",
                         field.dtype
                     ))),
                 },

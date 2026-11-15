@@ -1,63 +1,76 @@
-pub mod agg;
-pub mod agg_fn;
-pub mod function_args;
-#[cfg(test)]
-mod macro_tests;
-pub mod map;
+pub mod float;
+pub mod image;
+pub mod json;
+pub mod list;
+pub mod numeric;
 pub mod partitioning;
-pub mod prelude;
-pub mod python;
-pub mod scalar;
-pub mod sketch;
 pub mod struct_;
+pub mod temporal;
+pub mod uri;
+pub mod utf8;
 
-use std::{
-    collections::HashMap,
-    fmt::{Display, Formatter, Result, Write},
-    hash::Hash,
-    sync::{Arc, LazyLock, RwLock},
-};
+use std::fmt::{Display, Formatter, Result};
 
-pub use agg_fn::{AggFn, AggFnHandle, State};
+use self::image::ImageExpr;
+use self::json::JsonExpr;
+use self::list::ListExpr;
+use self::numeric::NumericExpr;
+use self::partitioning::PartitioningExpr;
+use self::struct_::StructExpr;
+use self::temporal::TemporalExpr;
+use self::utf8::Utf8Expr;
+use self::{float::FloatExpr, uri::UriExpr};
 use common_error::DaftResult;
-use daft_core::prelude::*;
-pub use function_args::{FunctionArg, FunctionArgs, UnaryArg};
-use scalar::DynamicScalarFunction;
-pub use scalar::{
-    AsyncScalarUDF, BuiltinScalarFn, BuiltinScalarFnVariant, ScalarFunctionFactory, ScalarUDF,
-};
+use daft_core::datatypes::FieldID;
+use daft_core::{datatypes::Field, schema::Schema, series::Series};
 use serde::{Deserialize, Serialize};
 
-use self::{map::MapExpr, partitioning::PartitioningExpr, sketch::SketchExpr, struct_::StructExpr};
-use crate::ExprRef;
+#[cfg(feature = "python")]
+pub mod python;
+#[cfg(feature = "python")]
+use python::PythonUDF;
+
+use super::Expr;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum FunctionExpr {
-    Map(MapExpr),
-    Sketch(SketchExpr),
+    Numeric(NumericExpr),
+    Float(FloatExpr),
+    Utf8(Utf8Expr),
+    Temporal(TemporalExpr),
+    List(ListExpr),
     Struct(StructExpr),
+    Json(JsonExpr),
+    Image(ImageExpr),
+    #[cfg(feature = "python")]
+    Python(PythonUDF),
     Partitioning(PartitioningExpr),
+    Uri(UriExpr),
 }
 
 pub trait FunctionEvaluator {
     fn fn_name(&self) -> &'static str;
-    fn to_field(
-        &self,
-        inputs: &[ExprRef],
-        schema: &Schema,
-        expr: &FunctionExpr,
-    ) -> DaftResult<Field>;
+    fn to_field(&self, inputs: &[Expr], schema: &Schema, expr: &FunctionExpr) -> DaftResult<Field>;
     fn evaluate(&self, inputs: &[Series], expr: &FunctionExpr) -> DaftResult<Series>;
 }
 
 impl FunctionExpr {
     #[inline]
     fn get_evaluator(&self) -> &dyn FunctionEvaluator {
+        use FunctionExpr::*;
         match self {
-            Self::Map(expr) => expr.get_evaluator(),
-            Self::Sketch(expr) => expr.get_evaluator(),
-            Self::Struct(expr) => expr.get_evaluator(),
-            Self::Partitioning(expr) => expr.get_evaluator(),
+            Numeric(expr) => expr.get_evaluator(),
+            Float(expr) => expr.get_evaluator(),
+            Utf8(expr) => expr.get_evaluator(),
+            Temporal(expr) => expr.get_evaluator(),
+            List(expr) => expr.get_evaluator(),
+            Struct(expr) => expr.get_evaluator(),
+            Json(expr) => expr.query_evaluator(),
+            Image(expr) => expr.get_evaluator(),
+            Uri(expr) => expr.get_evaluator(),
+            #[cfg(feature = "python")]
+            Python(expr) => expr,
+            Partitioning(expr) => expr.get_evaluator(),
         }
     }
 }
@@ -73,12 +86,7 @@ impl FunctionEvaluator for FunctionExpr {
         self.get_evaluator().fn_name()
     }
 
-    fn to_field(
-        &self,
-        inputs: &[ExprRef],
-        schema: &Schema,
-        expr: &FunctionExpr,
-    ) -> DaftResult<Field> {
+    fn to_field(&self, inputs: &[Expr], schema: &Schema, expr: &FunctionExpr) -> DaftResult<Field> {
         self.get_evaluator().to_field(inputs, schema, expr)
     }
 
@@ -87,7 +95,7 @@ impl FunctionEvaluator for FunctionExpr {
     }
 }
 
-pub fn function_display(f: &mut Formatter, func: &FunctionExpr, inputs: &[ExprRef]) -> Result {
+pub fn function_display(f: &mut Formatter, func: &FunctionExpr, inputs: &[Expr]) -> Result {
     write!(f, "{}(", func)?;
     for (i, input) in inputs.iter().enumerate() {
         if i != 0 {
@@ -99,23 +107,7 @@ pub fn function_display(f: &mut Formatter, func: &FunctionExpr, inputs: &[ExprRe
     Ok(())
 }
 
-pub fn function_display_without_formatter(
-    func: &FunctionExpr,
-    inputs: &[ExprRef],
-) -> std::result::Result<String, std::fmt::Error> {
-    let mut f = String::default();
-    write!(&mut f, "{}(", func)?;
-    for (i, input) in inputs.iter().enumerate() {
-        if i != 0 {
-            write!(&mut f, ", ")?;
-        }
-        write!(&mut f, "{input}")?;
-    }
-    write!(&mut f, ")")?;
-    Ok(f)
-}
-
-pub fn function_semantic_id(func: &FunctionExpr, inputs: &[ExprRef], schema: &Schema) -> FieldID {
+pub fn function_semantic_id(func: &FunctionExpr, inputs: &[Expr], schema: &Schema) -> FieldID {
     let inputs = inputs
         .iter()
         .map(|expr| expr.semantic_id(schema).id.to_string())
@@ -124,66 +116,3 @@ pub fn function_semantic_id(func: &FunctionExpr, inputs: &[ExprRef], schema: &Sc
     // TODO: check for function idempotency here.
     FieldID::new(format!("Function_{func:?}({inputs})"))
 }
-
-/// FunctionRegistry is a lookup structure for scalar functions.
-#[derive(Default)]
-pub struct FunctionRegistry {
-    // Todo: Use the Bindings object instead, so we can get aliases and case handling.
-    map: HashMap<String, Arc<dyn ScalarFunctionFactory>>,
-}
-
-/// FunctionModule is a mechanism to group and register scalar functions.
-pub trait FunctionModule {
-    /// Register this module to the given [SQLFunctions] table.
-    fn register(_parent: &mut FunctionRegistry);
-}
-
-impl FunctionRegistry {
-    /// Creates an empty FunctionRegistry.
-    pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
-    }
-
-    /// Registers all functions defined in the FunctionModule to this registry.
-    pub fn register<Mod: FunctionModule>(&mut self) {
-        Mod::register(self);
-    }
-
-    /// Registers a scalar function factory without monomorphization.
-    pub fn add_fn_factory(&mut self, function: impl ScalarFunctionFactory + 'static) {
-        let function = Arc::new(function);
-        for alias in function.aliases() {
-            self.map.insert((*alias).to_string(), function.clone());
-        }
-        self.map.insert(function.name().to_string(), function);
-    }
-
-    // TODO: remove this monomorphizing version after migrating to `add_function`.
-    pub fn add_fn<UDF: ScalarUDF + 'static>(&mut self, func: UDF) {
-        // casting to dyn ScalarUDF so as to not modify the signature
-        let udf = Arc::new(func) as Arc<dyn ScalarUDF>;
-        let udf = BuiltinScalarFnVariant::Sync(udf);
-        let function = DynamicScalarFunction::from(udf);
-        self.add_fn_factory(function);
-    }
-
-    pub fn add_async_fn<UDF: AsyncScalarUDF + 'static>(&mut self, func: UDF) {
-        let udf = Arc::new(func) as Arc<dyn AsyncScalarUDF>;
-        let udf = BuiltinScalarFnVariant::Async(udf);
-        let function = DynamicScalarFunction::from(udf);
-        self.add_fn_factory(function);
-    }
-
-    pub fn get(&self, name: &str) -> Option<Arc<dyn ScalarFunctionFactory>> {
-        self.map.get(name).cloned()
-    }
-
-    pub fn entries(&self) -> impl Iterator<Item = (&String, &Arc<dyn ScalarFunctionFactory>)> {
-        self.map.iter()
-    }
-}
-
-pub static FUNCTION_REGISTRY: LazyLock<RwLock<FunctionRegistry>> =
-    LazyLock::new(|| RwLock::new(FunctionRegistry::new()));

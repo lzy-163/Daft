@@ -2,12 +2,13 @@ mod arithmetic;
 mod comparison;
 mod logical;
 
-use std::{
-    hash::{Hash, Hasher},
-    string::FromUtf8Error,
-};
+use std::string::FromUtf8Error;
 
-use daft_core::prelude::*;
+use daft_core::{
+    array::ops::full::FullNull,
+    datatypes::{BooleanArray, NullArray},
+    DataType, IntoSeries, Series,
+};
 use snafu::{ResultExt, Snafu};
 
 use crate::DaftCoreComputeSnafu;
@@ -17,34 +18,11 @@ pub enum ColumnRangeStatistics {
     Loaded(Series, Series),
 }
 
-impl Hash for ColumnRangeStatistics {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Self::Missing => (),
-            Self::Loaded(l, u) => {
-                let lower_hashes = l
-                    .hash(None)
-                    .expect("Failed to hash lower column range statistics");
-                lower_hashes.into_iter().for_each(|h| h.hash(state));
-                let upper_hashes = u
-                    .hash(None)
-                    .expect("Failed to hash upper column range statistics");
-                upper_hashes.into_iter().for_each(|h| h.hash(state));
-            }
-        }
-    }
-}
-
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Debug)]
 pub enum TruthValue {
     False,
     Maybe,
     True,
-}
-impl std::fmt::Debug for TruthValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self}")
-    }
 }
 
 impl std::fmt::Display for TruthValue {
@@ -55,7 +33,7 @@ impl std::fmt::Display for TruthValue {
             Self::True => "True",
         };
 
-        write!(f, "TruthValue: {value}")
+        write!(f, "TruthValue: {value}",)
     }
 }
 
@@ -68,17 +46,16 @@ impl ColumnRangeStatistics {
                 assert_eq!(l.data_type(), u.data_type(), "");
 
                 // If creating on incompatible types, default to `Missing`
-                if !Self::supports_dtype(l.data_type()) {
-                    return Ok(Self::Missing);
+                if !ColumnRangeStatistics::supports_dtype(l.data_type()) {
+                    return Ok(ColumnRangeStatistics::Missing);
                 }
 
-                Ok(Self::Loaded(l, u))
+                Ok(ColumnRangeStatistics::Loaded(l, u))
             }
-            _ => Ok(Self::Missing),
+            _ => Ok(ColumnRangeStatistics::Missing),
         }
     }
 
-    #[must_use]
     pub fn supports_dtype(dtype: &DataType) -> bool {
         match dtype {
             // SUPPORTED TYPES:
@@ -86,46 +63,40 @@ impl ColumnRangeStatistics {
             DataType::Null |
 
             // Numeric types
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 |
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Int128 |
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 |
-            DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Decimal128(..) | DataType::Boolean |
+            DataType::Float32 | DataType::Float64 | DataType::Decimal128(..) | DataType::Boolean |
 
             // String types
-            DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(..) |
+            DataType::Utf8 | DataType::Binary |
 
             // Temporal types
-            DataType::Date | DataType::Time(..) | DataType::Timestamp(..) | DataType::Duration(..) | DataType::Interval => true,
+            DataType::Date | DataType::Time(..) | DataType::Timestamp(..) | DataType::Duration(..) => true,
 
             // UNSUPPORTED TYPES:
             // Types that don't support comparisons and can't be used as ColumnRangeStatistics
-            DataType::List(..) | DataType::FixedSizeList(..) | DataType::Uuid | DataType::Image(..) | DataType::FixedShapeImage(..) | DataType::Tensor(..) | DataType::SparseTensor(..) | DataType::FixedShapeSparseTensor(..) | DataType::FixedShapeTensor(..) | DataType::Struct(..) | DataType::Map { .. } | DataType::Extension(..) | DataType::Embedding(..) | DataType::Unknown | DataType::File(_) | DataType::Union(..) => false,
+            DataType::List(..) | DataType::FixedSizeList(..) | DataType::Image(..) | DataType::FixedShapeImage(..) | DataType::Tensor(..) | DataType::FixedShapeTensor(..) | DataType::Struct(..) | DataType::Map(..) | DataType::Extension(..) | DataType::Embedding(..) | DataType::Unknown => false,
             #[cfg(feature = "python")]
             DataType::Python => false,
         }
     }
 
-    #[must_use]
     pub fn to_truth_value(&self) -> TruthValue {
         match self {
             Self::Missing => TruthValue::Maybe,
             Self::Loaded(lower, upper) => {
-                // If the series can't be cast to bool (e.g. Null-typed from null substitution)
-                // or contains a null value, treat as Maybe (conservative).
-                let lower = lower.bool().ok().and_then(|b| b.get(0));
-                let upper = upper.bool().ok().and_then(|b| b.get(0));
+                let lower = lower.bool().unwrap().get(0).unwrap();
+                let upper = upper.bool().unwrap().get(0).unwrap();
                 match (lower, upper) {
-                    (Some(false), Some(false)) => TruthValue::False,
-                    (Some(true), Some(true)) => TruthValue::True,
-                    (Some(true), Some(false)) => {
-                        panic!("Upper is false and lower is true; Invalid states!")
-                    }
-                    _ => TruthValue::Maybe,
+                    (false, false) => TruthValue::False,
+                    (false, true) => TruthValue::Maybe,
+                    (true, true) => TruthValue::True,
+                    (true, false) => panic!("Upper is false and lower is true; Invalid states!"),
                 }
             }
         }
     }
 
-    #[must_use]
     pub fn from_truth_value(tv: TruthValue) -> Self {
         let (lower, upper) = match tv {
             TruthValue::False => (false, false),
@@ -133,14 +104,16 @@ impl ColumnRangeStatistics {
             TruthValue::True => (true, true),
         };
 
-        let lower = BooleanArray::from_slice("lower", &[lower]).into_series();
-        let upper = BooleanArray::from_slice("upper", &[upper]).into_series();
+        let lower = BooleanArray::from(("lower", [lower].as_slice())).into_series();
+        let upper = BooleanArray::from(("upper", [upper].as_slice())).into_series();
         Self::Loaded(lower, upper)
     }
 
     pub(crate) fn combined_series(&self) -> crate::Result<Series> {
         match self {
-            Self::Missing => Ok(NullArray::full_null("null", &DataType::Null, 2).into_series()),
+            Self::Missing => {
+                Ok(NullArray::full_null("null", &daft_core::DataType::Null, 2).into_series())
+            }
             Self::Loaded(l, u) => Series::concat([l, u].as_slice()).context(DaftCoreComputeSnafu),
         }
     }
@@ -148,28 +121,32 @@ impl ColumnRangeStatistics {
     pub(crate) fn element_size(&self) -> crate::Result<Option<f64>> {
         match self {
             Self::Missing => Ok(None),
-            Self::Loaded(l, u) => Ok(Some(((l.size_bytes() + u.size_bytes()) as f64) / 2.)),
+            Self::Loaded(l, u) => Ok(Some(
+                ((l.size_bytes().context(DaftCoreComputeSnafu)?
+                    + u.size_bytes().context(DaftCoreComputeSnafu)?) as f64)
+                    / 2.,
+            )),
         }
     }
 
-    #[must_use]
     pub fn from_series(series: &Series) -> Self {
         let lower = series.min(None).unwrap();
         let upper = series.max(None).unwrap();
         let _count = series
-            .count(None, CountMode::All)
+            .count(None, daft_core::CountMode::All)
             .unwrap()
             .u64()
             .unwrap()
             .get(0)
             .unwrap() as usize;
         let _null_count = series
-            .count(None, CountMode::Null)
+            .count(None, daft_core::CountMode::Null)
             .unwrap()
             .u64()
             .unwrap()
             .get(0)
             .unwrap() as usize;
+        let _num_bytes = series.size_bytes().unwrap();
         Self::Loaded(lower, upper)
     }
 
@@ -177,47 +154,50 @@ impl ColumnRangeStatistics {
     pub fn cast(&self, dtype: &DataType) -> crate::Result<Self> {
         match self {
             // `Missing` is casted to `Missing`
-            Self::Missing => Ok(Self::Missing),
+            ColumnRangeStatistics::Missing => Ok(ColumnRangeStatistics::Missing),
 
             // If the type to cast to matches the current type exactly, short-circuit the logic here. This should be the
             // most common case (e.g. parsing a Parquet file with the same types as the inferred types)
-            Self::Loaded(l, r) if l.data_type() == dtype => Ok(Self::Loaded(l.clone(), r.clone())),
+            ColumnRangeStatistics::Loaded(l, r) if l.data_type() == dtype => {
+                Ok(ColumnRangeStatistics::Loaded(l.clone(), r.clone()))
+            }
 
             // Only certain types are allowed to be casted in the context of ColumnRangeStatistics
             // as casting may not correctly preserve ordering of elements. We allow-list some type combinations
             // but for most combinations, we will default to `ColumnRangeStatistics::Missing`.
-            Self::Loaded(l, r) => {
+            ColumnRangeStatistics::Loaded(l, r) => {
                 match (l.data_type(), dtype) {
                     // Int casting to higher bitwidths
-                    (
-                        DataType::Int8,
-                        DataType::Int16
-                        | DataType::Int32
-                        | DataType::Int64
-                        | DataType::Date
-                        | DataType::Timestamp(..),
-                    )
-                    | (
-                        DataType::Int16,
-                        DataType::Int32
-                        | DataType::Int64
-                        | DataType::Date
-                        | DataType::Timestamp(..),
-                    )
-                    | (
-                        DataType::Int32,
-                        DataType::Int64 | DataType::Date | DataType::Timestamp(..),
-                    )
-                    | (DataType::UInt8, DataType::UInt16 | DataType::UInt32 | DataType::UInt64)
-                    | (DataType::UInt16, DataType::UInt32 | DataType::UInt64)
-                    | (DataType::UInt32, DataType::UInt64)
-                    | (DataType::Float32, DataType::Float64)
-                    | (DataType::Int64, DataType::Timestamp(..))
-                    | (DataType::Binary, DataType::Utf8) => Ok(Self::Loaded(
+                    (DataType::Int8, DataType::Int16) |
+                    (DataType::Int8, DataType::Int32) |
+                    (DataType::Int8, DataType::Int64) |
+                    (DataType::Int16, DataType::Int32) |
+                    (DataType::Int16, DataType::Int64) |
+                    (DataType::Int32, DataType::Int64) |
+                    // UInt casting to higher bitwidths
+                    (DataType::UInt8, DataType::UInt16) |
+                    (DataType::UInt8, DataType::UInt32) |
+                    (DataType::UInt8, DataType::UInt64) |
+                    (DataType::UInt16, DataType::UInt32) |
+                    (DataType::UInt16, DataType::UInt64) |
+                    (DataType::UInt32, DataType::UInt64) |
+                    // Float casting to higher bitwidths
+                    (DataType::Float32, DataType::Float64) |
+                    // Numeric to temporal casting from smaller-than-eq bitwidths
+                    (DataType::Int8, DataType::Date) |
+                    (DataType::Int16, DataType::Date) |
+                    (DataType::Int32, DataType::Date) |
+                    (DataType::Int8, DataType::Timestamp(..)) |
+                    (DataType::Int16, DataType::Timestamp(..)) |
+                    (DataType::Int32, DataType::Timestamp(..)) |
+                    (DataType::Int64, DataType::Timestamp(..)) |
+                    // Binary to Utf8
+                    (DataType::Binary, DataType::Utf8)
+                    => Ok(ColumnRangeStatistics::Loaded(
                         l.cast(dtype).context(DaftCoreComputeSnafu)?,
                         r.cast(dtype).context(DaftCoreComputeSnafu)?,
                     )),
-                    _ => Ok(Self::Missing),
+                    _ => Ok(ColumnRangeStatistics::Missing)
                 }
             }
         }
@@ -231,9 +211,10 @@ impl std::fmt::Display for ColumnRangeStatistics {
             Self::Loaded(lower, upper) => write!(
                 f,
                 "ColumnRangeStatistics:
-lower:\n{lower}
-upper:\n{upper}
-    "
+lower:\n{}
+upper:\n{}
+    ",
+                lower, upper
             ),
         }
     }
@@ -245,12 +226,12 @@ impl std::fmt::Debug for ColumnRangeStatistics {
     }
 }
 
-impl TryFrom<daft_core::lit::Literal> for ColumnRangeStatistics {
+impl TryFrom<&daft_dsl::LiteralValue> for ColumnRangeStatistics {
     type Error = crate::Error;
-    fn try_from(value: daft_core::lit::Literal) -> crate::Result<Self, Self::Error> {
-        let series: Series = value.into();
-        assert_eq!(series.len(), 1);
-        Self::new(Some(series.clone()), Some(series))
+    fn try_from(value: &daft_dsl::LiteralValue) -> crate::Result<Self, Self::Error> {
+        let ser = value.to_series();
+        assert_eq!(ser.len(), 1);
+        Self::new(Some(ser.clone()), Some(ser.clone()))
     }
 }
 
@@ -265,68 +246,30 @@ pub enum Error {
 
 impl From<Error> for crate::Error {
     fn from(value: Error) -> Self {
-        Self::MissingStatistics { source: value }
+        crate::Error::MissingStatistics { source: value }
     }
 }
 
 #[cfg(test)]
 mod test {
 
-    use std::ops::Not;
+    use daft_core::{array::ops::DaftCompare, datatypes::Int32Array, IntoSeries};
 
-    use daft_core::prelude::*;
+    use crate::column_stats::TruthValue;
 
     use super::ColumnRangeStatistics;
-    use crate::column_stats::TruthValue;
 
     #[test]
     fn test_equal() -> crate::Result<()> {
         let l = ColumnRangeStatistics::new(
-            Some(Int32Array::from_slice("l", &[1]).into_series()),
-            Some(Int32Array::from_slice("l", &[5]).into_series()),
+            Some(Int32Array::from(("l", vec![1])).into_series()),
+            Some(Int32Array::from(("l", vec![5])).into_series()),
         )?;
         let r = ColumnRangeStatistics::new(
-            Some(Int32Array::from_slice("r", &[4]).into_series()),
-            Some(Int32Array::from_slice("r", &[4]).into_series()),
+            Some(Int32Array::from(("r", vec![4])).into_series()),
+            Some(Int32Array::from(("r", vec![4])).into_series()),
         )?;
         assert_eq!(l.lt(&r)?.to_truth_value(), TruthValue::Maybe);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_not_boolean_stats() -> crate::Result<()> {
-        // NOT of a True-range → False, NOT of a False-range → True.
-        let all_true = ColumnRangeStatistics::from_truth_value(TruthValue::True);
-        assert_eq!(all_true.not()?.to_truth_value(), TruthValue::False);
-
-        let all_false = ColumnRangeStatistics::from_truth_value(TruthValue::False);
-        assert_eq!(all_false.not()?.to_truth_value(), TruthValue::True);
-
-        let maybe = ColumnRangeStatistics::from_truth_value(TruthValue::Maybe);
-        assert_eq!(maybe.not()?.to_truth_value(), TruthValue::Maybe);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_not_null_stats_is_missing() -> crate::Result<()> {
-        // NOT of Null-typed stats (schema evolution: missing column substituted with null_lit)
-        // must conservatively return Missing, not prune the row group.
-        let null_series = NullArray::full_null("x", &DataType::Null, 1).into_series();
-        let null_stats = ColumnRangeStatistics::new(Some(null_series.clone()), Some(null_series))?;
-        let result = null_stats.not()?;
-        assert_eq!(result, ColumnRangeStatistics::Missing);
-        assert_eq!(result.to_truth_value(), TruthValue::Maybe);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_not_missing_stats_is_missing() -> crate::Result<()> {
-        // NOT of Missing stays Missing.
-        let result = ColumnRangeStatistics::Missing.not()?;
-        assert_eq!(result, ColumnRangeStatistics::Missing);
 
         Ok(())
     }

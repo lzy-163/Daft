@@ -1,7 +1,9 @@
-use common_error::DaftResult;
-use num_traits::{One, Signed, Unsigned, Zero};
-
 use crate::{array::DataArray, datatypes::DaftNumericType};
+use num_traits::Signed;
+use num_traits::Unsigned;
+use num_traits::{One, Zero};
+
+use common_error::DaftResult;
 
 impl<T: DaftNumericType> DataArray<T>
 where
@@ -9,10 +11,6 @@ where
 {
     pub fn sign(&self) -> DaftResult<Self> {
         self.apply(|v| v.signum())
-    }
-
-    pub fn negate(&self) -> DaftResult<Self> {
-        self.apply(|v| -v)
     }
 }
 

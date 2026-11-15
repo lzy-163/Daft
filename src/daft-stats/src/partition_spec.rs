@@ -1,41 +1,30 @@
-use std::{
-    collections::HashMap,
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::collections::HashMap;
 
-use daft_core::{
-    array::ops::{DaftCompare, DaftLogical},
-    lit::Literal,
-};
-use daft_dsl::{Expr, ExprRef};
-use daft_recordbatch::RecordBatch;
+use daft_core::array::ops::DaftCompare;
+use daft_dsl::{Expr, Literal};
+use daft_table::Table;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PartitionSpec {
-    pub keys: RecordBatch,
+    pub keys: Table,
 }
 
 impl PartitionSpec {
-    #[must_use]
     pub fn multiline_display(&self) -> Vec<String> {
         let mut res = vec![];
         res.push(format!("Keys = {}", self.keys));
         res
     }
 
-    #[must_use]
-    pub fn to_fill_map(&self) -> HashMap<&str, ExprRef> {
+    pub fn to_fill_map(&self) -> HashMap<&str, Expr> {
         self.keys
-            .columns()
+            .schema
+            .fields
             .iter()
-            .map(|column| {
+            .map(|(col, _)| {
                 (
-                    column.name(),
-                    Arc::new(Expr::Literal(
-                        Literal::try_from_single_value_series(column.as_materialized_series())
-                            .expect("column should have one row"),
-                    )),
+                    col.as_str(),
+                    self.keys.get_column(col).unwrap().clone().lit(),
                 )
             })
             .collect()
@@ -50,28 +39,12 @@ impl PartialEq for PartitionSpec {
         }
 
         // Assuming exact matches in field names and types, now compare each field's values
-        for i in 0..self.keys.num_columns() {
-            let self_column = self.keys.get_column(i);
-            let other_column = other.keys.get_column(i);
-            if let Some(value_eq) = self_column.equal(other_column).unwrap().get(0) {
-                if !value_eq {
-                    return false;
-                }
-            } else {
-                // For partition spec, we treat null as equal to null, in order to allow for
-                // partitioning on columns that may have nulls.
-                let self_null = self_column.is_null().unwrap();
-                let other_null = other_column.is_null().unwrap();
-                if self_null
-                    .xor(&other_null)
-                    .unwrap()
-                    .bool()
-                    .unwrap()
-                    .get(0)
-                    .unwrap()
-                {
-                    return false;
-                }
+        for field_name in self.keys.schema.as_ref().fields.keys() {
+            let self_column = self.keys.get_column(field_name).unwrap();
+            let other_column = other.keys.get_column(field_name).unwrap();
+            let value_eq = self_column.equal(other_column).unwrap().get(0).unwrap();
+            if !value_eq {
+                return false;
             }
         }
 
@@ -80,14 +53,3 @@ impl PartialEq for PartitionSpec {
 }
 
 impl Eq for PartitionSpec {}
-
-// Manually implement Hash to ensure consistency with `PartialEq`.
-impl Hash for PartitionSpec {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.keys.schema.hash(state);
-
-        for column in self.keys.columns() {
-            column.hash(state);
-        }
-    }
-}

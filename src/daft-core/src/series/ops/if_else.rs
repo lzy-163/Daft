@@ -1,16 +1,11 @@
-use common_error::DaftResult;
-
-use super::cast_series_to_supertype;
+use super::match_types_on_series;
 use crate::series::Series;
 
+use common_error::DaftResult;
+
 impl Series {
-    pub fn if_else(&self, other: &Self, predicate: &Self) -> DaftResult<Self> {
-        let casted_series = cast_series_to_supertype(&[self, other])?;
-        assert_eq!(casted_series.len(), 2);
-
-        let if_true = &casted_series[0];
-        let if_false = &casted_series[1];
-
-        if_true.inner.if_else(if_false, predicate)
+    pub fn if_else(&self, other: &Series, predicate: &Series) -> DaftResult<Series> {
+        let (if_true, if_false) = match_types_on_series(self, other)?;
+        if_true.inner.if_else(&if_false, predicate)
     }
 }

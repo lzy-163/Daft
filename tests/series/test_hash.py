@@ -10,7 +10,6 @@ import xxhash
 
 from daft.datatype import DataType
 from daft.series import Series
-from tests.test_datatypes import daft_numeric_types
 
 
 @pytest.mark.parametrize(
@@ -37,10 +36,10 @@ def test_hash_int_array_with_reference(nbytes, dtype):
 
     hashed_again = arr.hash(hashed)
 
-    for v, hashed_value, hashed_again_value in zip(arr.to_pylist(), hashed.to_pylist(), hashed_again.to_pylist()):
+    for v, hv, hav in zip(arr.to_pylist(), hashed.to_pylist(), hashed_again.to_pylist()):
         vbytes = v.to_bytes(nbytes, "little")
-        ref_value = xxhash.xxh3_64_intdigest(vbytes, seed=hashed_value)
-        assert hashed_again_value == ref_value
+        ref_value = xxhash.xxh3_64_intdigest(vbytes, seed=hv)
+        assert hav == ref_value
 
 
 def test_hash_bool_array_with_reference():
@@ -88,27 +87,6 @@ def test_hash_binary_array_with_reference():
     assert hashed_again.to_pylist() == expected
 
 
-def test_hash_fixed_size_binary_array_with_reference():
-    import pyarrow as pa
-
-    arr = Series.from_arrow(pa.array([b"foo", b"bar", None], type=pa.binary(3)))
-    expected = [
-        xxhash.xxh3_64_intdigest(b"foo"),
-        xxhash.xxh3_64_intdigest(b"bar"),
-        xxhash.xxh3_64_intdigest(b"\x00\x00\x00"),
-    ]
-    hashed = arr.hash()
-    assert hashed.to_pylist() == expected
-
-    hashed_again = arr.hash(hashed)
-    expected = [
-        xxhash.xxh3_64_intdigest(b"foo", expected[0]),
-        xxhash.xxh3_64_intdigest(b"bar", expected[1]),
-        xxhash.xxh3_64_intdigest(b"\x00\x00\x00", expected[2]),
-    ]
-    assert hashed_again.to_pylist() == expected
-
-
 def test_hash_null_array_with_reference():
     arr = Series.from_pylist([None, None, None])
     expected = [xxhash.xxh3_64_intdigest(b""), xxhash.xxh3_64_intdigest(b""), xxhash.xxh3_64_intdigest(b"")]
@@ -129,330 +107,17 @@ def test_hash_int_array_with_bad_seed():
 
     bad_seed = Series.from_numpy(np.random.randint(0, 127, 100)).cast(DataType.float64())
 
-    with pytest.raises(ValueError, match="seed must be a numeric type"):
+    with pytest.raises(ValueError, match="We can only use UInt64 as a seed"):
         arr.hash(bad_seed)
 
 
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-def test_hash_list_array_no_seed(dtype):
-    arr = Series.from_pylist([[1, 2], [1, 3], [1, 2], [1, 2, 3], [], [], [2, 1]]).cast(DataType.list(dtype))
+def test_hash_int_array_with_bad_length():
+    arr = Series.from_numpy(np.random.randint(0, 127, 100)).cast(DataType.uint64())
 
-    hashed = arr.hash().to_pylist()
-    assert hashed[0] == hashed[2]
-    assert hashed[4] == hashed[5]
+    bad_seed = Series.from_numpy(np.random.randint(0, 127, 99)).cast(DataType.uint64())
 
-    different_inds = [0, 1, 3, 4, 6]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-@pytest.mark.parametrize("seed", [1, 2, 42])
-def test_hash_list_array_seeded(dtype, seed):
-    arr = Series.from_pylist([[1, 2], [1, 3], [1, 2], [1, 2, 3], [], [], [2, 1]]).cast(DataType.list(dtype))
-    seeds = Series.from_pylist([seed] * 7).cast(DataType.uint64())
-    hashed = arr.hash(seeds).to_pylist()
-    assert hashed[0] == hashed[2]
-    assert hashed[4] == hashed[5]
-
-    different_inds = [0, 1, 3, 4, 6]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-def test_hash_list_array_no_seed_with_invalid(dtype):
-    arr = Series.from_pylist([[1, 2], [1, 3], [1, 2], [1, 2, 3], [], [], None, [2, 1], None]).cast(DataType.list(dtype))
-
-    hashed = arr.hash().to_pylist()
-    assert hashed[0] == hashed[2]
-    assert hashed[4] == hashed[5]
-    assert hashed[6] is None
-    assert hashed[8] is None
-
-    different_inds = [0, 1, 3, 4, 7]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-@pytest.mark.parametrize("seed", [1, 2, 42])
-def test_hash_list_array_seeded_with_invalid(dtype, seed):
-    arr = Series.from_pylist([[1, 2], [1, 3], [1, 2], [1, 2, 3], [], [], None, [2, 1], None]).cast(DataType.list(dtype))
-    seeds = Series.from_pylist([seed] * 9).cast(DataType.uint64())
-
-    hashed = arr.hash(seeds).to_pylist()
-    assert hashed[0] == hashed[2]
-    assert hashed[4] == hashed[5]
-    assert hashed[6] is None
-    assert hashed[8] is None
-
-    different_inds = [0, 1, 3, 4, 7]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-def test_hash_list_array_different_seeds(dtype):
-    arr = Series.from_pylist([[1, 2], [1, 2], [1, 2], [1, 2]]).cast(DataType.list(dtype))
-    seeds = Series.from_pylist([1, 2, 3, 4]).cast(DataType.uint64())
-
-    hashed = arr.hash(seeds).to_pylist()
-
-    different_inds = [0, 1, 2, 3]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-def test_hash_list_array_nested_lists(dtype):
-    arr = Series.from_pylist(
-        [
-            [[1, 2], [3, 4]],
-            [[1, 2], [3, 5]],
-            [[1, 2], [3, 4]],
-            [[3, 4], [1, 2]],
-            [[1], [2]],
-            [[], []],
-            [[]],
-            [],
-            [[1, 2, 3]],
-            [[1], [2], [3]],
-        ]
-    ).cast(DataType.list(DataType.list(dtype)))
-
-    hashed = arr.hash().to_pylist()
-    assert hashed[0] == hashed[2]
-
-    different_inds = [0, 1, 3, 4, 5, 6, 7, 8, 9]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-def test_hash_list_array_consistency(dtype):
-    data = [[1, 2], [1, 3], [1, 2], [1, 2, 3], [], [], None, [2, 1], None]
-    arr1 = Series.from_pylist(data).cast(DataType.list(dtype))
-    arr2 = Series.from_pylist(data).cast(DataType.list(dtype))
-
-    hashed1 = arr1.hash().to_pylist()
-    hashed2 = arr2.hash().to_pylist()
-    assert hashed1 == hashed2
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-def test_hash_fixed_size_list_array_no_seed(dtype):
-    arr = Series.from_pylist([[1, 2], [1, 3], [1, 2], [1, 4], [5, 5], [5, 5], [2, 1]]).cast(
-        DataType.fixed_size_list(dtype, 2)
-    )
-
-    hashed = arr.hash().to_pylist()
-    assert hashed[0] == hashed[2]
-    assert hashed[4] == hashed[5]
-
-    different_inds = [0, 1, 3, 4, 6]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-@pytest.mark.parametrize("seed", [1, 2, 42])
-def test_hash_fixed_size_list_array_seeded(dtype, seed):
-    arr = Series.from_pylist([[1, 2], [1, 3], [1, 2], [1, 4], [5, 5], [5, 5], [2, 1]]).cast(
-        DataType.fixed_size_list(dtype, 2)
-    )
-    seeds = Series.from_pylist([seed] * len(arr)).cast(DataType.uint64())
-
-    hashed = arr.hash(seeds).to_pylist()
-    assert hashed[0] == hashed[2]
-    assert hashed[4] == hashed[5]
-
-    different_inds = [0, 1, 3, 4, 6]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-def test_hash_fixed_size_list_array_no_seed_with_invalid(dtype):
-    arr = Series.from_pylist([[1, 2], [1, 3], [1, 2], [1, 4], [5, 5], [5, 5], None, [2, 1], None]).cast(
-        DataType.fixed_size_list(dtype, 2)
-    )
-
-    hashed = arr.hash().to_pylist()
-    assert hashed[0] == hashed[2]
-    assert hashed[4] == hashed[5]
-    assert hashed[6] is None
-    assert hashed[8] is None
-
-    different_inds = [0, 1, 3, 4, 7]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-@pytest.mark.parametrize("seed", [1, 2, 42])
-def test_hash_fixed_size_list_array_seeded_with_invalid(dtype, seed):
-    arr = Series.from_pylist([[1, 2], [1, 3], [1, 2], [1, 4], [5, 5], [5, 5], None, [2, 1], None]).cast(
-        DataType.fixed_size_list(dtype, 2)
-    )
-    seeds = Series.from_pylist([seed] * 9).cast(DataType.uint64())
-
-    hashed = arr.hash(seeds).to_pylist()
-    assert hashed[0] == hashed[2]
-    assert hashed[4] == hashed[5]
-    assert hashed[6] is None
-    assert hashed[8] is None
-
-    different_inds = [0, 1, 3, 4, 7]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-def test_hash_fixed_size_list_array_different_seeds(dtype):
-    arr = Series.from_pylist([[1, 2], [1, 2], [1, 2], [1, 2]]).cast(DataType.fixed_size_list(dtype, 2))
-    seeds = Series.from_pylist([1, 2, 3, 4]).cast(DataType.uint64())
-
-    hashed = arr.hash(seeds).to_pylist()
-
-    different_inds = [0, 1, 2, 3]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-def test_hash_fixed_size_list_array_consistency(dtype):
-    data = [[1, 2], [1, 3], [1, 2], [1, 4], [5, 5], [5, 5], None, [2, 1], None]
-    arr1 = Series.from_pylist(data).cast(DataType.fixed_size_list(dtype, 2))
-    arr2 = Series.from_pylist(data).cast(DataType.fixed_size_list(dtype, 2))
-
-    hashed1 = arr1.hash().to_pylist()
-    hashed2 = arr2.hash().to_pylist()
-    assert hashed1 == hashed2
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-@pytest.mark.parametrize("seed", [None, 123])
-def test_hash_struct(dtype, seed):
-    data = [
-        {"a": 1, "b": 2},
-        {"a": 3, "b": 4},
-        {"a": 1, "b": 4},
-        {"a": 2, "b": 1},
-        None,
-        {"b": 2, "a": 1},
-        {"b": 1, "a": 2},
-        None,
-    ]
-    arr = Series.from_pylist(data).cast(DataType.struct({"a": dtype, "b": dtype}))
-
-    seeds = None if seed is None else Series.from_pylist([seed] * len(data)).cast(DataType.uint64())
-
-    hashed = arr.hash(seeds).to_pylist()
-    assert hashed[0] == hashed[5]
-    assert hashed[3] == hashed[6]
-    assert hashed[4] is None and hashed[-1] is None
-
-    different_inds = [0, 1, 2, 3]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-@pytest.mark.parametrize("seed", [None, 123])
-def test_hash_struct_nested(dtype, seed):
-    data = [
-        {"a": 1, "b": {"c": 1, "d": 2}},
-        {"a": 3, "b": {"c": 3, "d": 4}},
-        {"a": 1, "b": {"c": 3, "d": 4}},
-        {"a": 2, "b": {"c": 1, "d": 2}},
-        None,
-        {"b": {"c": 1, "d": 2}, "a": 1},
-        {"b": {"c": 1, "d": 2}, "a": 2},
-        {"a": 1, "b": {"c": 2, "d": 1}},
-        None,
-    ]
-    arr = Series.from_pylist(data).cast(DataType.struct({"a": dtype, "b": DataType.struct({"c": dtype, "d": dtype})}))
-
-    seeds = None if seed is None else Series.from_pylist([seed] * len(data)).cast(DataType.uint64())
-
-    hashed = arr.hash(seeds).to_pylist()
-    assert hashed[0] == hashed[5]
-    assert hashed[3] == hashed[6]
-    assert hashed[4] is None and hashed[-1] is None
-
-    different_inds = [0, 1, 2, 3, 7]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-@pytest.mark.parametrize("seed", [None, 123])
-def test_hash_struct_sublist(dtype, seed):
-    data = [
-        {"a": 1, "b": [2, 3, 4]},
-        {"a": 3, "b": [5, 6, 7]},
-        {"a": 1, "b": [5, 6, 7]},
-        {"a": 2, "b": [2, 3, 4]},
-        None,
-        {"b": [2, 3, 4], "a": 1},
-        {"b": [2, 3, 4], "a": 2},
-        {"a": 1, "b": [2, 4, 3]},
-        None,
-    ]
-    arr = Series.from_pylist(data).cast(DataType.struct({"a": dtype, "b": DataType.list(dtype)}))
-
-    seeds = None if seed is None else Series.from_pylist([seed] * len(data)).cast(DataType.uint64())
-
-    hashed = arr.hash(seeds).to_pylist()
-    assert hashed[0] == hashed[5]
-    assert hashed[3] == hashed[6]
-    assert hashed[4] is None and hashed[-1] is None
-
-    different_inds = [0, 1, 2, 3, 7]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
-
-
-@pytest.mark.parametrize("dtype", daft_numeric_types)
-@pytest.mark.parametrize("seed", [None, 123])
-def test_hash_struct_with_nones(dtype, seed):
-    data = [
-        {"a": 1, "b": 2},
-        {"a": None, "b": 2},
-        {"a": 0, "b": 2},
-        {"a": None, "b": None},
-        {"a": 0, "b": 0},
-        None,
-        {"a": None, "b": 2},
-        None,
-    ]
-    arr = Series.from_pylist(data).cast(DataType.struct({"a": dtype, "b": dtype}))
-
-    seeds = None if seed is None else Series.from_pylist([seed] * len(data)).cast(DataType.uint64())
-
-    hashed = arr.hash(seeds).to_pylist()
-    assert hashed[1] == hashed[6]
-    assert hashed[5] is None and hashed[-1] is None
-
-    different_inds = [0, 1, 2, 3, 4]
-    for i in range(len(different_inds)):
-        for j in range(i):
-            assert hashed[different_inds[i]] != hashed[different_inds[j]]
+    with pytest.raises(ValueError, match="seed length does not match array length"):
+        arr.hash(bad_seed)
 
 
 @pytest.mark.parametrize(
@@ -499,16 +164,6 @@ def test_murmur3_32_hash_string():
 def test_murmur3_32_hash_bytes():
     arr = Series.from_pylist([b"\x00\x01\x02\x03", None])
     assert arr.datatype() == DataType.binary()
-    hashes = arr.murmur3_32()
-    java_answer = -188683207
-    assert hashes.to_pylist() == [java_answer, None]
-
-
-def test_murmur3_32_hash_fixed_sized_bytes():
-    import pyarrow as pa
-
-    arr = Series.from_arrow(pa.array([b"\x00\x01\x02\x03", None], type=pa.binary(4)))
-    assert arr.datatype() == DataType.fixed_size_binary(4)
     hashes = arr.murmur3_32()
     java_answer = -188683207
     assert hashes.to_pylist() == [java_answer, None]

@@ -1,79 +1,59 @@
 use std::sync::Arc;
 
-use arrow::{
-    array::{Array, ArrayRef},
-    buffer::{NullBuffer, OffsetBuffer, ScalarBuffer},
-    compute::kernels::concat::concat,
-};
 use common_error::{DaftError, DaftResult};
 
-use crate::{
-    datatypes::{DaftArrayType, DataType, Field},
-    prelude::{FromArrow, ListArray},
-    series::Series,
-};
+use crate::array::growable::{Growable, GrowableArray};
+use crate::datatypes::{DaftArrayType, Field};
+use crate::series::Series;
+use crate::DataType;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FixedSizeListArray {
     pub field: Arc<Field>,
-    /// contains all the elements of the nested lists flattened into a single contiguous array.
     pub flat_child: Series,
-    nulls: Option<NullBuffer>,
+    validity: Option<arrow2::bitmap::Bitmap>,
 }
 
-impl DaftArrayType for FixedSizeListArray {
-    fn data_type(&self) -> &DataType {
-        &self.field.as_ref().dtype
-    }
-}
+impl DaftArrayType for FixedSizeListArray {}
 
 impl FixedSizeListArray {
     pub fn new<F: Into<Arc<Field>>>(
         field: F,
         flat_child: Series,
-        nulls: Option<NullBuffer>,
+        validity: Option<arrow2::bitmap::Bitmap>,
     ) -> Self {
         let field: Arc<Field> = field.into();
         match &field.as_ref().dtype {
             DataType::FixedSizeList(child_dtype, size) => {
-                if let Some(nulls) = nulls.as_ref()
-                    && (nulls.len() * size) != flat_child.len()
-                {
+                if let Some(validity) = validity.as_ref() && (validity.len() * size) != flat_child.len() {
                     panic!(
-                        "FixedSizeListArray::new received values with len {} but expected it to match len of validity {} * size: {}",
+                        "FixedSizeListArray::new received values with len {} but expected it to match len of validity * size: {}",
                         flat_child.len(),
-                        nulls.len(),
-                        nulls.len() * size,
+                        (validity.len() * size),
                     )
                 }
-                assert!(
-                    !(child_dtype.as_ref() != flat_child.data_type()),
-                    "FixedSizeListArray::new expects the child series to have dtype {}, but received: {}",
-                    child_dtype,
-                    flat_child.data_type(),
-                );
+                if child_dtype.as_ref() != flat_child.data_type() {
+                    panic!(
+                        "FixedSizeListArray::new expects the child series to have dtype {}, but received: {}",
+                        child_dtype,
+                        flat_child.data_type(),
+                    )
+                }
             }
             _ => panic!(
                 "FixedSizeListArray::new expected FixedSizeList datatype, but received field: {}",
                 field
             ),
         }
-        Self {
+        FixedSizeListArray {
             field,
             flat_child,
-            nulls,
+            validity,
         }
     }
 
-    pub fn nulls(&self) -> Option<&NullBuffer> {
-        self.nulls.as_ref()
-    }
-
-    pub fn null_count(&self) -> usize {
-        match self.nulls() {
-            None => 0,
-            Some(nulls) => nulls.null_count(),
-        }
+    pub fn validity(&self) -> Option<&arrow2::bitmap::Bitmap> {
+        self.validity.as_ref()
     }
 
     pub fn concat(arrays: &[&Self]) -> DaftResult<Self> {
@@ -82,22 +62,27 @@ impl FixedSizeListArray {
                 "Need at least 1 FixedSizeListArray to concat".to_string(),
             ));
         }
-        let first_field = arrays[0].field().clone();
 
-        let arc_vec = arrays
-            .iter()
-            .map(|arr| {
-                let mut arr = (*arr).clone();
-                // arrow-rs concat does a deep equality on the field names, which arrow2 did not.
-                // so to make sure we can `concat`, we need to rename both the child and the array itself
-                arr.flat_child = arr.flat_child.rename(&first_field.name);
-                arr.rename(&first_field.name).to_arrow()
-            })
-            .collect::<DaftResult<Vec<ArrayRef>>>()?;
-        let ref_vec: Vec<&dyn Array> = arc_vec.iter().map(|x| x.as_ref()).collect();
+        let first_array = arrays.get(0).unwrap();
+        let mut growable = <Self as GrowableArray>::make_growable(
+            first_array.field.name.as_str(),
+            &first_array.field.dtype,
+            arrays.to_vec(),
+            arrays
+                .iter()
+                .map(|a| a.validity.as_ref().map_or(0usize, |v| v.unset_bits()))
+                .sum::<usize>()
+                > 0,
+            arrays.iter().map(|a| a.len()).sum(),
+        );
 
-        let res = concat(&ref_vec)?;
-        Self::from_arrow(first_field, res)
+        for (i, arr) in arrays.iter().enumerate() {
+            growable.extend(i, 0, arr.len());
+        }
+
+        growable
+            .build()
+            .map(|s| s.downcast::<FixedSizeListArray>().unwrap().clone())
     }
 
     pub fn len(&self) -> usize {
@@ -108,20 +93,14 @@ impl FixedSizeListArray {
         self.len() == 0
     }
 
-    pub fn field(&self) -> &Field {
-        &self.field
-    }
-
     pub fn name(&self) -> &str {
         &self.field.name
     }
 
-    #[must_use]
     pub fn data_type(&self) -> &DataType {
         &self.field.dtype
     }
 
-    #[must_use]
     pub fn child_data_type(&self) -> &DataType {
         match &self.field.dtype {
             DataType::FixedSizeList(child, _) => child.as_ref(),
@@ -129,12 +108,11 @@ impl FixedSizeListArray {
         }
     }
 
-    #[must_use]
     pub fn rename(&self, name: &str) -> Self {
         Self::new(
             Field::new(name, self.data_type().clone()),
             self.flat_child.clone(),
-            self.nulls.clone(),
+            self.validity.clone(),
         )
     }
 
@@ -148,23 +126,19 @@ impl FixedSizeListArray {
         Ok(Self::new(
             self.field.clone(),
             self.flat_child.slice(start * size, end * size)?,
-            self.nulls
+            self.validity
                 .as_ref()
-                .map(|v| v.clone().slice(start, end - start)),
+                .map(|v| v.clone().sliced(start, end - start)),
         ))
     }
 
-    pub fn to_arrow(&self) -> DaftResult<ArrayRef> {
-        let mut field = self.flat_child.field().to_arrow()?;
-        field = field.with_name("item");
-        let field = Arc::new(field);
-        let size = self.fixed_element_len() as i32;
-        let values = self.flat_child.to_arrow()?;
-        let nulls = self.nulls.clone();
-
-        Ok(Arc::new(arrow::array::FixedSizeListArray::try_new(
-            field, size, values, nulls,
-        )?))
+    pub fn to_arrow(&self) -> Box<dyn arrow2::array::Array> {
+        let arrow_dtype = self.data_type().to_arrow().unwrap();
+        Box::new(arrow2::array::FixedSizeListArray::new(
+            arrow_dtype,
+            self.flat_child.to_arrow(),
+            self.validity.clone(),
+        ))
     }
 
     pub fn fixed_element_len(&self) -> usize {
@@ -175,53 +149,20 @@ impl FixedSizeListArray {
         }
     }
 
-    pub fn with_nulls(&self, nulls: Option<NullBuffer>) -> DaftResult<Self> {
-        if let Some(v) = &nulls
-            && v.len() != self.len()
-        {
+    pub fn with_validity(&self, validity: Option<arrow2::bitmap::Bitmap>) -> DaftResult<Self> {
+        if let Some(v) = &validity && v.len() != self.len() {
             return Err(DaftError::ValueError(format!(
                 "validity mask length does not match FixedSizeListArray length, {} vs {}",
                 v.len(),
                 self.len()
-            )));
+            )))
         }
 
         Ok(Self::new(
             self.field.clone(),
             self.flat_child.clone(),
-            nulls,
+            validity,
         ))
-    }
-
-    fn generate_offsets(&self) -> OffsetBuffer<i64> {
-        let size = self.fixed_element_len();
-        let len = self.len();
-
-        // Create new offsets
-        let offsets: ScalarBuffer<i64> = (0..=len)
-            .map(|i| i64::try_from(i * size).unwrap())
-            .collect();
-
-        OffsetBuffer::new(offsets)
-    }
-
-    pub fn to_list(&self) -> ListArray {
-        let field = &self.field;
-
-        let DataType::FixedSizeList(inner_type, _) = &field.dtype else {
-            unreachable!("Expected FixedSizeListArray, got {:?}", field.dtype);
-        };
-
-        let datatype = DataType::List(inner_type.clone());
-        let mut field = (**field).clone();
-        field.dtype = datatype;
-
-        ListArray::new(
-            field,
-            self.flat_child.clone(),
-            self.generate_offsets(),
-            self.nulls.clone(),
-        )
     }
 }
 
@@ -238,7 +179,6 @@ impl<'a> IntoIterator for &'a FixedSizeListArray {
     }
 }
 
-#[derive(Clone)]
 pub struct FixedSizeListArrayIter<'a> {
     array: &'a FixedSizeListArray,
     idx: usize,
@@ -249,9 +189,7 @@ impl Iterator for FixedSizeListArrayIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.idx < self.array.len() {
-            if let Some(nulls) = self.array.nulls()
-                && nulls.is_null(self.idx)
-            {
+            if let Some(validity) = self.array.validity() && !validity.get_bit(self.idx) {
                 self.idx += 1;
                 Some(None)
             } else {
@@ -267,42 +205,30 @@ impl Iterator for FixedSizeListArrayIter<'_> {
             None
         }
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (
-            self.array.len() - self.idx,
-            Some(self.array.len() - self.idx),
-        )
-    }
-}
-
-impl ExactSizeIterator for FixedSizeListArrayIter<'_> {
-    fn len(&self) -> usize {
-        self.array.len() - self.idx
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use arrow::buffer::NullBuffer;
     use common_error::DaftResult;
 
-    use super::FixedSizeListArray;
     use crate::{
-        datatypes::{DataType, Field, Int32Array},
-        series::IntoSeries,
+        datatypes::{Field, Int32Array},
+        DataType, IntoSeries,
     };
 
+    use super::FixedSizeListArray;
+
     /// Helper that returns a FixedSizeListArray, with each list element at len=3
-    fn get_i32_fixed_size_list_array(nulls: &[bool]) -> FixedSizeListArray {
+    fn get_i32_fixed_size_list_array(validity: &[bool]) -> FixedSizeListArray {
         let field = Field::new("foo", DataType::FixedSizeList(Box::new(DataType::Int32), 3));
-        let flat_child = Int32Array::from_values("foo", 0i32..(nulls.len() * 3) as i32);
+        let flat_child = Int32Array::from((
+            "foo",
+            (0i32..(validity.len() * 3) as i32).collect::<Vec<i32>>(),
+        ));
         FixedSizeListArray::new(
             field,
             flat_child.into_series(),
-            Some(NullBuffer::from(nulls)),
+            Some(arrow2::bitmap::Bitmap::from(validity)),
         )
     }
 
@@ -322,42 +248,13 @@ mod tests {
             arr.flat_child.i32()?.into_iter().collect::<Vec<_>>()
         );
         assert_eq!(
-            renamed_arr.nulls.unwrap().into_iter().collect::<Vec<_>>(),
-            arr.nulls.unwrap().into_iter().collect::<Vec<_>>()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_fixed_size_list_to_arrow() -> DaftResult<()> {
-        let arr = get_i32_fixed_size_list_array(vec![true, true, false].as_slice());
-        let arrow_arr = arr.to_arrow()?;
-
-        assert_eq!(
-            arrow_arr.data_type(),
-            &arrow::datatypes::DataType::FixedSizeList(
-                Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    arrow::datatypes::DataType::Int32,
-                    true
-                )),
-                3
-            )
-        );
-        assert_eq!(arrow_arr.len(), arr.len());
-        assert_eq!(arrow_arr.null_count(), arr.null_count());
-
-        assert_eq!(
-            arrow_arr
-                .as_any()
-                .downcast_ref::<arrow::array::FixedSizeListArray>()
+            renamed_arr
+                .validity
                 .unwrap()
-                .values()
-                .as_ref()
-                .len(),
-            arr.flat_child.len()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            arr.validity.unwrap().into_iter().collect::<Vec<_>>()
         );
-
         Ok(())
     }
 }

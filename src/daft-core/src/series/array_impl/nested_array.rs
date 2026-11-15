@@ -1,19 +1,16 @@
 use std::sync::Arc;
 
-use arrow::array::ArrayRef;
 use common_error::{DaftError, DaftResult};
 
+use crate::array::ops::broadcast::Broadcastable;
+use crate::array::ops::{DaftIsNull, DaftNotNull, GroupIndices};
+use crate::array::{FixedSizeListArray, ListArray, StructArray};
+use crate::datatypes::BooleanArray;
+use crate::datatypes::Field;
+use crate::series::{array_impl::binary_ops::SeriesBinaryOps, IntoSeries, Series, SeriesLike};
+use crate::{with_match_integer_daft_types, DataType};
+
 use super::ArrayWrapper;
-use crate::{
-    array::{
-        FixedSizeListArray, ListArray, StructArray, UnionArray,
-        ops::{DaftIsNull, DaftNotNull, DaftSetAggable, GroupIndices, broadcast::Broadcastable},
-    },
-    datatypes::{BooleanArray, DataType, Field},
-    lit::Literal,
-    prelude::UInt64Array,
-    series::{IntoSeries, Series, SeriesLike},
-};
 
 macro_rules! impl_series_like_for_nested_arrays {
     ($da:ident) => {
@@ -30,7 +27,7 @@ macro_rules! impl_series_like_for_nested_arrays {
                 self.0.clone().into_series()
             }
 
-            fn to_arrow(&self) -> DaftResult<ArrayRef> {
+            fn to_arrow(&self) -> Box<dyn arrow2::array::Array> {
                 self.0.to_arrow()
             }
 
@@ -38,12 +35,15 @@ macro_rules! impl_series_like_for_nested_arrays {
                 self
             }
 
-            fn with_nulls(&self, nulls: Option<arrow::buffer::NullBuffer>) -> DaftResult<Series> {
-                Ok(self.0.with_nulls(nulls)?.into_series())
+            fn with_validity(
+                &self,
+                validity: Option<arrow2::bitmap::Bitmap>,
+            ) -> DaftResult<Series> {
+                Ok(self.0.with_validity(validity)?.into_series())
             }
 
-            fn nulls(&self) -> Option<&arrow::buffer::NullBuffer> {
-                self.0.nulls()
+            fn validity(&self) -> Option<&arrow2::bitmap::Bitmap> {
+                self.0.validity()
             }
 
             fn min(&self, _groups: Option<&GroupIndices>) -> DaftResult<Series> {
@@ -66,18 +66,6 @@ macro_rules! impl_series_like_for_nested_arrays {
                 match groups {
                     Some(groups) => Ok(self.0.grouped_list(groups)?.into_series()),
                     None => Ok(self.0.list()?.into_series()),
-                }
-            }
-
-            fn agg_set(&self, groups: Option<&GroupIndices>) -> DaftResult<Series> {
-                match groups {
-                    Some(groups) => self
-                        .0
-                        .clone()
-                        .into_series()
-                        .grouped_set(groups)
-                        .map(|x| x.into_series()),
-                    None => self.0.clone().into_series().set().map(|x| x.into_series()),
                 }
             }
 
@@ -120,7 +108,7 @@ macro_rules! impl_series_like_for_nested_arrays {
                 self.0.rename(name).into_series()
             }
 
-            fn size_bytes(&self) -> usize {
+            fn size_bytes(&self) -> DaftResult<usize> {
                 self.0.size_bytes()
             }
 
@@ -132,7 +120,7 @@ macro_rules! impl_series_like_for_nested_arrays {
                 Ok(self.0.not_null()?.into_series())
             }
 
-            fn sort(&self, _descending: bool, _nulls_first: bool) -> DaftResult<Series> {
+            fn sort(&self, _descending: bool) -> DaftResult<Series> {
                 Err(DaftError::ValueError(format!(
                     "Cannot sort a {}",
                     stringify!($da)
@@ -147,16 +135,66 @@ macro_rules! impl_series_like_for_nested_arrays {
                 Ok(self.0.slice(start, end)?.into_series())
             }
 
-            fn take(&self, idx: &UInt64Array) -> DaftResult<Series> {
-                Ok(self.0.take(idx)?.into_series())
+            fn take(&self, idx: &Series) -> DaftResult<Series> {
+                with_match_integer_daft_types!(idx.data_type(), |$S| {
+                    Ok(self
+                        .0
+                        .take(idx.downcast::<<$S as DaftDataType>::ArrayType>()?)?
+                        .into_series())
+                })
             }
 
             fn str_value(&self, idx: usize) -> DaftResult<String> {
                 self.0.str_value(idx)
             }
 
-            fn get_lit(&self, idx: usize) -> Literal {
-                self.0.get_lit(idx)
+            fn html_value(&self, idx: usize) -> String {
+                self.0.html_value(idx)
+            }
+
+            fn add(&self, rhs: &Series) -> DaftResult<Series> {
+                SeriesBinaryOps::add(self, rhs)
+            }
+            fn sub(&self, rhs: &Series) -> DaftResult<Series> {
+                SeriesBinaryOps::sub(self, rhs)
+            }
+            fn mul(&self, rhs: &Series) -> DaftResult<Series> {
+                SeriesBinaryOps::mul(self, rhs)
+            }
+            fn div(&self, rhs: &Series) -> DaftResult<Series> {
+                SeriesBinaryOps::div(self, rhs)
+            }
+            fn rem(&self, rhs: &Series) -> DaftResult<Series> {
+                SeriesBinaryOps::rem(self, rhs)
+            }
+
+            fn and(&self, rhs: &Series) -> DaftResult<BooleanArray> {
+                SeriesBinaryOps::and(self, rhs)
+            }
+            fn or(&self, rhs: &Series) -> DaftResult<BooleanArray> {
+                SeriesBinaryOps::or(self, rhs)
+            }
+            fn xor(&self, rhs: &Series) -> DaftResult<BooleanArray> {
+                SeriesBinaryOps::xor(self, rhs)
+            }
+
+            fn equal(&self, rhs: &Series) -> DaftResult<BooleanArray> {
+                SeriesBinaryOps::equal(self, rhs)
+            }
+            fn not_equal(&self, rhs: &Series) -> DaftResult<BooleanArray> {
+                SeriesBinaryOps::not_equal(self, rhs)
+            }
+            fn lt(&self, rhs: &Series) -> DaftResult<BooleanArray> {
+                SeriesBinaryOps::lt(self, rhs)
+            }
+            fn lte(&self, rhs: &Series) -> DaftResult<BooleanArray> {
+                SeriesBinaryOps::lte(self, rhs)
+            }
+            fn gt(&self, rhs: &Series) -> DaftResult<BooleanArray> {
+                SeriesBinaryOps::gt(self, rhs)
+            }
+            fn gte(&self, rhs: &Series) -> DaftResult<BooleanArray> {
+                SeriesBinaryOps::gte(self, rhs)
             }
         }
     };
@@ -165,4 +203,3 @@ macro_rules! impl_series_like_for_nested_arrays {
 impl_series_like_for_nested_arrays!(FixedSizeListArray);
 impl_series_like_for_nested_arrays!(StructArray);
 impl_series_like_for_nested_arrays!(ListArray);
-impl_series_like_for_nested_arrays!(UnionArray);

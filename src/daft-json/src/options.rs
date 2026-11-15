@@ -1,17 +1,19 @@
-use common_py_serde::impl_bincode_py_state_serialization;
-use daft_core::prelude::SchemaRef;
+use daft_core::{impl_bincode_py_state_serialization, schema::SchemaRef};
 use daft_dsl::ExprRef;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "python")]
 use {
-    daft_core::python::PySchema,
+    daft_core::python::schema::PySchema,
     daft_dsl::python::PyExpr,
-    pyo3::{PyResult, Python, pyclass, pyclass::CompareOp, pymethods},
+    pyo3::{
+        pyclass, pyclass::CompareOp, pymethods, types::PyBytes, PyObject, PyResult, PyTypeInfo,
+        Python, ToPyObject,
+    },
 };
 
 /// Options for converting JSON data to Daft data.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyclass(module = "daft.daft", from_py_object))]
+#[cfg_attr(feature = "python", pyclass(module = "daft.daft"))]
 pub struct JsonConvertOptions {
     pub limit: Option<usize>,
     pub include_columns: Option<Vec<String>>,
@@ -83,8 +85,8 @@ impl JsonConvertOptions {
         Self::new_internal(
             limit,
             include_columns,
-            schema.map(std::convert::Into::into),
-            predicate.map(|p| p.expr),
+            schema.map(|s| s.into()),
+            predicate.map(|p| p.expr.into()),
         )
     }
 
@@ -115,31 +117,23 @@ impl JsonConvertOptions {
         Ok(format!("{:?}", self))
     }
 }
+
 impl_bincode_py_state_serialization!(JsonConvertOptions);
 
 /// Options for parsing JSON files.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(
-    feature = "python",
-    pyclass(module = "daft.daft", get_all, from_py_object)
-)]
-pub struct JsonParseOptions {
-    pub sample_size: Option<usize>,
-    pub skip_empty_files: bool,
-}
+#[cfg_attr(feature = "python", pyclass(module = "daft.daft", get_all))]
+pub struct JsonParseOptions {}
 
 impl JsonParseOptions {
-    pub fn new_internal(skip_empty_files: bool) -> Self {
-        Self {
-            sample_size: None,
-            skip_empty_files,
-        }
+    pub fn new_internal() -> Self {
+        Self {}
     }
 }
 
 impl Default for JsonParseOptions {
     fn default() -> Self {
-        Self::new_internal(false)
+        Self::new_internal()
     }
 }
 
@@ -148,9 +142,8 @@ impl Default for JsonParseOptions {
 impl JsonParseOptions {
     /// Create parsing options for the JSON reader.
     #[new]
-    #[pyo3(signature = (skip_empty_files = false))]
-    pub fn new(skip_empty_files: bool) -> PyResult<Self> {
-        Ok(Self::new_internal(skip_empty_files))
+    pub fn new() -> PyResult<Self> {
+        Ok(Self::new_internal())
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
@@ -165,21 +158,14 @@ impl JsonParseOptions {
         Ok(format!("{:?}", self))
     }
 }
+
 impl_bincode_py_state_serialization!(JsonParseOptions);
 
 /// Options for reading JSON files.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(
-    feature = "python",
-    pyclass(module = "daft.daft", get_all, from_py_object)
-)]
+#[cfg_attr(feature = "python", pyclass(module = "daft.daft", get_all))]
 pub struct JsonReadOptions {
     pub buffer_size: Option<usize>,
-    /// Target chunk size in bytes (approximate).
-    ///
-    /// Controls how data is split into RecordBatches for parallel processing.
-    /// Each chunk may be slightly larger than this value because splits are aligned
-    /// to line boundaries.
     pub chunk_size: Option<usize>,
 }
 
@@ -239,4 +225,5 @@ impl JsonReadOptions {
         Ok(format!("{:?}", self))
     }
 }
+
 impl_bincode_py_state_serialization!(JsonReadOptions);

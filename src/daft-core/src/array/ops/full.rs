@@ -1,17 +1,17 @@
-use std::{iter::repeat_n, sync::Arc};
+use std::{iter::repeat, sync::Arc};
 
-use arrow::buffer::OffsetBuffer;
+use arrow2::offset::OffsetsBuffer;
 #[cfg(feature = "python")]
 use pyo3::Python;
 
-#[cfg(feature = "python")]
-use crate::prelude::PythonArray;
 use crate::{
-    array::{DataArray, FixedSizeListArray, ListArray, StructArray, UnionArray},
-    datatypes::{
-        DaftDataType, DaftLogicalType, DaftPhysicalType, DataType, Field, logical::LogicalArray,
+    array::{
+        pseudo_arrow::PseudoArrowArray, DataArray, FixedSizeListArray, ListArray, StructArray,
     },
-    series::Series,
+    datatypes::{
+        logical::LogicalArray, DaftDataType, DaftLogicalType, DaftPhysicalType, DataType, Field,
+    },
+    Series,
 };
 
 pub trait FullNull {
@@ -25,17 +25,29 @@ where
 {
     /// Creates a DataArray<T> of size `length` that is filled with all nulls.
     fn full_null(name: &str, dtype: &DataType, length: usize) -> Self {
-        assert!(
-            !(dtype != &T::get_dtype() && !matches!(T::get_dtype(), DataType::Unknown)),
-            "Cannot create DataArray from dtype: {dtype} with physical type: {}",
-            T::get_dtype()
-        );
+        if dtype != &T::get_dtype() && !matches!(T::get_dtype(), DataType::Unknown) {
+            panic!(
+                "Cannot create DataArray from dtype: {dtype} with physical type: {}",
+                T::get_dtype()
+            );
+        }
+        let field = Field::new(name, dtype.clone());
+        #[cfg(feature = "python")]
+        if dtype.is_python() {
+            let py_none = Python::with_gil(|py: Python| py.None());
+
+            return DataArray::new(
+                field.into(),
+                Box::new(PseudoArrowArray::from_pyobj_vec(vec![py_none; length])),
+            )
+            .unwrap();
+        }
 
         let arrow_dtype = dtype.to_arrow();
         match arrow_dtype {
-            Ok(arrow_dtype) => Self::from_arrow(
+            Ok(arrow_dtype) => DataArray::<T>::new(
                 Arc::new(Field::new(name.to_string(), dtype.clone())),
-                arrow::array::new_null_array(&arrow_dtype, length),
+                arrow2::array::new_null_array(arrow_dtype, length),
             )
             .unwrap(),
             Err(e) => panic!("Cannot create DataArray from non-arrow dtype: {e}"),
@@ -43,11 +55,21 @@ where
     }
 
     fn empty(name: &str, dtype: &DataType) -> Self {
+        let field = Field::new(name, dtype.clone());
+        #[cfg(feature = "python")]
+        if dtype.is_python() {
+            return DataArray::new(
+                field.into(),
+                Box::new(PseudoArrowArray::from_pyobj_vec(vec![])),
+            )
+            .unwrap();
+        }
+
         let arrow_dtype = dtype.to_arrow();
         match arrow_dtype {
-            Ok(arrow_dtype) => Self::from_arrow(
+            Ok(arrow_dtype) => DataArray::<T>::new(
                 Arc::new(Field::new(name.to_string(), dtype.clone())),
-                arrow::array::new_empty_array(&arrow_dtype),
+                arrow2::array::new_empty_array(arrow_dtype),
             )
             .unwrap(),
             Err(e) => panic!("Cannot create DataArray from non-arrow dtype: {e}"),
@@ -78,12 +100,12 @@ where
 
 impl FullNull for FixedSizeListArray {
     fn full_null(name: &str, dtype: &DataType, length: usize) -> Self {
-        let nulls = arrow::buffer::NullBuffer::from_iter(repeat_n(false, length));
+        let validity = arrow2::bitmap::Bitmap::from_iter(repeat(false).take(length));
 
         match dtype {
             DataType::FixedSizeList(child_dtype, size) => {
                 let flat_child = Series::full_null("item", child_dtype, length * size);
-                Self::new(Field::new(name, dtype.clone()), flat_child, Some(nulls))
+                Self::new(Field::new(name, dtype.clone()), flat_child, Some(validity))
             }
             _ => panic!(
                 "Cannot create FixedSizeListArray::full_null from datatype: {}",
@@ -109,7 +131,7 @@ impl FullNull for FixedSizeListArray {
 
 impl FullNull for ListArray {
     fn full_null(name: &str, dtype: &DataType, length: usize) -> Self {
-        let nulls = arrow::buffer::NullBuffer::from_iter(repeat_n(false, length));
+        let validity = arrow2::bitmap::Bitmap::from_iter(repeat(false).take(length));
 
         match dtype {
             DataType::List(child_dtype) => {
@@ -117,8 +139,9 @@ impl FullNull for ListArray {
                 Self::new(
                     Field::new(name, dtype.clone()),
                     empty_flat_child,
-                    OffsetBuffer::new_zeroed(length),
-                    Some(nulls),
+                    OffsetsBuffer::try_from(repeat(0).take(length + 1).collect::<Vec<_>>())
+                        .unwrap(),
+                    Some(validity),
                 )
             }
             _ => panic!(
@@ -133,7 +156,7 @@ impl FullNull for ListArray {
             DataType::List(child_dtype) => {
                 let field = Field::new(name, dtype.clone());
                 let empty_child = Series::empty("list", child_dtype.as_ref());
-                Self::new(field, empty_child, OffsetBuffer::default(), None)
+                Self::new(field, empty_child, OffsetsBuffer::default(), None)
             }
             _ => panic!("Cannot create empty ListArray with dtype: {}", dtype),
         }
@@ -142,15 +165,15 @@ impl FullNull for ListArray {
 
 impl FullNull for StructArray {
     fn full_null(name: &str, dtype: &DataType, length: usize) -> Self {
-        let nulls = arrow::buffer::NullBuffer::from_iter(repeat_n(false, length));
+        let validity = arrow2::bitmap::Bitmap::from_iter(repeat(false).take(length));
         match dtype {
             DataType::Struct(children) => {
                 let field = Field::new(name, dtype.clone());
                 let empty_children = children
                     .iter()
-                    .map(|f| Series::full_null(f.name.as_ref(), &f.dtype, length))
+                    .map(|f| Series::full_null(f.name.as_str(), &f.dtype, length))
                     .collect::<Vec<_>>();
-                Self::new(field, empty_children, Some(nulls))
+                Self::new(field, empty_children, Some(validity))
             }
             _ => panic!("Cannot create empty StructArray with dtype: {}", dtype),
         }
@@ -162,7 +185,7 @@ impl FullNull for StructArray {
                 let field = Field::new(name, dtype.clone());
                 let empty_children = children
                     .iter()
-                    .map(|f| Series::empty(f.name.as_ref(), &f.dtype))
+                    .map(|f| Series::empty(f.name.as_str(), &f.dtype))
                     .collect::<Vec<_>>();
                 Self::new(field, empty_children, None)
             }
@@ -171,74 +194,14 @@ impl FullNull for StructArray {
     }
 }
 
-impl FullNull for UnionArray {
-    fn full_null(name: &str, dtype: &DataType, length: usize) -> Self {
-        match dtype {
-            DataType::Union(fields, type_ids, mode) => {
-                let field = Field::new(name, dtype.clone());
-                let empty_children = fields
-                    .iter()
-                    .map(|f| Series::full_null(f.name.as_ref(), &f.dtype, length))
-                    .collect::<Vec<_>>();
-
-                let offsets = if mode.is_dense() {
-                    Some(vec![0i32; length])
-                } else {
-                    None
-                };
-
-                let null_id = type_ids[0];
-                let types = vec![null_id; length];
-
-                Self::new(field, types, empty_children, offsets)
-            }
-            _ => panic!("Cannot create empty UnionArray with dtype: {}", dtype),
-        }
-    }
-
-    fn empty(name: &str, dtype: &DataType) -> Self {
-        match dtype {
-            DataType::Union(fields, _, mode) => {
-                let field = Field::new(name, dtype.clone());
-                let empty_children = fields
-                    .iter()
-                    .map(|f| Series::empty(f.name.as_ref(), &f.dtype))
-                    .collect::<Vec<_>>();
-
-                let offsets = if mode.is_dense() { Some(vec![]) } else { None };
-
-                Self::new(field, vec![], empty_children, offsets)
-            }
-            _ => panic!("Cannot create empty UnionArray with dtype: {}", dtype),
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-impl FullNull for PythonArray {
-    fn full_null(name: &str, dtype: &DataType, length: usize) -> Self {
-        let pynone = Arc::new(Python::attach(|py: Python| py.None()));
-        let values = vec![pynone; length];
-
-        let validity = arrow::buffer::NullBuffer::new_null(length);
-
-        let field = Arc::new(Field::new(name, dtype.clone()));
-        Self::new(field, values.into(), Some(validity))
-    }
-
-    fn empty(name: &str, dtype: &DataType) -> Self {
-        let field = Arc::new(Field::new(name, dtype.clone()));
-        Self::new(field, Vec::new().into(), None)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use common_error::DaftResult;
 
     use crate::{
-        array::{FixedSizeListArray, StructArray, ops::full::FullNull},
-        datatypes::{DataType, Field},
+        array::{ops::full::FullNull, FixedSizeListArray, StructArray},
+        datatypes::Field,
+        DataType,
     };
 
     #[test]

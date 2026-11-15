@@ -1,89 +1,71 @@
 use std::sync::Arc;
 
-use arrow::{
-    array::{Array, ArrayRef},
-    buffer::{NullBuffer, OffsetBuffer, ScalarBuffer},
-    compute::kernels::concat::concat,
-};
 use common_error::{DaftError, DaftResult};
 
-use crate::{
-    datatypes::{DaftArrayType, DataType, Field},
-    prelude::FromArrow,
-    series::Series,
-};
+use crate::array::growable::{Growable, GrowableArray};
+use crate::datatypes::{DaftArrayType, Field};
+use crate::series::Series;
+use crate::DataType;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ListArray {
     pub field: Arc<Field>,
     pub flat_child: Series,
-
-    /// Where each row starts and ends. Null rows usually have the same start/end index, but this is not guaranteed.
-    offsets: OffsetBuffer<i64>,
-    nulls: Option<NullBuffer>,
+    offsets: arrow2::offset::OffsetsBuffer<i64>,
+    validity: Option<arrow2::bitmap::Bitmap>,
 }
 
-impl DaftArrayType for ListArray {
-    fn data_type(&self) -> &DataType {
-        &self.field.as_ref().dtype
-    }
-}
+impl DaftArrayType for ListArray {}
 
 impl ListArray {
     pub fn new<F: Into<Arc<Field>>>(
         field: F,
         flat_child: Series,
-        offsets: OffsetBuffer<i64>,
-        nulls: Option<NullBuffer>,
+        offsets: arrow2::offset::OffsetsBuffer<i64>,
+        validity: Option<arrow2::bitmap::Bitmap>,
     ) -> Self {
         let field: Arc<Field> = field.into();
         match &field.as_ref().dtype {
             DataType::List(child_dtype) => {
-                if let Some(nulls) = nulls.as_ref()
-                    && nulls.len() != (offsets.len() - 1)
-                {
+                if let Some(validity) = validity.as_ref() && validity.len() != offsets.len_proxy() {
+                    panic!("ListArray::new validity length does not match computed length from offsets")
+                }
+                if child_dtype.as_ref() != flat_child.data_type() {
                     panic!(
-                        "ListArray::new validity length does not match computed length from offsets"
+                        "ListArray::new expects the child series to have field {}, but received: {}",
+                        child_dtype,
+                        flat_child.data_type(),
                     )
                 }
-                assert!(
-                    !(child_dtype.as_ref() != flat_child.data_type()),
-                    "ListArray::new expects the child series to have field {}, but received: {}",
-                    child_dtype,
-                    flat_child.data_type(),
-                );
-                assert!(
-                    *offsets.last().unwrap() <= flat_child.len() as i64,
-                    "ListArray::new received offsets with last value {}, but child series has length {}",
-                    offsets.last().unwrap(),
-                    flat_child.len()
-                );
+                if *offsets.last() > flat_child.len() as i64 {
+                    panic!("ListArray::new received offsets with last value {}, but child series has length {}", offsets.last(), flat_child.len())
+                }
             }
             _ => panic!(
                 "ListArray::new expected List datatype, but received field: {}",
                 field
             ),
         }
-        Self {
+        ListArray {
             field,
             flat_child,
             offsets,
-            nulls,
+            validity,
         }
     }
 
-    pub fn offsets(&self) -> &OffsetBuffer<i64> {
+    pub fn offsets(&self) -> &arrow2::offset::OffsetsBuffer<i64> {
         &self.offsets
     }
 
-    pub fn nulls(&self) -> Option<&NullBuffer> {
-        self.nulls.as_ref()
+    pub fn validity(&self) -> Option<&arrow2::bitmap::Bitmap> {
+        self.validity.as_ref()
     }
 
     pub fn null_count(&self) -> usize {
-        match self.nulls() {
+        match self.validity() {
             None => 0,
-            Some(nulls) => nulls.null_count(),
+            Some(validity) => validity.unset_bits(),
         }
     }
 
@@ -93,34 +75,35 @@ impl ListArray {
                 "Need at least 1 ListArray to concat".to_string(),
             ));
         }
-        let first_field = arrays[0].field().clone();
 
-        let arc_vec = arrays
-            .iter()
-            .map(|arr| {
-                let mut arr = (*arr).clone();
-                // arrow-rs concat does a deep equality on the field names, which arrow2 did not.
-                // so to make sure we can `concat`, we need to rename both the child and the array itself
-                arr.flat_child = arr.flat_child.rename(&first_field.name);
-                arr.rename(&first_field.name).to_arrow()
-            })
-            .collect::<DaftResult<Vec<ArrayRef>>>()?;
-        let ref_vec: Vec<&dyn Array> = arc_vec.iter().map(|x| x.as_ref()).collect();
+        let first_array = arrays.get(0).unwrap();
+        let mut growable = <Self as GrowableArray>::make_growable(
+            first_array.field.name.as_str(),
+            &first_array.field.dtype,
+            arrays.to_vec(),
+            arrays
+                .iter()
+                .map(|a| a.validity.as_ref().map_or(0usize, |v| v.unset_bits()))
+                .sum::<usize>()
+                > 0,
+            arrays.iter().map(|a| a.len()).sum(),
+        );
 
-        let res = concat(&ref_vec)?;
-        Self::from_arrow(first_field, res)
+        for (i, arr) in arrays.iter().enumerate() {
+            growable.extend(i, 0, arr.len());
+        }
+
+        growable
+            .build()
+            .map(|s| s.downcast::<ListArray>().unwrap().clone())
     }
 
     pub fn len(&self) -> usize {
-        self.offsets.len() - 1
+        self.offsets.len_proxy()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    pub fn field(&self) -> &Field {
-        &self.field
     }
 
     pub fn name(&self) -> &str {
@@ -143,7 +126,7 @@ impl ListArray {
             Field::new(name, self.data_type().clone()),
             self.flat_child.clone(),
             self.offsets.clone(),
-            self.nulls.clone(),
+            self.validity.clone(),
         )
     }
 
@@ -153,55 +136,45 @@ impl ListArray {
                 "Trying to slice array with negative length, start: {start} vs end: {end}"
             )));
         }
-        // OffsetBuffer::slice(offset, len) takes len as the number of *rows*, not offset values.
-        // It internally adds 1 to account for the extra offset value (N rows need N+1 offsets).
-        let num_rows = end - start;
-        let new_offsets = self.offsets.slice(start, num_rows);
+        let mut new_offsets = self.offsets.clone();
+        new_offsets.slice(start, end - start + 1);
 
-        let new_nulls = self
-            .nulls
+        let new_validity = self
+            .validity
             .as_ref()
-            .map(|v| v.clone().slice(start, num_rows));
+            .map(|v| v.clone().sliced(start, end - start));
         Ok(Self::new(
             self.field.clone(),
             self.flat_child.clone(),
             new_offsets,
-            new_nulls,
+            new_validity,
         ))
     }
-    pub fn to_arrow(&self) -> DaftResult<ArrayRef> {
-        let mut field = self.flat_child.field().to_arrow()?;
-        field = field.with_name("item");
-        let offsets = self.offsets().clone();
-        let arrow_offsets: arrow::buffer::Buffer = offsets.inner().clone().into();
 
-        let offsets = arrow::buffer::OffsetBuffer::new(ScalarBuffer::from(arrow_offsets));
-        let values = self.flat_child.to_arrow()?;
-        let nulls = self.nulls.clone();
-        Ok(Arc::new(arrow::array::LargeListArray::new(
-            Arc::new(field),
-            offsets,
-            values,
-            nulls,
-        )))
+    pub fn to_arrow(&self) -> Box<dyn arrow2::array::Array> {
+        let arrow_dtype = self.data_type().to_arrow().unwrap();
+        Box::new(arrow2::array::ListArray::new(
+            arrow_dtype,
+            self.offsets().clone(),
+            self.flat_child.to_arrow(),
+            self.validity.clone(),
+        ))
     }
 
-    pub fn with_nulls(&self, nulls: Option<arrow::buffer::NullBuffer>) -> DaftResult<Self> {
-        if let Some(v) = &nulls
-            && v.len() != self.len()
-        {
+    pub fn with_validity(&self, validity: Option<arrow2::bitmap::Bitmap>) -> DaftResult<Self> {
+        if let Some(v) = &validity && v.len() != self.len() {
             return Err(DaftError::ValueError(format!(
                 "validity mask length does not match ListArray length, {} vs {}",
                 v.len(),
                 self.len()
-            )));
+            )))
         }
 
         Ok(Self::new(
             self.field.clone(),
             self.flat_child.clone(),
             self.offsets.clone(),
-            nulls,
+            validity,
         ))
     }
 }
@@ -219,16 +192,6 @@ impl<'a> IntoIterator for &'a ListArray {
     }
 }
 
-impl ListArray {
-    pub fn iter(&self) -> ListArrayIter<'_> {
-        ListArrayIter {
-            array: self,
-            idx: 0,
-        }
-    }
-}
-
-#[derive(Clone)]
 pub struct ListArrayIter<'a> {
     array: &'a ListArray,
     idx: usize,
@@ -239,9 +202,7 @@ impl Iterator for ListArrayIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.idx < self.array.len() {
-            if let Some(nulls) = self.array.nulls()
-                && nulls.is_null(self.idx)
-            {
+            if let Some(validity) = self.array.validity() && !validity.get_bit(self.idx) {
                 self.idx += 1;
                 Some(None)
             } else {
@@ -254,18 +215,5 @@ impl Iterator for ListArrayIter<'_> {
         } else {
             None
         }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (
-            self.array.len() - self.idx,
-            Some(self.array.len() - self.idx),
-        )
-    }
-}
-
-impl ExactSizeIterator for ListArrayIter<'_> {
-    fn len(&self) -> usize {
-        self.array.len() - self.idx
     }
 }

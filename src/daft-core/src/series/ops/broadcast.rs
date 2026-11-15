@@ -1,25 +1,22 @@
-use common_error::DaftResult;
-
 use crate::series::Series;
+
+use common_error::DaftResult;
 impl Series {
-    pub fn broadcast(&self, num: usize) -> DaftResult<Self> {
+    pub fn broadcast(&self, num: usize) -> DaftResult<Series> {
         self.inner.broadcast(num)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::array::ops::full::FullNull;
+    use crate::datatypes::{DataType, Int64Array, Utf8Array};
+    use crate::series::array_impl::IntoSeries;
     use common_error::DaftResult;
-
-    use crate::{
-        array::ops::full::FullNull,
-        datatypes::{DataType, Int64Array, Utf8Array},
-        series::array_impl::IntoSeries,
-    };
 
     #[test]
     fn broadcast_int() -> DaftResult<()> {
-        let a = Int64Array::from_slice("a", &[1]).into_series();
+        let a = Int64Array::from(("a", vec![1])).into_series();
         let a = a.broadcast(10)?;
         assert_eq!(a.len(), 10);
         assert_eq!(*a.data_type(), DataType::Int64);
@@ -49,7 +46,7 @@ mod tests {
 
     #[test]
     fn broadcast_utf8() -> DaftResult<()> {
-        let a = Utf8Array::from_slice("a", vec!["1"].as_slice()).into_series();
+        let a = Utf8Array::from(("a", vec!["1"].as_slice())).into_series();
         let a = a.broadcast(10)?;
         assert_eq!(a.len(), 10);
         assert_eq!(*a.data_type(), DataType::Utf8);

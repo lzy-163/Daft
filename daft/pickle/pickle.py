@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
-
-from daft.pickle.cloudpickle import dumps as cloudpickle_dumps  # type: ignore
-from daft.pickle.cloudpickle import loads as cloudpickle_loads  # type: ignore
+from daft.pickle.cloudpickle_fast import dumps as cloudpickle_dumps
+from daft.pickle.cloudpickle_fast import loads as cloudpickle_loads
 
 
-def dumps(obj: Any) -> bytes:
+def dumps(obj: object) -> bytes:
     return cloudpickle_dumps(obj)
 
 
-def loads(data: bytes) -> Any:
+def loads(data: bytes) -> object:
     return cloudpickle_loads(data)

@@ -3,32 +3,30 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from daft.daft import FileFormatConfig, ScanOperatorHandle, StorageConfig
+from daft.datatype import DataType
 from daft.logical.builder import LogicalPlanBuilder
 from daft.logical.schema import Schema
 
 if TYPE_CHECKING:
-    from daft.datatype import DataType
+    pass
 
 
-def _get_schema_from_dict(fields: dict[str, DataType]) -> Schema:
-    if isinstance(fields, dict):
-        return Schema._from_field_name_and_types([(fname, dtype) for fname, dtype in fields.items()])
+def _get_schema_from_hints(hints: dict[str, DataType]) -> Schema:
+    if isinstance(hints, dict):
+        return Schema._from_field_name_and_types([(fname, dtype) for fname, dtype in hints.items()])
     else:
-        raise NotImplementedError(f"Unsupported schema fields: {type(fields)}")
+        raise NotImplementedError(f"Unsupported schema hints: {type(hints)}")
 
 
 def get_tabular_files_scan(
     path: str | list[str],
-    infer_schema: bool,
-    schema: dict[str, DataType] | None,
+    schema_hints: dict[str, DataType] | None,
     file_format_config: FileFormatConfig,
     storage_config: StorageConfig,
-    file_path_column: str | None = None,
-    hive_partitioning: bool = False,
-    skip_glob: bool = False,
 ) -> LogicalPlanBuilder:
     """Returns a TabularFilesScan LogicalPlan for a given glob filepath."""
     # Glob the path using the Runner
+    schema_hint = _get_schema_from_hints(schema_hints) if schema_hints is not None else None
 
     if isinstance(path, list):
         paths = path
@@ -41,11 +39,7 @@ def get_tabular_files_scan(
         paths,
         file_format_config,
         storage_config,
-        infer_schema=infer_schema,
-        schema=_get_schema_from_dict(schema)._schema if schema is not None else None,
-        file_path_column=file_path_column,
-        hive_partitioning=hive_partitioning,
-        skip_glob=skip_glob,
+        schema_hint=schema_hint._schema if schema_hint is not None else None,
     )
 
     builder = LogicalPlanBuilder.from_tabular_scan(

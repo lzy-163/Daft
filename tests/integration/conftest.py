@@ -37,10 +37,7 @@ def check_answer(gen_tpch):
         query = pathlib.Path(f"{TPCH_QUERIES}/{tpch_question}.sql").read_text()
         conn = sqlite3.connect(sqlite_db_file_path, detect_types=sqlite3.PARSE_DECLTYPES)
         cursor = conn.cursor()
-        queries = query.split(";")
-        for q in queries:
-            if not q.isspace():
-                res = cursor.execute(q)
+        res = cursor.execute(query)
         sqlite_results = res.fetchall()
         sqlite_pd_results = pd.DataFrame.from_records(sqlite_results, columns=daft_pd_df.columns)
         assert_df_equals(

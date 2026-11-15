@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime
-from collections.abc import Mapping
 
 from hypothesis.strategies import (
     SearchStrategy,
@@ -47,7 +46,7 @@ _default_strategies = {
 
 @composite
 def generate_data(draw, daft_type: DataType, strategies: dict[DataType, SearchStrategy] = _default_strategies):
-    """Helper to generate data when given a daft_type."""
+    """Helper to generate data when given a daft_type"""
     if daft_type not in strategies:
         raise NotImplementedError(f"Strategy for type {daft_type} not implemented")
     return draw(strategies[daft_type], label=f"Generated data for type {daft_type}")
@@ -91,7 +90,7 @@ def series(
     dtypes: SearchStrategy[DataType] = all_dtypes,
     strategies: dict[DataType, SearchStrategy] = _default_strategies,
 ) -> Series:
-    """Generate a column of data.
+    """Generate a column of data
 
     Args:
         draw: Hypothesis draw function
@@ -119,7 +118,7 @@ def series(
 @composite
 def columns_dict(
     draw,
-    generate_columns_with_type: Mapping[str, SearchStrategy[DataType]] | None = None,
+    generate_columns_with_type: dict[str, SearchStrategy[DataType]] = {},
     num_rows_strategy: SearchStrategy[int] = integers(min_value=0, max_value=8),
 ) -> dict[str, Series]:
     """Hypothesis composite strategy for generating in-memory Daft DataFrames.
@@ -130,7 +129,6 @@ def columns_dict(
         generate_columns_with_type: {col_name: column_strategy} for specific strategies (e.g. hashable columns, numeric columns etc)
     """
     df_len = draw(num_rows_strategy, label="Number of rows")
-    generate_columns_with_type = generate_columns_with_type or {}
 
     # Generate requested columns according to requested types
     requested_columns = {
@@ -142,7 +140,7 @@ def columns_dict(
     num_cols = draw(integers(min_value=0, max_value=2), label="Number of additional columns")
     additional_column_names = draw(
         lists(
-            text().filter(lambda name: name not in requested_columns and name != "*" and "\0" not in name),
+            text().filter(lambda name: name not in requested_columns.keys()),
             min_size=num_cols,
             max_size=num_cols,
             unique=True,

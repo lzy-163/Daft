@@ -1,5 +1,6 @@
-use common_error::DaftResult;
 use num_traits::Float;
+
+use common_error::DaftResult;
 
 use crate::{array::DataArray, datatypes::DaftNumericType};
 
@@ -10,9 +11,5 @@ where
 {
     pub fn exp(&self) -> DaftResult<Self> {
         self.apply(|v| v.exp())
-    }
-
-    pub fn expm1(&self) -> DaftResult<Self> {
-        self.apply(|v| v.exp_m1())
     }
 }

@@ -1,8 +1,7 @@
+pub mod binary_ops;
 pub mod data_array;
 pub mod logical_array;
 pub mod nested_array;
-#[cfg(feature = "python")]
-pub mod python_array;
 
 use super::Series;
 

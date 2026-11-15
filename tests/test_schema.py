@@ -8,7 +8,7 @@ import pytest
 from daft.datatype import DataType
 from daft.expressions import ExpressionsProjection, col
 from daft.logical.schema import Schema
-from daft.recordbatch import MicroPartition
+from daft.table import MicroPartition
 
 DATA = {
     "int": ([1, 2, None], DataType.int64()),
@@ -21,9 +21,6 @@ TABLE = MicroPartition.from_pydict({k: data for k, (data, _) in DATA.items()})
 EXPECTED_TYPES = {k: t for k, (_, t) in DATA.items()}
 
 from tests.utils import ANSI_ESCAPE
-
-SCHEMA_TD_STYLE = 'style="text-align:left; max-width:192px; max-height:64px; overflow:auto"'
-SCHEMA_TH_STYLE = 'style="text-wrap: nowrap; max-width:192px; overflow:auto; text-align:left"'
 
 
 def test_schema_len():
@@ -73,23 +70,12 @@ def test_truncated_repr():
     without_escape = ANSI_ESCAPE.sub("", out_repr)
     assert (
         without_escape.replace("\r", "")
-        == """╭───────┬─────────┬────────┬──────╮
-│ int   ┆ float   ┆ string ┆ bool │
-│ ---   ┆ ---     ┆ ---    ┆ ---  │
-│ Int64 ┆ Float64 ┆ String ┆ Bool │
-╰───────┴─────────┴────────┴──────╯
+        == """╭───────┬─────────┬────────┬─────────╮
+│ int   ┆ float   ┆ string ┆ bool    │
+│ ---   ┆ ---     ┆ ---    ┆ ---     │
+│ Int64 ┆ Float64 ┆ Utf8   ┆ Boolean │
+╰───────┴─────────┴────────┴─────────╯
 """
-    )
-
-
-def test_truncated_repr_html():
-    schema = TABLE.schema()
-    out_repr = schema._truncated_table_html()
-    assert (
-        out_repr
-        == f"""<table class="dataframe">
-<thead><tr><th {SCHEMA_TH_STYLE}>int<br />Int64</th><th {SCHEMA_TH_STYLE}>float<br />Float64</th><th {SCHEMA_TH_STYLE}>string<br />String</th><th {SCHEMA_TH_STYLE}>bool<br />Bool</th></tr></thead>
-</table>"""
     )
 
 
@@ -100,34 +86,17 @@ def test_repr():
     assert (
         without_escape.replace("\r", "")
         == """╭─────────────┬─────────╮
-│ Column Name ┆ DType   │
+│ Column Name ┆ Type    │
 ╞═════════════╪═════════╡
 │ int         ┆ Int64   │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
 │ float       ┆ Float64 │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
-│ string      ┆ String  │
+│ string      ┆ Utf8    │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
-│ bool        ┆ Bool    │
+│ bool        ┆ Boolean │
 ╰─────────────┴─────────╯
 """
-    )
-
-
-def test_repr_html():
-    schema = TABLE.schema()
-    out_repr = schema._repr_html_()
-    assert (
-        out_repr
-        == f"""<table class="dataframe">
-<thead><tr><th {SCHEMA_TH_STYLE}>column_name</th><th {SCHEMA_TH_STYLE}>type</th></tr></thead>
-<tbody>
-<tr><td {SCHEMA_TD_STYLE}>int</td><td {SCHEMA_TD_STYLE}>Int64</td></tr>
-<tr><td {SCHEMA_TD_STYLE}>float</td><td {SCHEMA_TD_STYLE}>Float64</td></tr>
-<tr><td {SCHEMA_TD_STYLE}>string</td><td {SCHEMA_TD_STYLE}>String</td></tr>
-<tr><td {SCHEMA_TD_STYLE}>bool</td><td {SCHEMA_TD_STYLE}>Bool</td></tr>
-</tbody>
-</table>"""
     )
 
 
@@ -192,7 +161,7 @@ def test_schema_pickling():
     assert t_empty.schema() == t_empty_schema_copy
 
 
-def test_schema_pyarrow_roundtrip():
+def test_schema_from_pyarrow():
     pa_schema = pa.schema(
         {
             "int": pa.int64(),
@@ -212,42 +181,3 @@ def test_schema_pyarrow_roundtrip():
     )
 
     assert Schema.from_pyarrow_schema(pa_schema) == expected_daft_schema
-
-    roundtrip_pa_schema = pa.schema(
-        {
-            "int": pa.int64(),
-            "str": pa.large_string(),
-            "list": pa.large_list(pa.int64()),
-            "map": pa.map_(pa.large_string(), pa.int64()),
-        }
-    )
-
-    assert Schema.from_pyarrow_schema(pa_schema).to_pyarrow_schema() == roundtrip_pa_schema
-
-
-def test_schema_pyarrow_roundtrip_with_metadata():
-    metadata = {
-        "lance-encoding:compression": "zstd",
-        "lance-encoding:compression-level": "3",
-        "lance-encoding:structural-encoding": "miniblock",
-        "lance-encoding:packed": "true",
-    }
-    pa_schema = pa.schema(
-        [
-            pa.field("compressible_strings", pa.string(), metadata=metadata),
-            pa.field("uncompressed_stuff", pa.int64()),
-        ]
-    )
-
-    # Daft seems to default to large_string on conversion, so we create an expected schema with large_string
-    expected_roundtrip_pa_schema = pa.schema(
-        [
-            pa.field("compressible_strings", pa.large_string(), metadata=metadata),
-            pa.field("uncompressed_stuff", pa.int64()),
-        ]
-    )
-
-    daft_schema = Schema.from_pyarrow_schema(pa_schema)
-    roundtrip_pa_schema = daft_schema.to_pyarrow_schema()
-
-    assert roundtrip_pa_schema == expected_roundtrip_pa_schema

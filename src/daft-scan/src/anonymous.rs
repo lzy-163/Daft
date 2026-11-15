@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use common_error::DaftResult;
-use daft_schema::schema::SchemaRef;
+use daft_core::schema::SchemaRef;
 
 use crate::{
-    ChunkSpec, FileFormatConfig, ParquetSourceConfig, PartitionField, Pushdowns, ScanOperator,
-    ScanSource, ScanSourceKind, ScanTask, ScanTaskRef, SourceConfig, storage_config::StorageConfig,
+    file_format::FileFormatConfig, storage_config::StorageConfig, DataFileSource, PartitionField,
+    Pushdowns, ScanOperator, ScanTask, ScanTaskRef,
 };
 #[derive(Debug)]
 pub struct AnonymousScanOperator {
@@ -16,7 +16,6 @@ pub struct AnonymousScanOperator {
 }
 
 impl AnonymousScanOperator {
-    #[must_use]
     pub fn new(
         files: Vec<String>,
         schema: SchemaRef,
@@ -33,23 +32,12 @@ impl AnonymousScanOperator {
 }
 
 impl ScanOperator for AnonymousScanOperator {
-    fn name(&self) -> &'static str {
-        "AnonymousScanOperator"
-    }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
     fn partitioning_keys(&self) -> &[PartitionField] {
         &[]
-    }
-
-    fn file_path_column(&self) -> Option<&str> {
-        None
-    }
-
-    fn generated_fields(&self) -> Option<SchemaRef> {
-        None
     }
 
     fn can_absorb_filter(&self) -> bool {
@@ -59,14 +47,6 @@ impl ScanOperator for AnonymousScanOperator {
         false
     }
     fn can_absorb_limit(&self) -> bool {
-        false
-    }
-
-    fn can_absorb_shard(&self) -> bool {
-        false
-    }
-
-    fn supports_count_pushdown(&self) -> bool {
         false
     }
 
@@ -81,48 +61,32 @@ impl ScanOperator for AnonymousScanOperator {
         lines
     }
 
-    fn to_scan_tasks(&self, pushdowns: Pushdowns) -> DaftResult<Vec<ScanTaskRef>> {
+    fn to_scan_tasks(
+        &self,
+        pushdowns: Pushdowns,
+    ) -> DaftResult<Box<dyn Iterator<Item = DaftResult<ScanTaskRef>>>> {
         let files = self.files.clone();
-        let source_config = Arc::new(SourceConfig::File(self.file_format_config.as_ref().clone()));
+        let file_format_config = self.file_format_config.clone();
         let schema = self.schema.clone();
         let storage_config = self.storage_config.clone();
 
-        let row_groups = if let FileFormatConfig::Parquet(ParquetSourceConfig {
-            row_groups: Some(row_groups),
-            ..
-        }) = self.file_format_config.as_ref()
-        {
-            row_groups.clone()
-        } else {
-            std::iter::repeat_n(None, files.len()).collect()
-        };
-
         // Create one ScanTask per file.
-        Ok(files
-            .into_iter()
-            .zip(row_groups)
-            .map(|(f, rg)| {
-                let chunk_spec = rg.map(ChunkSpec::Parquet);
-                Arc::new(ScanTask::new(
-                    vec![ScanSource {
-                        size_bytes: None,
-                        metadata: None,
-                        statistics: None,
-                        partition_spec: None,
-                        kind: ScanSourceKind::File {
-                            path: f,
-                            chunk_spec,
-                            iceberg_delete_files: None,
-                            parquet_metadata: None,
-                        },
-                    }],
-                    source_config.clone(),
-                    schema.clone(),
-                    storage_config.clone(),
-                    pushdowns.clone(),
-                    None,
-                ))
-            })
-            .collect())
+        Ok(Box::new(files.into_iter().map(move |f| {
+            Ok(ScanTask::new(
+                vec![DataFileSource::AnonymousDataFile {
+                    path: f.to_string(),
+                    chunk_spec: None,
+                    size_bytes: None,
+                    metadata: None,
+                    partition_spec: None,
+                    statistics: None,
+                }],
+                file_format_config.clone(),
+                schema.clone(),
+                storage_config.clone(),
+                pushdowns.clone(),
+            )
+            .into())
+        })))
     }
 }

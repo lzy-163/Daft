@@ -22,7 +22,7 @@ def s3fs_recursive_list(fs, path) -> list:
     curr_level_result = fs.ls(path, detail=True)
     for item in curr_level_result:
         if item["type"] == "directory":
-            new_path = f"s3://{item['name']}"
+            new_path = f's3://{item["name"]}'
             all_results.extend(s3fs_recursive_list(fs, new_path))
             item["name"] += "/"
             all_results.append(item)
@@ -198,7 +198,7 @@ def s3fs_recursive_list(fs, path) -> list:
 @pytest.mark.parametrize("fanout_limit", [None, 1])
 def test_directory_globbing_fragment_wildcard(minio_io_config, path_expect_pair, fanout_limit):
     globpath, expect = path_expect_pair
-    with minio_create_bucket(minio_io_config) as (fs, bucket_name):
+    with minio_create_bucket(minio_io_config, bucket_name="bucket") as fs:
         files = [
             "a.match",
             "b.nomatch",
@@ -211,22 +211,14 @@ def test_directory_globbing_fragment_wildcard(minio_io_config, path_expect_pair,
             "nested2/c.match",
         ]
         for name in files:
-            fs.touch(f"{bucket_name}/{name}")
+            fs.touch(f"bucket/{name}")
 
-        # Replace hardcoded "bucket" in glob patterns with actual bucket_name
-        actual_globpath = globpath.replace("bucket", bucket_name)
-
-        if type(expect) is type and issubclass(expect, BaseException):
+        if type(expect) == type and issubclass(expect, BaseException):
             with pytest.raises(expect):
-                io_glob(actual_globpath, io_config=minio_io_config, fanout_limit=fanout_limit)
+                io_glob(globpath, io_config=minio_io_config, fanout_limit=fanout_limit)
         else:
-            daft_ls_result = io_glob(actual_globpath, io_config=minio_io_config, fanout_limit=fanout_limit)
-            # Update expected results to use actual bucket_name
-            actual_expect = [
-                {**item, "path": item["path"].replace("bucket", bucket_name)} if "path" in item else item
-                for item in expect
-            ]
-            assert sorted(daft_ls_result, key=lambda d: d["path"]) == sorted(actual_expect, key=lambda d: d["path"])
+            daft_ls_result = io_glob(globpath, io_config=minio_io_config, fanout_limit=fanout_limit)
+            assert sorted(daft_ls_result, key=lambda d: d["path"]) == sorted(expect, key=lambda d: d["path"])
 
 
 @pytest.mark.integration()
@@ -243,18 +235,12 @@ def test_directory_globbing_fragment_wildcard(minio_io_config, path_expect_pair,
 )
 def test_directory_globbing_escape_characters(minio_io_config, path_expect_pair):
     globpath, expect = path_expect_pair
-    with minio_create_bucket(minio_io_config) as (fs, bucket_name):
+    with minio_create_bucket(minio_io_config, bucket_name="bucket") as fs:
         files = ["a.match", "*.match", r"\.match"]
         for name in files:
-            fs.touch(f"{bucket_name}/{name}")
-        # Replace hardcoded "bucket" in glob patterns with actual bucket_name
-        actual_globpath = globpath.replace("bucket", bucket_name)
-        daft_ls_result = io_glob(actual_globpath, io_config=minio_io_config)
-        # Update expected results to use actual bucket_name
-        actual_expect = [
-            {**item, "path": item["path"].replace("bucket", bucket_name)} if "path" in item else item for item in expect
-        ]
-        assert sorted(daft_ls_result, key=lambda d: d["path"]) == sorted(actual_expect, key=lambda d: d["path"])
+            fs.touch(f"bucket/{name}")
+        daft_ls_result = io_glob(globpath, io_config=minio_io_config)
+        assert sorted(daft_ls_result, key=lambda d: d["path"]) == sorted(expect, key=lambda d: d["path"])
 
 
 @pytest.mark.integration()
@@ -292,23 +278,17 @@ def test_directory_globbing_escape_characters(minio_io_config, path_expect_pair)
 )
 def test_directory_globbing_special_characters(minio_io_config, path_expect_pair):
     globpath, expect = path_expect_pair
-    with minio_create_bucket(minio_io_config) as (fs, bucket_name):
+    with minio_create_bucket(minio_io_config, bucket_name="bucket") as fs:
         files = ["a.match", "b.match", "c.match", "d.match"]
         for name in files:
-            fs.touch(f"{bucket_name}/{name}")
-        # Replace hardcoded "bucket" in glob patterns with actual bucket_name
-        actual_globpath = globpath.replace("bucket", bucket_name)
-        daft_ls_result = io_glob(actual_globpath, io_config=minio_io_config)
-        # Update expected results to use actual bucket_name
-        actual_expect = [
-            {**item, "path": item["path"].replace("bucket", bucket_name)} if "path" in item else item for item in expect
-        ]
-        assert sorted(daft_ls_result, key=lambda d: d["path"]) == sorted(actual_expect, key=lambda d: d["path"])
+            fs.touch(f"bucket/{name}")
+        daft_ls_result = io_glob(globpath, io_config=minio_io_config)
+        assert sorted(daft_ls_result, key=lambda d: d["path"]) == sorted(expect, key=lambda d: d["path"])
 
 
 @pytest.mark.integration()
 def test_directory_globbing_common_prefix_cornercase(minio_io_config):
-    with minio_create_bucket(minio_io_config) as (fs, bucket_name):
+    with minio_create_bucket(minio_io_config, bucket_name="bucket") as fs:
         files = [
             "1/a/file.txt",
             "1/b/file.txt",
@@ -317,16 +297,16 @@ def test_directory_globbing_common_prefix_cornercase(minio_io_config):
             "11/b/file.txt",
         ]
         for name in files:
-            fs.touch(f"{bucket_name}/{name}")
+            fs.touch(f"bucket/{name}")
 
         # Force a prefix listing on the second level when the fanout becomes more than 2
-        daft_ls_result = io_glob(f"s3://{bucket_name}/**", io_config=minio_io_config, fanout_limit=2)
+        daft_ls_result = io_glob("s3://bucket/**", io_config=minio_io_config, fanout_limit=2)
         assert sorted(daft_ls_result, key=lambda d: d["path"]) == sorted(
             [
-                {"type": "File", "path": f"s3://{bucket_name}/1/a/file.txt", "size": 0},
-                {"type": "File", "path": f"s3://{bucket_name}/1/b/file.txt", "size": 0},
-                {"type": "File", "path": f"s3://{bucket_name}/11/a/file.txt", "size": 0},
-                {"type": "File", "path": f"s3://{bucket_name}/11/b/file.txt", "size": 0},
+                {"type": "File", "path": "s3://bucket/1/a/file.txt", "size": 0},
+                {"type": "File", "path": "s3://bucket/1/b/file.txt", "size": 0},
+                {"type": "File", "path": "s3://bucket/11/a/file.txt", "size": 0},
+                {"type": "File", "path": "s3://bucket/11/b/file.txt", "size": 0},
             ],
             key=lambda d: d["path"],
         )
@@ -334,7 +314,8 @@ def test_directory_globbing_common_prefix_cornercase(minio_io_config):
 
 @pytest.mark.integration()
 def test_flat_directory_listing(minio_io_config):
-    with minio_create_bucket(minio_io_config) as (fs, bucket_name):
+    bucket_name = "bucket"
+    with minio_create_bucket(minio_io_config, bucket_name=bucket_name) as fs:
         files = ["a", "b", "c"]
         for name in files:
             fs.touch(f"{bucket_name}/{name}")
@@ -345,7 +326,8 @@ def test_flat_directory_listing(minio_io_config):
 
 @pytest.mark.integration()
 def test_recursive_directory_listing(minio_io_config):
-    with minio_create_bucket(minio_io_config) as (fs, bucket_name):
+    bucket_name = "bucket"
+    with minio_create_bucket(minio_io_config, bucket_name=bucket_name) as fs:
         files = ["a", "b/bb", "c/cc/ccc"]
         for name in files:
             fs.write_bytes(f"s3://{bucket_name}/{name}", b"")
@@ -357,7 +339,8 @@ def test_recursive_directory_listing(minio_io_config):
 
 @pytest.mark.integration()
 def test_single_file_directory_listing(minio_io_config):
-    with minio_create_bucket(minio_io_config) as (fs, bucket_name):
+    bucket_name = "bucket"
+    with minio_create_bucket(minio_io_config, bucket_name=bucket_name) as fs:
         files = ["a", "b/bb", "c/cc/ccc"]
         for name in files:
             fs.write_bytes(f"s3://{bucket_name}/{name}", b"")
@@ -370,7 +353,8 @@ def test_single_file_directory_listing(minio_io_config):
 
 @pytest.mark.integration()
 def test_single_file_directory_listing_trailing(minio_io_config):
-    with minio_create_bucket(minio_io_config) as (fs, bucket_name):
+    bucket_name = "bucket"
+    with minio_create_bucket(minio_io_config, bucket_name=bucket_name) as fs:
         files = ["a", "b/bb", "c/cc/ccc"]
         for name in files:
             fs.write_bytes(f"s3://{bucket_name}/{name}", b"")
@@ -387,7 +371,8 @@ def test_single_file_directory_listing_trailing(minio_io_config):
     [False, True],
 )
 def test_missing_file_path(minio_io_config, recursive):
-    with minio_create_bucket(minio_io_config) as (fs, bucket_name):
+    bucket_name = "bucket"
+    with minio_create_bucket(minio_io_config, bucket_name=bucket_name) as fs:
         files = ["a", "b/bb", "c/cc/ccc"]
         path = f"s3://{bucket_name}/c/cc/ddd/**" if recursive else f"s3://{bucket_name}/c/cc/ddd"
         for name in files:
@@ -399,7 +384,8 @@ def test_missing_file_path(minio_io_config, recursive):
 @pytest.mark.integration()
 @pytest.mark.parametrize("limit", [1, 2])
 def test_limit(minio_io_config, limit):
-    with minio_create_bucket(minio_io_config) as (fs, bucket_name):
+    bucket_name = "bucket"
+    with minio_create_bucket(minio_io_config, bucket_name=bucket_name) as fs:
         files = ["a", "b/bb", "c/cc/ccc"]
         for name in files:
             fs.write_bytes(f"s3://{bucket_name}/{name}", b"")

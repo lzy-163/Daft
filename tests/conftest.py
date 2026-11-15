@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-import os
 import uuid
-from collections.abc import Generator, Sequence
-from typing import Any, Literal, Protocol
 
 import pandas as pd
 import pyarrow as pa
 import pytest
 
 import daft
-import daft.context
-from daft.recordbatch import MicroPartition
+from daft.table import MicroPartition
 
 # import all conftest
 from tests.integration.io.conftest import *
@@ -25,24 +21,23 @@ def pytest_addoption(parser):
     )
 
 
-def pytest_configure(config):
-    config.addinivalue_line(
-        "markers",
-        "integration: mark test as an integration test that runs with external dependencies",
+@pytest.fixture(scope="session", autouse=True)
+def set_execution_configs():
+    """Sets global Daft config for testing"""
+    daft.set_execution_config(
+        # Disables merging of ScanTasks
+        scan_tasks_min_size_bytes=0,
+        scan_tasks_max_size_bytes=0,
     )
 
 
-def get_tests_daft_runner_name() -> Literal["ray", "native"]:
-    """Test utility that checks the environment variable for the runner that is being used for the test."""
-    name = os.getenv("DAFT_RUNNER")
-    assert name is not None, "Tests must be run with $DAFT_RUNNER env var"
-    name = name.lower()
-
-    assert name in {"ray", "native"}, f"Runner name not recognized: {name}"
-    return name
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "integration: mark test as an integration test that runs with external dependencies"
+    )
 
 
-class DaftUuidType(pa.ExtensionType):
+class UuidType(pa.ExtensionType):
     NAME = "daft.uuid"
 
     def __init__(self):
@@ -52,7 +47,7 @@ class DaftUuidType(pa.ExtensionType):
         return b""
 
     def __reduce__(self):
-        return DaftUuidType, ()
+        return UuidType, ()
 
     @classmethod
     def __arrow_ext_deserialize__(cls, storage_type, serialized):
@@ -60,8 +55,8 @@ class DaftUuidType(pa.ExtensionType):
 
 
 @pytest.fixture
-def uuid_ext_type() -> Generator[DaftUuidType, None, None]:
-    ext_type = DaftUuidType()
+def uuid_ext_type() -> UuidType:
+    ext_type = UuidType()
     pa.register_extension_type(ext_type)
     yield ext_type
     pa.unregister_extension_type(ext_type.NAME)
@@ -72,7 +67,7 @@ def uuid_ext_type() -> Generator[DaftUuidType, None, None]:
     params=[
         # Convert the data into Arrow and then load as in-memory Arrow data
         "arrow",
-        # Dump the data as Parquet and read it back through the Parquet scan path
+        # Dump the data as Parquet and load it as Parquet (will trigger "Unloaded" MicroPartitions)
         "parquet",
     ],
 )
@@ -81,50 +76,30 @@ def data_source(request):
 
 
 @pytest.fixture(scope="function")
-def make_spark_df(spark_session):
-    def _make_spark_df(data: dict[str, Any]):
-        fields = [name for name in data]
-        rows = list(zip(*[data[name] for name in fields]))
-        return spark_session.createDataFrame(rows, fields)
-
-    yield _make_spark_df
+def join_strategy(request):
+    # Modifies the join strategy parametrization to toggle a specialized presorting path for sort-merge joins, where
+    # each side of the join is sorted such that their boundaries will align.
+    if request.param != "sort_merge_aligned_boundaries":
+        yield request.param
+    else:
+        old_execution_config = daft.context.get_context().daft_execution_config
+        try:
+            daft.set_execution_config(
+                sort_merge_join_sort_with_aligned_boundaries=True,
+            )
+            yield "sort_merge"
+        finally:
+            daft.set_execution_config(old_execution_config)
 
 
 @pytest.fixture(scope="function")
-def assert_spark_equals(spark_session):
-    def _assert_spark_dfs_eq(df1, df2):
-        if isinstance(df1, daft.DataFrame):
-            df1 = df1.to_pandas()
-        else:
-            df1 = df1.toPandas()
-        if isinstance(df2, daft.DataFrame):
-            df2 = df2.to_pandas()
-        else:
-            df2 = df2.toPandas()
-
-        assert df1.equals(df2)
-
-    yield _assert_spark_dfs_eq
-
-
-class MakeDF(Protocol):
-    def __call__(
-        self,
-        data: pa.Table | dict | list,
-        repartition: int = 1,
-        repartition_columns: Sequence[str] = (),
-    ) -> daft.DataFrame: ...
-
-
-@pytest.fixture(scope="function", params=[True, False])
-def make_df(data_source, tmp_path, request) -> Generator[MakeDF, None, None]:
-    """Makes a dataframe when provided with data."""
-    dynamic_batching = request.param
+def make_df(data_source, tmp_path) -> daft.Dataframe:
+    """Makes a dataframe when provided with data"""
 
     def _make_df(
         data: pa.Table | dict | list,
         repartition: int = 1,
-        repartition_columns: Sequence[str] = (),
+        repartition_columns: list[str] = [],
     ) -> daft.DataFrame:
         pa_table: pa.Table
         if isinstance(data, pa.Table):
@@ -147,11 +122,11 @@ def make_df(data_source, tmp_path, request) -> Generator[MakeDF, None, None]:
             import pyarrow.parquet as papq
 
             name = str(uuid.uuid4())
-            daft_recordbatch = MicroPartition.from_arrow(pa_table)
+            daft_table = MicroPartition.from_arrow(pa_table)
             partitioned_tables = (
-                daft_recordbatch.partition_by_random(repartition, 0)
+                daft_table.partition_by_random(repartition, 0)
                 if len(repartition_columns) == 0
-                else daft_recordbatch.partition_by_hash([daft.col(c) for c in repartition_columns], repartition)
+                else daft_table.partition_by_hash([daft.col(c) for c in repartition_columns], repartition)
             )
             for i, tbl in enumerate(partitioned_tables):
                 tmp_file = tmp_path / (name + f"-{i}")
@@ -160,10 +135,7 @@ def make_df(data_source, tmp_path, request) -> Generator[MakeDF, None, None]:
         else:
             raise NotImplementedError(f"make_df not implemented for: {variant}")
 
-    with daft.execution_config_ctx(
-        enable_dynamic_batching=dynamic_batching,
-    ):
-        yield _make_df
+    yield _make_df
 
 
 def assert_df_equals(
@@ -187,7 +159,7 @@ def assert_df_equals(
         sort_key_list: list[str] = [sort_key] if isinstance(sort_key, str) else sort_key
         for key in sort_key_list:
             assert key in daft_pd_df.columns, (
-                f"Daft Dataframe missing key: {key}\nNOTE: This doesn't necessarily mean your code is "
+                f"DaFt Dataframe missing key: {key}\nNOTE: This doesn't necessarily mean your code is "
                 "breaking, but our testing utilities require sorting on this key in order to compare your "
                 "Dataframe against the expected Pandas Dataframe."
             )
@@ -209,38 +181,3 @@ def assert_df_equals(
         except AssertionError:
             print(f"Failed assertion for col: {col}")
             raise
-
-
-def check_answer(df: daft.DataFrame, expected_answer: dict[str, Any], is_sorted: bool = False):
-    daft_df = df.to_pandas()
-    expected_df = daft.from_pydict(expected_answer).to_pandas()
-    # when this is an empty result, no need to check data types.
-    check_dtype = not expected_df.empty
-    if is_sorted:
-        assert_df_equals(daft_df, expected_df, assert_ordering=True, check_dtype=check_dtype)
-    else:
-        sort_keys = df.column_names
-        assert_df_equals(
-            daft_df,
-            expected_df,
-            sort_key=sort_keys,
-            assert_ordering=False,
-            check_dtype=check_dtype,
-        )
-
-
-@pytest.fixture(
-    scope="function",
-    params=[1, None] if get_tests_daft_runner_name() == "native" else [None],
-)
-def with_morsel_size(request):
-    morsel_size = request.param
-    with daft.context.execution_config_ctx(default_morsel_size=morsel_size):
-        yield morsel_size
-
-
-@pytest.fixture(scope="function")
-def with_default_morsel_size():
-    """Non-parametrized morsel size fixture for tests that don't need to test morsel size variations."""
-    with daft.context.execution_config_ctx(default_morsel_size=None):
-        yield None

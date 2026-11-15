@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use common_error::DaftResult;
-use daft_dsl::expr::bound_expr::BoundExpr;
-use daft_recordbatch::RecordBatch;
+use daft_dsl::Expr;
+use daft_io::IOStatsContext;
+use daft_table::Table;
 
 use crate::micropartition::MicroPartition;
 
@@ -11,10 +12,7 @@ fn transpose2<T>(v: Vec<Vec<T>>) -> Vec<Vec<T>> {
         return v;
     }
     let len = v[0].len();
-    let mut iters: Vec<_> = v
-        .into_iter()
-        .map(std::iter::IntoIterator::into_iter)
-        .collect();
+    let mut iters: Vec<_> = v.into_iter().map(|n| n.into_iter()).collect();
     (0..len)
         .map(|_| {
             iters
@@ -26,20 +24,31 @@ fn transpose2<T>(v: Vec<Vec<T>>) -> Vec<Vec<T>> {
 }
 
 impl MicroPartition {
-    fn vec_part_tables_to_mps(&self, part_tables: Vec<Vec<RecordBatch>>) -> DaftResult<Vec<Self>> {
+    fn vec_part_tables_to_mps(
+        &self,
+        part_tables: Vec<Vec<Table>>,
+    ) -> DaftResult<Vec<MicroPartition>> {
         let part_tables = transpose2(part_tables);
         Ok(part_tables
             .into_iter()
-            .map(|v| Self::new_loaded(self.schema.clone(), Arc::new(v), self.statistics.clone()))
+            .map(|v| {
+                MicroPartition::new_loaded(
+                    self.schema.clone(),
+                    Arc::new(v),
+                    self.statistics.clone(),
+                )
+            })
             .collect())
     }
 
     pub fn partition_by_hash(
         &self,
-        exprs: &[BoundExpr],
+        exprs: &[Expr],
         num_partitions: usize,
     ) -> DaftResult<Vec<Self>> {
-        let tables = self.record_batches();
+        let io_stats = IOStatsContext::new("MicroPartition::partition_by_hash");
+
+        let tables = self.tables_or_read(io_stats)?;
 
         if tables.is_empty() {
             return Ok(
@@ -57,7 +66,9 @@ impl MicroPartition {
     }
 
     pub fn partition_by_random(&self, num_partitions: usize, seed: u64) -> DaftResult<Vec<Self>> {
-        let tables = self.record_batches();
+        let io_stats = IOStatsContext::new("MicroPartition::partition_by_random");
+
+        let tables = self.tables_or_read(io_stats)?;
 
         if tables.is_empty() {
             return Ok(
@@ -77,11 +88,13 @@ impl MicroPartition {
 
     pub fn partition_by_range(
         &self,
-        partition_keys: &[BoundExpr],
-        boundaries: &RecordBatch,
+        partition_keys: &[Expr],
+        boundaries: &Table,
         descending: &[bool],
     ) -> DaftResult<Vec<Self>> {
-        let tables = self.record_batches();
+        let io_stats = IOStatsContext::new("MicroPartition::partition_by_range");
+
+        let tables = self.tables_or_read(io_stats)?;
 
         if tables.is_empty() {
             let num_partitions = boundaries.len() + 1;
@@ -99,24 +112,26 @@ impl MicroPartition {
         self.vec_part_tables_to_mps(part_tables)
     }
 
-    pub fn partition_by_value(
-        &self,
-        partition_keys: &[BoundExpr],
-    ) -> DaftResult<(Vec<Self>, Self)> {
-        let Some(table) = self.concat_or_get()? else {
+    pub fn partition_by_value(&self, partition_keys: &[Expr]) -> DaftResult<(Vec<Self>, Self)> {
+        let io_stats = IOStatsContext::new("MicroPartition::partition_by_value");
+
+        let tables = self.concat_or_get(io_stats)?;
+
+        if tables.is_empty() {
             let empty = Self::empty(Some(self.schema.clone()));
             let pkeys = empty.eval_expression_list(partition_keys)?;
             return Ok((vec![], pkeys));
-        };
-
+        }
+        let table = tables.first().unwrap();
         let (tables, values) = table.partition_by_value(partition_keys)?;
 
         let mps = tables
             .into_iter()
-            .map(|t| Self::new_loaded(self.schema.clone(), Arc::new(vec![t]), None))
+            .map(|t| MicroPartition::new_loaded(self.schema.clone(), Arc::new(vec![t]), None))
             .collect::<Vec<_>>();
 
-        let values = Self::new_loaded(values.schema.clone(), Arc::new(vec![values]), None);
+        let values =
+            MicroPartition::new_loaded(values.schema.clone(), Arc::new(vec![values]), None);
 
         Ok((mps, values))
     }

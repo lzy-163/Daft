@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -9,17 +11,16 @@ import ray
 
 import daft
 from daft import DataType
-from daft.runners.ray_compat import parse_ray_version
-from tests.conftest import get_tests_daft_runner_name
+from daft.context import get_context
 
-RAY_VERSION = parse_ray_version(ray.__version__)
+RAY_VERSION = tuple(int(s) for s in ray.__version__.split(".")[0:3])
 
 
 class MyObj:
     def __init__(self, x: int):
         self._x = x
 
-    def __eq__(self, other: object) -> bool:
+    def __eq__(self, other: Any) -> bool:
         return isinstance(other, MyObj) and self._x == other._x
 
 
@@ -35,6 +36,7 @@ def _row_to_pydict(row: ray.data.row.TableRow | dict) -> dict:
     return row.as_pydict()
 
 
+@pytest.mark.skipif(get_context().runner_config.name != "ray", reason="Needs to run on Ray runner")
 @pytest.mark.parametrize("n_partitions", [1, 2])
 def test_to_ray_dataset_all_arrow(n_partitions: int):
     df = daft.from_pydict(DATA).repartition(n_partitions)
@@ -58,6 +60,7 @@ def test_to_ray_dataset_all_arrow(n_partitions: int):
     )
 
 
+@pytest.mark.skipif(get_context().runner_config.name != "ray", reason="Needs to run on Ray runner")
 @pytest.mark.skipif(
     RAY_VERSION >= (2, 5, 0), reason="Ray Datasets versions >= 2.5.0 no longer support Python objects as rows"
 )
@@ -84,6 +87,7 @@ def test_to_ray_dataset_with_py(n_partitions: int):
     )
 
 
+@pytest.mark.skipif(get_context().runner_config.name != "ray", reason="Needs to run on Ray runner")
 @pytest.mark.parametrize("n_partitions", [1, 2])
 def test_to_ray_dataset_with_numpy(n_partitions: int):
     df = daft.from_pydict(DATA).repartition(n_partitions)
@@ -93,13 +97,13 @@ def test_to_ray_dataset_with_numpy(n_partitions: int):
 
     if RAY_VERSION < (2, 4, 0):
         if RAY_VERSION >= (2, 2, 0):
-            assert ds.dataset_format() == "arrow", (
-                "Ray Dataset format should be arrow because it uses a Tensor extension type"
-            )
+            assert (
+                ds.dataset_format() == "arrow"
+            ), "Ray Dataset format should be arrow because it uses a Tensor extension type"
         elif RAY_VERSION >= (2, 0, 0):
-            assert ds._dataset_format() == "arrow", (
-                "Ray Dataset format should be arrow because it uses a Tensor extension type"
-            )
+            assert (
+                ds._dataset_format() == "arrow"
+            ), "Ray Dataset format should be arrow because it uses a Tensor extension type"
 
     rows = sorted([_row_to_pydict(row) for row in ds.iter_rows()], key=lambda r: r["intcol"])
     np.testing.assert_equal(
@@ -115,24 +119,23 @@ def test_to_ray_dataset_with_numpy(n_partitions: int):
     )
 
 
+@pytest.mark.skipif(get_context().runner_config.name != "ray", reason="Needs to run on Ray runner")
 @pytest.mark.skipif(RAY_VERSION < (2, 2, 0), reason="Variable-shaped tensor columns not supported in Ray < 2.1.0")
 @pytest.mark.parametrize("n_partitions", [1, 2])
 def test_to_ray_dataset_with_numpy_variable_shaped(n_partitions: int):
     df = daft.from_pydict(DATA).repartition(n_partitions)
-    df = df.with_column(
-        "npcol", df["intcol"].apply(lambda x: np.ones((x, 3), dtype=np.int64), DataType.tensor(DataType.int64()))
-    )
+    df = df.with_column("npcol", df["intcol"].apply(lambda x: np.ones((x, 3)), DataType.tensor(DataType.int64())))
     ds = df.to_ray_dataset()
 
     if RAY_VERSION < (2, 4, 0):
         if RAY_VERSION >= (2, 2, 0):
-            assert ds.dataset_format() == "arrow", (
-                "Ray Dataset format should be arrow because it uses a Tensor extension type"
-            )
+            assert (
+                ds.dataset_format() == "arrow"
+            ), "Ray Dataset format should be arrow because it uses a Tensor extension type"
         elif RAY_VERSION >= (2, 0, 0):
-            assert ds._dataset_format() == "simple", (
-                "In old versions of Ray, we drop down to `simple` format because ArrowTensorType is not compatible with ragged tensors"
-            )
+            assert (
+                ds._dataset_format() == "simple"
+            ), "In old versions of Ray, we drop down to `simple` format because ArrowTensorType is not compatible with ragged tensors"
 
     rows = sorted([_row_to_pydict(row) for row in ds.iter_rows()], key=lambda r: r["intcol"])
     np.testing.assert_equal(
@@ -148,7 +151,7 @@ def test_to_ray_dataset_with_numpy_variable_shaped(n_partitions: int):
     )
 
 
-@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Needs to run on Ray runner")
+@pytest.mark.skipif(get_context().runner_config.name != "ray", reason="Needs to run on Ray runner")
 @pytest.mark.parametrize("n_partitions", [1, 2])
 def test_from_ray_dataset_all_arrow(n_partitions: int):
     def add_float(table: pa.Table) -> pa.Table:
@@ -179,7 +182,7 @@ def test_from_ray_dataset_all_arrow(n_partitions: int):
     assert out_table.equals(expected_table), (out_table, expected_table)
 
 
-@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Needs to run on Ray runner")
+@pytest.mark.skipif(get_context().runner_config.name != "ray", reason="Needs to run on Ray runner")
 @pytest.mark.parametrize("n_partitions", [1, 2])
 def test_from_ray_dataset_simple(n_partitions: int):
     ds = ray.data.range(8, parallelism=n_partitions)
@@ -192,7 +195,7 @@ def test_from_ray_dataset_simple(n_partitions: int):
     assert sorted(out[key]) == list(range(8))
 
 
-@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Needs to run on Ray runner")
+@pytest.mark.skipif(get_context().runner_config.name != "ray", reason="Needs to run on Ray runner")
 @pytest.mark.parametrize("n_partitions", [1, 2])
 def test_from_ray_dataset_tensor(n_partitions: int):
     ds = ray.data.range(8)
@@ -212,12 +215,12 @@ def test_from_ray_dataset_tensor(n_partitions: int):
     out_sorted = {"int": int_col, "np": np_col}
     expected = {
         "int": list(range(8)),
-        "np": [np.ones((3, 3)) for _ in range(8)],
+        "np": [np.ones((3, 3)) for i in range(8)],
     }
     np.testing.assert_equal(out_sorted, expected)
 
 
-@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Needs to run on Ray runner")
+@pytest.mark.skipif(get_context().runner_config.name != "ray", reason="Needs to run on Ray runner")
 @pytest.mark.parametrize("n_partitions", [1, 2])
 def test_from_ray_dataset_pandas(n_partitions: int):
     def add_float(df: pd.DataFrame) -> pd.DataFrame:
@@ -239,21 +242,21 @@ def test_from_ray_dataset_pandas(n_partitions: int):
     pd.testing.assert_frame_equal(df.to_pandas(), expected_df)
 
 
-@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Needs to run on Ray runner")
+@pytest.mark.skipif(get_context().runner_config.name != "ray", reason="Needs to run on Ray runner")
 @pytest.mark.parametrize("n_partitions", [1, 2])
 def test_from_ray_dataset_preview(n_partitions: int):
     ds = ray.data.range(3, parallelism=n_partitions)
 
     df = daft.from_ray_dataset(ds)
     assert len(df) == 3
-    assert len(df._preview.partition) == 3
+    assert len(df._preview.preview_partition) == 3
 
 
-@pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Needs to run on Ray runner")
+@pytest.mark.skipif(get_context().runner_config.name != "ray", reason="Needs to run on Ray runner")
 @pytest.mark.parametrize("n_partitions", [1, 2])
 def test_from_ray_dataset_data_longer_than_preview(n_partitions: int):
     ds = ray.data.range(10, parallelism=n_partitions)
 
     df = daft.from_ray_dataset(ds)
     assert len(df) == 10
-    assert len(df._preview.partition) == 8
+    assert len(df._preview.preview_partition) == 8
