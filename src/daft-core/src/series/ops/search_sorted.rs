@@ -1,25 +1,20 @@
-use std::sync::Arc;
-
-use common_error::DaftResult;
-
 use crate::{
-    datatypes::{DataType, Field, UInt64Array},
-    kernels::search_sorted as kernels_search_sorted,
-    series::{Series, ops::cast_series_to_supertype},
+    datatypes::UInt64Array,
+    series::{ops::match_types_on_series, Series},
+    with_match_comparable_daft_types,
 };
+use common_error::DaftResult;
 
 impl Series {
     pub fn search_sorted(&self, keys: &Self, descending: bool) -> DaftResult<UInt64Array> {
-        let casted_series = cast_series_to_supertype(&[self, keys])?;
-        assert_eq!(casted_series.len(), 2);
+        let (lhs, rhs) = match_types_on_series(self, keys)?;
+        let lhs = lhs.as_physical()?;
+        let rhs = rhs.as_physical()?;
 
-        let lhs = casted_series[0].as_physical()?;
-        let rhs = casted_series[1].as_physical()?;
-        let result = kernels_search_sorted::search_sorted(
-            lhs.to_arrow()?.as_ref(),
-            rhs.to_arrow()?.as_ref(),
-            descending,
-        )?;
-        UInt64Array::from_arrow(Field::new(lhs.name(), DataType::UInt64), Arc::new(result))
+        with_match_comparable_daft_types!(lhs.data_type(), |$T| {
+            let lhs = lhs.downcast::<<$T as DaftDataType>::ArrayType>().unwrap();
+            let rhs = rhs.downcast::<<$T as DaftDataType>::ArrayType>().unwrap();
+            lhs.search_sorted(rhs, descending)
+        })
     }
 }

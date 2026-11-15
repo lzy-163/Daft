@@ -1,30 +1,34 @@
 from __future__ import annotations
 
+import sys
 import threading
 import weakref
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 from uuid import uuid4
 
-from daft.daft import FlightPartitionRef, PyMicroPartitionSet
+import pyarrow as pa
+
 from daft.datatype import TimeUnit
-from daft.recordbatch import MicroPartition
+from daft.expressions.expressions import Expression
+from daft.logical.schema import Schema
+from daft.table import MicroPartition
+
+if sys.version_info < (3, 8):
+    pass
+else:
+    pass
 
 if TYPE_CHECKING:
     import pandas as pd
-    import pyarrow as pa
-    from ray import ObjectRef
-
-    from daft.expressions.expressions import Expression
-    from daft.logical.schema import Schema
 
 PartID = int
 
 
 @dataclass(frozen=True)
 class TableReadOptions:
-    """Options for reading a vPartition.
+    """Options for reading a vPartition
 
     Args:
         num_rows: Number of rows to read, or None to read all rows
@@ -37,7 +41,7 @@ class TableReadOptions:
 
 @dataclass(frozen=True)
 class TableParseCSVOptions:
-    """Options for parsing CSVs.
+    """Options for parsing CSVs
 
     Args:
         delimiter: The delimiter to use when parsing CSVs, defaults to ","
@@ -45,14 +49,12 @@ class TableParseCSVOptions:
         double_quote: Whether to support escaping quotes by doubling them, defaults to True
         buffer_size: Size of the buffer (in bytes) used by the streaming reader.
         chunk_size: Size of the chunks (in bytes) deserialized in parallel by the streaming reader.
-        allow_variable_columns: Whether to allow for variable number of columns in the CSV, defaults to False.
     """
 
     delimiter: str | None = None
     header_index: int | None = 0
     double_quote: bool = True
     quote: str | None = None
-    allow_variable_columns: bool = False
     escape_char: str | None = None
     comment: str | None = None
     buffer_size: int | None = None
@@ -61,13 +63,24 @@ class TableParseCSVOptions:
 
 @dataclass(frozen=True)
 class TableParseParquetOptions:
-    """Options for parsing Parquet files.
+    """Options for parsing Parquet files
 
     Args:
         coerce_int96_timestamp_unit: TimeUnit to use when parsing Int96 fields
     """
 
     coerce_int96_timestamp_unit: TimeUnit = TimeUnit.ns()
+
+
+@dataclass(frozen=True)
+class TableReadSQLOptions:
+    """Options for parsing SQL tables
+
+    Args:
+        predicate_expression: Expression predicate to apply to the table
+    """
+
+    predicate_expression: Expression | None = None
 
 
 @dataclass(frozen=True)
@@ -88,14 +101,6 @@ class PartitionMetadata(PartialPartitionMetadata):
         return PartitionMetadata(
             num_rows=len(table),
             size_bytes=table.size_bytes(),
-            boundaries=None,
-        )
-
-    @classmethod
-    def from_flight_partition_ref(cls, flight_partition_ref: FlightPartitionRef) -> PartitionMetadata:
-        return PartitionMetadata(
-            num_rows=flight_partition_ref.num_rows,
-            size_bytes=flight_partition_ref.size_bytes,
             boundaries=None,
         )
 
@@ -121,7 +126,7 @@ class Boundaries:
     sort_by: list[Expression]
     bounds: MicroPartition
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         assert len(self.sort_by) > 0
         assert len(self.bounds) == 2
         assert self.bounds.column_names() == [e.name() for e in self.sort_by]
@@ -174,7 +179,7 @@ class Boundaries:
         return self_upper < other_upper
 
 
-PartitionT = TypeVar("PartitionT", bound="ObjectRef | MicroPartition")
+PartitionT = TypeVar("PartitionT")
 
 
 class MaterializedResult(Generic[PartitionT]):
@@ -185,12 +190,12 @@ class MaterializedResult(Generic[PartitionT]):
 
     @abstractmethod
     def partition(self) -> PartitionT:
-        """Get the result data as a generic PartitionT, which is an internal backend-specific representation of the result."""
+        """Get the partition of this result."""
         ...
 
     @abstractmethod
-    def micropartition(self) -> MicroPartition:
-        """Get the result data as an in-memory MicroPartition."""
+    def vpartition(self) -> MicroPartition:
+        """Get the vPartition of this result."""
         ...
 
     @abstractmethod
@@ -206,52 +211,45 @@ class MaterializedResult(Generic[PartitionT]):
     @abstractmethod
     def _noop(self, _: PartitionT) -> None:
         """Implement this as a no-op.
-
-        https://peps.python.org/pep-0544/#overriding-inferred-variance-of-protocol-classes.
+        https://peps.python.org/pep-0544/#overriding-inferred-variance-of-protocol-classes
         """
         ...
 
 
 class PartitionSet(Generic[PartitionT]):
-    def _get_merged_micropartition(self, schema: Schema) -> MicroPartition:
+    def _get_merged_vpartition(self) -> MicroPartition:
         raise NotImplementedError()
 
-    def _get_preview_micropartitions(self, num_rows: int) -> list[MicroPartition]:
+    def _get_preview_vpartition(self, num_rows: int) -> list[MicroPartition]:
         raise NotImplementedError()
 
-    def to_pydict(
-        self,
-        schema: Schema,
-        maps_as_pydicts: Literal["lossy", "strict"] | None = None,
-    ) -> dict[str, list[Any]]:
+    def to_pydict(self) -> dict[str, list[Any]]:
         """Retrieves all the data in a PartitionSet as a Python dictionary. Values are the raw data from each Block."""
-        merged_partition = self._get_merged_micropartition(schema)
-        return merged_partition._to_pydict_impl(maps_as_pydicts=maps_as_pydicts)
+        merged_partition = self._get_merged_vpartition()
+        return merged_partition.to_pydict()
 
-    def to_pandas(
-        self,
-        schema: Schema,
-        coerce_temporal_nanoseconds: bool = False,
-    ) -> pd.DataFrame:
-        merged_partition = self._get_merged_micropartition(schema)
+    def to_pandas(self, schema: Schema | None = None, cast_tensors_to_ray_tensor_dtype: bool = False) -> pd.DataFrame:
+        merged_partition = self._get_merged_vpartition()
         return merged_partition.to_pandas(
-            schema=schema,
-            coerce_temporal_nanoseconds=coerce_temporal_nanoseconds,
+            schema=schema, cast_tensors_to_ray_tensor_dtype=cast_tensors_to_ray_tensor_dtype
         )
 
-    def to_arrow(self, schema: Schema) -> pa.Table:
-        merged_partition = self._get_merged_micropartition(schema)
-        return merged_partition.to_arrow()
+    def to_arrow(self, cast_tensors_to_ray_tensor_dtype: bool = False) -> pa.Table:
+        merged_partition = self._get_merged_vpartition()
+        return merged_partition.to_arrow(cast_tensors_to_ray_tensor_dtype)
 
-    def items(self) -> list[tuple[PartID, MaterializedResult[PartitionT]]]:
-        """Returns all (partition id, partition) in this PartitionSet ordered by partition ID."""
+    def items(self) -> list[tuple[PartID, PartitionT]]:
+        """
+        Returns all (partition id, partition) in this PartitionSet,
+        ordered by partition ID.
+        """
         raise NotImplementedError()
 
-    def values(self) -> list[MaterializedResult[PartitionT]]:
+    def values(self) -> list[PartitionT]:
         return [value for _, value in self.items()]
 
     @abstractmethod
-    def get_partition(self, idx: PartID) -> MaterializedResult[PartitionT]:
+    def get_partition(self, idx: PartID) -> PartitionT:
         raise NotImplementedError()
 
     @abstractmethod
@@ -283,95 +281,10 @@ class PartitionSet(Generic[PartitionT]):
         raise NotImplementedError()
 
 
-class LocalPartitionSet(PartitionSet[MicroPartition]):
-    _pset: PyMicroPartitionSet
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._pset = PyMicroPartitionSet()
-
-    @classmethod
-    def _from_micropartition_set(cls, pset: PyMicroPartitionSet) -> LocalPartitionSet:
-        s = cls()
-        s._pset = pset
-        return s
-
-    def _get_merged_micropartition(self, _schema: Schema) -> MicroPartition:
-        return MicroPartition._from_pymicropartition(self._pset.get_merged_micropartition())
-
-    def _get_preview_micropartitions(self, num_rows: int) -> list[MicroPartition]:
-        return [
-            MicroPartition._from_pymicropartition(part) for part in self._pset.get_preview_micropartitions(num_rows)
-        ]
-
-    def items(self) -> list[tuple[PartID, MaterializedResult[MicroPartition]]]:
-        return [
-            (
-                idx,
-                LocalMaterializedResult(
-                    MicroPartition._from_pymicropartition(part),
-                    PartitionMetadata.from_table(MicroPartition._from_pymicropartition(part)),
-                ),
-            )
-            for idx, part in self._pset.items()
-        ]
-
-    def get_partition(self, idx: PartID) -> MaterializedResult[MicroPartition]:
-        part = MicroPartition._from_pymicropartition(self._pset.get_partition(idx))
-        return LocalMaterializedResult(part, PartitionMetadata.from_table(part))
-
-    def set_partition(self, idx: PartID, part: MaterializedResult[MicroPartition]) -> None:
-        self._pset.set_partition(idx, part.partition()._micropartition)
-
-    def set_partition_from_table(self, idx: PartID, part: MicroPartition) -> None:
-        self._pset.set_partition(idx, part._micropartition)
-
-    def delete_partition(self, idx: PartID) -> None:
-        self._pset.delete_partition(idx)
-
-    def has_partition(self, idx: PartID) -> bool:
-        return self._pset.has_partition(idx)
-
-    def __len__(self) -> int:
-        return len(self._pset)
-
-    def size_bytes(self) -> int | None:
-        return self._pset.size_bytes()
-
-    def num_partitions(self) -> int:
-        return self._pset.num_partitions()
-
-    def wait(self) -> None:
-        pass
-
-
-@dataclass
-class LocalMaterializedResult(MaterializedResult[MicroPartition]):
-    _partition: MicroPartition
-    _metadata: PartitionMetadata | None = None
-
-    def partition(self) -> MicroPartition:
-        return self._partition
-
-    def micropartition(self) -> MicroPartition:
-        return self._partition
-
-    def metadata(self) -> PartitionMetadata:
-        if self._metadata is None:
-            self._metadata = PartitionMetadata.from_table(self._partition)
-        return self._metadata
-
-    def cancel(self) -> None:
-        return None
-
-    def _noop(self, _: MicroPartition) -> None:
-        return None
-
-
 @dataclass(eq=False, repr=False)
 class PartitionCacheEntry:
     key: str
-    value: PartitionSet[Any] | None
+    value: PartitionSet | None
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, PartitionCacheEntry) and self.key == other.key
@@ -382,10 +295,10 @@ class PartitionCacheEntry:
     def __repr__(self) -> str:
         return f"PartitionCacheEntry: {self.key}"
 
-    def __getstate__(self) -> str:
+    def __getstate__(self):
         return self.key
 
-    def __setstate__(self, key: str) -> None:
+    def __setstate__(self, key):
         self.key = key
         self.value = None
 
@@ -394,9 +307,6 @@ class PartitionCacheEntry:
 
     def size_bytes(self) -> int | None:
         return self.value.size_bytes() if self.value is not None else None
-
-    def num_rows(self) -> int | None:
-        return len(self.value) if self.value is not None else None
 
 
 class PartitionSetCache:
@@ -411,11 +321,11 @@ class PartitionSetCache:
             assert pset_id in self.__uuid_to_partition_set
             return self.__uuid_to_partition_set[pset_id]
 
-    def get_all_partition_sets(self) -> dict[str, PartitionSet[Any]]:
+    def get_all_partition_sets(self) -> dict[str, PartitionSet]:
         with self._lock:
             return {key: entry.value for key, entry in self.__uuid_to_partition_set.items() if entry.value is not None}
 
-    def put_partition_set(self, pset: PartitionSet[Any]) -> PartitionCacheEntry:
+    def put_partition_set(self, pset: PartitionSet) -> PartitionCacheEntry:
         pset_id = uuid4().hex
         part_entry = PartitionCacheEntry(pset_id, pset)
         with self._lock:

@@ -1,7 +1,6 @@
-# ruff: noqa: I002
 # isort: dont-add-import: from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Dict, List, Optional, Union
 
 from daft import context
 from daft.api_annotations import PublicAPI
@@ -9,81 +8,64 @@ from daft.daft import (
     CsvSourceConfig,
     FileFormatConfig,
     IOConfig,
+    NativeStorageConfig,
+    PythonStorageConfig,
     StorageConfig,
 )
 from daft.dataframe import DataFrame
 from daft.datatype import DataType
-from daft.io._checkpoint import attach_checkpoint
 from daft.io.common import get_tabular_files_scan
-
-if TYPE_CHECKING:
-    from daft.checkpoint import CheckpointConfig
 
 
 @PublicAPI
 def read_csv(
-    path: str | list[str],
-    infer_schema: bool = True,
-    schema: dict[str, DataType] | None = None,
+    path: Union[str, List[str]],
+    schema_hints: Optional[Dict[str, DataType]] = None,
     has_headers: bool = True,
-    delimiter: str | None = None,
+    column_names: Optional[List[str]] = None,
+    delimiter: Optional[str] = None,
     double_quote: bool = True,
-    quote: str | None = None,
-    escape_char: str | None = None,
-    comment: str | None = None,
-    allow_variable_columns: bool = False,
-    io_config: IOConfig | None = None,
-    file_path_column: str | None = None,
-    hive_partitioning: bool = False,
-    ignore_corrupt_files: bool = False,
-    _buffer_size: int | None = None,
-    _chunk_size: int | None = None,
-    checkpoint: "CheckpointConfig | None" = None,
+    quote: Optional[str] = None,
+    escape_char: Optional[str] = None,
+    comment: Optional[str] = None,
+    io_config: Optional["IOConfig"] = None,
+    use_native_downloader: bool = True,
+    _buffer_size: Optional[int] = None,
+    _chunk_size: Optional[int] = None,
 ) -> DataFrame:
-    """Creates a DataFrame from CSV file(s).
+    """Creates a DataFrame from CSV file(s)
 
-    Args:
-        path (str): Path to CSV (allows for wildcards; supports remote URLs to object stores such as ``s3://`` or ``gs://``)
-        infer_schema (bool): Whether to infer the schema of the CSV, defaults to True.
-        schema (dict[str, DataType]): A schema that is used as the definitive schema for the CSV if infer_schema is False, otherwise it is used as a schema hint that is applied after the schema is inferred (overriding the types of inferred columns, and appending any new columns not found during inference).
-        has_headers (bool): Whether the CSV has a header or not, defaults to True
-        delimiter (Str): Delimiter used in the CSV, defaults to ","
-        double_quote (bool): Whether to support double quote escapes, defaults to True
-        escape_char (str): Character to use as the escape character for double quotes, or defaults to `"`
-        comment (str): Character to treat as the start of a comment line, or None to not support comments
-        allow_variable_columns (bool): Whether to allow for variable number of columns in the CSV, defaults to False. If set to True, Daft will append nulls to rows with less columns than the schema, and ignore extra columns in rows with more columns
-        io_config (IOConfig): Config to be used with the native downloader
-        file_path_column: Include the source path(s) as a column with this name. Defaults to None.
-        hive_partitioning: Whether to infer hive_style partitions from file paths and include them as columns in the Dataframe. Defaults to False.
-        checkpoint: Optional :class:`daft.CheckpointConfig` for progress tracking across runs. Bundles the
-            checkpoint store, the source key column (``on=``), and optional anti-join tuning. Rows whose key
-            already exists in the store are skipped on re-run. Requires the Ray runner.
-        ignore_corrupt_files: If True, corrupt or unreadable CSV files are silently skipped instead
-            of raising an error. Skipped files are recorded in ``df.skipped_corrupt_files`` after collection.
-            Defaults to False.
-
-    Returns:
-        DataFrame: parsed DataFrame
-
-    Examples:
-        Read a CSV file from a local path:
+    Example:
         >>> df = daft.read_csv("/path/to/file.csv")
         >>> df = daft.read_csv("/path/to/directory")
         >>> df = daft.read_csv("/path/to/files-*.csv")
+        >>> df = daft.read_csv("s3://path/to/files-*.csv")
 
-        Read a CSV file from a public S3 bucket:
-        >>> from daft.io import S3Config, IOConfig
-        >>> io_config = IOConfig(s3=S3Config(region="us-west-2", anonymous=True))
-        >>> df = daft.read_csv("s3://path/to/files-*.csv", io_config=io_config)
-        >>> df.show()
+    Args:
+        path (str): Path to CSV (allows for wildcards)
+        schema_hints (dict[str, DataType]): A mapping between column names and datatypes - passing this option
+            will override the specified columns on the inferred schema with the specified DataTypes
+        has_headers (bool): Whether the CSV has a header or not, defaults to True
+        delimiter (Str): Delimiter used in the CSV, defaults to ","
+        doubled_quote (bool): Whether to support double quote escapes, defaults to True
+        escape_char (str): Character to use as the escape character for double quotes, or defaults to `"`
+        comment (str): Character to treat as the start of a comment line, or None to not support comments
+        io_config (IOConfig): Config to be used with the native downloader
+        use_native_downloader: Whether to use the native downloader instead of PyArrow for reading Parquet. This
+            is currently experimental.
+
+    returns:
+        DataFrame: parsed DataFrame
     """
-    if isinstance(path, list) and len(path) == 0:
-        raise ValueError("Cannot read DataFrame from empty list of CSV filepaths")
-
-    if not infer_schema and schema is None:
-        raise ValueError(
-            "Cannot read DataFrame with infer_schema=False and schema=None, please provide a schema or set infer_schema=True"
+    if column_names is not None:
+        raise NotImplementedError(
+            "The `column_names` option has been deprecated. As an alternative, you may specify `has_headers=False` which will have Daft "
+            "autogenerate your column names. Then, you can use `df.select` to alias each of the autogenerated columns: "
+            "`df.select(*[col(old).alias(new) for old, new in zip(df.column_names, MY_COL_NAMES)])`. Please submit an issue if this is a "
+            "blocker for your workflow!"
         )
+    if isinstance(path, list) and len(path) == 0:
+        raise ValueError("Cannot read DataFrame from from empty list of CSV filepaths")
 
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
@@ -94,22 +76,13 @@ def read_csv(
         quote=quote,
         escape_char=escape_char,
         comment=comment,
-        allow_variable_columns=allow_variable_columns,
         buffer_size=_buffer_size,
         chunk_size=_chunk_size,
-        ignore_corrupt_files=ignore_corrupt_files,
     )
     file_format_config = FileFormatConfig.from_csv_config(csv_config)
-    storage_config = StorageConfig(True, io_config)
-
-    builder = get_tabular_files_scan(
-        path=path,
-        infer_schema=infer_schema,
-        schema=schema,
-        file_format_config=file_format_config,
-        storage_config=storage_config,
-        file_path_column=file_path_column,
-        hive_partitioning=hive_partitioning,
-    )
-    builder = attach_checkpoint(builder, checkpoint)
+    if use_native_downloader:
+        storage_config = StorageConfig.native(NativeStorageConfig(True, io_config))
+    else:
+        storage_config = StorageConfig.python(PythonStorageConfig(io_config=io_config))
+    builder = get_tabular_files_scan(path, schema_hints, file_format_config, storage_config=storage_config)
     return DataFrame(builder)

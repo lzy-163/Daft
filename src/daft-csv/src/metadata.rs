@@ -1,21 +1,22 @@
 use std::{collections::HashSet, sync::Arc};
 
-use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use arrow2::io::csv::read_async::{AsyncReader, AsyncReaderBuilder};
+use async_compat::CompatExt;
 use common_error::DaftResult;
-use csv_async::{AsyncReaderBuilder, ByteRecord};
-use daft_compression::CompressionCodec;
-use daft_core::prelude::Schema;
-use daft_decoding::inference::infer;
-use daft_io::{GetResult, IOClient, IOStatsRef};
+use csv_async::ByteRecord;
+use daft_core::schema::Schema;
+use daft_io::{get_runtime, GetResult, IOClient, IOStatsRef};
 use futures::{StreamExt, TryStreamExt};
 use snafu::ResultExt;
 use tokio::{
     fs::File,
     io::{AsyncBufRead, AsyncRead, BufReader},
 };
-use tokio_util::{compat::TokioAsyncReadCompatExt, io::StreamReader};
+use tokio_util::io::StreamReader;
 
-use crate::{CsvParseOptions, schema::merge_schema};
+use crate::{schema::merge_schema, CsvParseOptions};
+use daft_compression::CompressionCodec;
+use daft_decoding::inference::infer;
 
 const DEFAULT_COLUMN_PREFIX: &str = "column_";
 
@@ -28,7 +29,6 @@ pub struct CsvReadStats {
 }
 
 impl CsvReadStats {
-    #[must_use]
     pub fn new(
         total_bytes_read: usize,
         total_records_read: usize,
@@ -50,22 +50,26 @@ impl Default for CsvReadStats {
     }
 }
 
-pub async fn read_csv_schema(
+pub fn read_csv_schema(
     uri: &str,
     parse_options: Option<CsvParseOptions>,
     max_bytes: Option<usize>,
     io_client: Arc<IOClient>,
     io_stats: Option<IOStatsRef>,
 ) -> DaftResult<(Schema, CsvReadStats)> {
-    read_csv_schema_single(
-        uri,
-        parse_options.unwrap_or_default(),
-        // Default to 1 MiB.
-        max_bytes.or(Some(1024 * 1024)),
-        io_client,
-        io_stats,
-    )
-    .await
+    let runtime_handle = get_runtime(true)?;
+    let _rt_guard = runtime_handle.enter();
+    runtime_handle.block_on(async {
+        read_csv_schema_single(
+            uri,
+            parse_options.unwrap_or_default(),
+            // Default to 1 MiB.
+            max_bytes.or(Some(1024 * 1024)),
+            io_client,
+            io_stats,
+        )
+        .await
+    })
 }
 
 pub async fn read_csv_schema_bulk(
@@ -76,32 +80,33 @@ pub async fn read_csv_schema_bulk(
     io_stats: Option<IOStatsRef>,
     num_parallel_tasks: usize,
 ) -> DaftResult<Vec<(Schema, CsvReadStats)>> {
-    let result = async {
-        let task_stream = futures::stream::iter(uris.iter().map(|uri| {
-            let owned_string = (*uri).to_string();
-            let owned_client = io_client.clone();
-            let owned_io_stats = io_stats.clone();
-            let owned_parse_options = parse_options.clone();
-            tokio::spawn(async move {
-                read_csv_schema_single(
-                    &owned_string,
-                    owned_parse_options.unwrap_or_default(),
-                    max_bytes,
-                    owned_client,
-                    owned_io_stats,
-                )
+    let runtime_handle = get_runtime(true)?;
+    let _rt_guard = runtime_handle.enter();
+    let result = runtime_handle
+        .block_on(async {
+            let task_stream = futures::stream::iter(uris.iter().map(|uri| {
+                let owned_string = uri.to_string();
+                let owned_client = io_client.clone();
+                let owned_io_stats = io_stats.clone();
+                let owned_parse_options = parse_options.clone();
+                tokio::spawn(async move {
+                    read_csv_schema_single(
+                        &owned_string,
+                        owned_parse_options.unwrap_or_default(),
+                        max_bytes,
+                        owned_client,
+                        owned_io_stats,
+                    )
+                    .await
+                })
+            }));
+            task_stream
+                .buffered(num_parallel_tasks)
+                .try_collect::<Vec<_>>()
                 .await
-            })
-        }));
-        task_stream
-            .buffered(num_parallel_tasks)
-            .try_collect::<Vec<_>>()
-            .await
-    }
-    .await
-    .context(super::JoinSnafu {})?;
-
-    result.into_iter().collect()
+        })
+        .context(super::JoinSnafu {})?;
+    result.into_iter().collect::<DaftResult<Vec<_>>>()
 }
 
 pub(crate) async fn read_csv_schema_single(
@@ -125,13 +130,13 @@ pub(crate) async fn read_csv_schema_single(
             )
             .await
         }
-        GetResult::Stream(stream, size, ..) => {
+        GetResult::Stream(stream, size, _) => {
             read_csv_schema_from_compressed_reader(
                 StreamReader::new(stream),
                 compression_codec,
                 parse_options,
                 // Truncate max_bytes to size if both are set.
-                max_bytes.map(|m| size.map_or(m, |s| m.min(s))),
+                max_bytes.map(|m| size.map(|s| m.min(s)).unwrap_or(m)),
             )
             .await
         }
@@ -170,10 +175,9 @@ async fn read_csv_schema_from_uncompressed_reader<R>(
 where
     R: AsyncRead + Unpin + Send,
 {
-    let (arrow_schema, read_stats) =
+    let (schema, read_stats) =
         read_csv_arrow_schema_from_uncompressed_reader(reader, parse_options, max_bytes).await?;
-    let schema = Schema::try_from(&arrow_schema)?;
-    Ok((schema, read_stats))
+    Ok((Schema::try_from(&schema)?, read_stats))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -181,7 +185,7 @@ async fn read_csv_arrow_schema_from_uncompressed_reader<R>(
     reader: R,
     parse_options: CsvParseOptions,
     max_bytes: Option<usize>,
-) -> DaftResult<(ArrowSchema, CsvReadStats)>
+) -> DaftResult<(arrow2::datatypes::Schema, CsvReadStats)>
 where
     R: AsyncRead + Unpin + Send,
 {
@@ -193,19 +197,18 @@ where
         .escape(parse_options.escape_char)
         .comment(parse_options.comment)
         .buffer_capacity(max_bytes.unwrap_or(1 << 20).min(1 << 20))
-        .flexible(parse_options.allow_variable_columns)
         .create_reader(reader.compat());
     let (fields, read_stats) =
         infer_schema(&mut reader, None, max_bytes, parse_options.has_header).await?;
-    Ok((ArrowSchema::new(fields), read_stats))
+    Ok((fields.into(), read_stats))
 }
 
 async fn infer_schema<R>(
-    reader: &mut csv_async::AsyncReader<R>,
+    reader: &mut AsyncReader<R>,
     max_rows: Option<usize>,
     max_bytes: Option<usize>,
     has_header: bool,
-) -> DaftResult<(Vec<Field>, CsvReadStats)>
+) -> arrow2::error::Result<(Vec<arrow2::datatypes::Field>, CsvReadStats)>
 where
     R: futures::AsyncRead + Unpin + Send,
 {
@@ -216,22 +219,15 @@ where
         (
             reader
                 .headers()
-                .await
-                .map_err(|e| crate::Error::CSVError { source: e })
-                .map_err(common_error::DaftError::from)?
+                .await?
                 .iter()
-                .map(std::string::ToString::to_string)
+                .map(|s| s.to_string())
                 .collect(),
             false,
         )
     } else {
         // Save the csv reader position before reading headers
-        if !reader
-            .read_byte_record(&mut record)
-            .await
-            .map_err(|e| crate::Error::CSVError { source: e })
-            .map_err(common_error::DaftError::from)?
-        {
+        if !reader.read_byte_record(&mut record).await? {
             return Ok((vec![], Default::default()));
         }
         let first_record_count = record.len();
@@ -243,7 +239,8 @@ where
         )
     };
     // keep track of inferred field types
-    let mut column_types: Vec<HashSet<DataType>> = vec![HashSet::new(); headers.len()];
+    let mut column_types: Vec<HashSet<arrow2::datatypes::DataType>> =
+        vec![HashSet::new(); headers.len()];
     let mut records_count = 0;
     let mut total_bytes = 0;
     let mut mean = 0f64;
@@ -255,7 +252,7 @@ where
         let delta = (record_size as f64) - mean;
         mean += delta / (records_count as f64);
         let delta2 = (record_size as f64) - mean;
-        m2 = delta.mul_add(delta2, m2);
+        m2 += delta * delta2;
         for (i, column) in column_types.iter_mut().enumerate() {
             if let Some(string) = record.get(i) {
                 column.insert(infer(string));
@@ -265,12 +262,7 @@ where
     let max_records = max_rows.unwrap_or(usize::MAX);
     let max_bytes = max_bytes.unwrap_or(usize::MAX);
     while records_count < max_records && total_bytes < max_bytes {
-        if !reader
-            .read_byte_record(&mut record)
-            .await
-            .map_err(|e| crate::Error::CSVError { source: e })
-            .map_err(common_error::DaftError::from)?
-        {
+        if !reader.read_byte_record(&mut record).await? {
             break;
         }
         records_count += 1;
@@ -279,7 +271,7 @@ where
         let delta = (record_size as f64) - mean;
         mean += delta / (records_count as f64);
         let delta2 = (record_size as f64) - mean;
-        m2 = delta.mul_add(delta2, m2);
+        m2 += delta * delta2;
         for (i, column) in column_types.iter_mut().enumerate() {
             if let Some(string) = record.get(i) {
                 column.insert(infer(string));
@@ -299,16 +291,16 @@ mod tests {
     use std::sync::Arc;
 
     use common_error::{DaftError, DaftResult};
-    use daft_core::prelude::*;
+    use daft_core::{datatypes::Field, schema::Schema, DataType};
     use daft_io::{IOClient, IOConfig};
     use rstest::rstest;
 
-    use super::read_csv_schema;
     use crate::CsvParseOptions;
 
+    use super::read_csv_schema;
+
     #[rstest]
-    #[tokio::test]
-    async fn test_csv_schema_local(
+    fn test_csv_schema_local(
         #[values(
             // Uncompressed
             None,
@@ -334,7 +326,7 @@ mod tests {
         let file = format!(
             "{}/test/iris_tiny.csv{}",
             env!("CARGO_MANIFEST_DIR"),
-            compression.map_or(String::new(), |ext| format!(".{ext}"))
+            compression.map_or("".to_string(), |ext| format!(".{}", ext))
         );
 
         let mut io_config = IOConfig::default();
@@ -342,7 +334,7 @@ mod tests {
         let io_client = Arc::new(IOClient::new(io_config.into())?);
 
         let (schema, read_stats) =
-            read_csv_schema(file.as_ref(), None, None, io_client, None).await?;
+            read_csv_schema(file.as_ref(), None, None, io_client.clone(), None)?;
         assert_eq!(
             schema,
             Schema::new(vec![
@@ -351,7 +343,7 @@ mod tests {
                 Field::new("petal.length", DataType::Float64),
                 Field::new("petal.width", DataType::Float64),
                 Field::new("variety", DataType::Utf8),
-            ]),
+            ])?,
         );
         assert_eq!(read_stats.total_bytes_read, 328);
         assert_eq!(read_stats.total_records_read, 20);
@@ -359,8 +351,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_csv_schema_local_delimiter() -> DaftResult<()> {
+    #[test]
+    fn test_csv_schema_local_delimiter() -> DaftResult<()> {
         let file = format!(
             "{}/test/iris_tiny_bar_delimiter.csv",
             env!("CARGO_MANIFEST_DIR"),
@@ -374,10 +366,9 @@ mod tests {
             file.as_ref(),
             Some(CsvParseOptions::default().with_delimiter(b'|')),
             None,
-            io_client,
+            io_client.clone(),
             None,
-        )
-        .await?;
+        )?;
         assert_eq!(
             schema,
             Schema::new(vec![
@@ -386,7 +377,7 @@ mod tests {
                 Field::new("petal.length", DataType::Float64),
                 Field::new("petal.width", DataType::Float64),
                 Field::new("variety", DataType::Utf8),
-            ]),
+            ])?,
         );
         assert_eq!(read_stats.total_bytes_read, 328);
         assert_eq!(read_stats.total_records_read, 20);
@@ -394,23 +385,23 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_csv_schema_local_read_stats() -> DaftResult<()> {
-        let file = format!("{}/test/iris_tiny.csv", env!("CARGO_MANIFEST_DIR"));
+    #[test]
+    fn test_csv_schema_local_read_stats() -> DaftResult<()> {
+        let file = format!("{}/test/iris_tiny.csv", env!("CARGO_MANIFEST_DIR"),);
 
         let mut io_config = IOConfig::default();
         io_config.s3.anonymous = true;
         let io_client = Arc::new(IOClient::new(io_config.into())?);
 
-        let (_, read_stats) = read_csv_schema(file.as_ref(), None, None, io_client, None).await?;
+        let (_, read_stats) = read_csv_schema(file.as_ref(), None, None, io_client.clone(), None)?;
         assert_eq!(read_stats.total_bytes_read, 328);
         assert_eq!(read_stats.total_records_read, 20);
 
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_csv_schema_local_no_headers() -> DaftResult<()> {
+    #[test]
+    fn test_csv_schema_local_no_headers() -> DaftResult<()> {
         let file = format!(
             "{}/test/iris_tiny_no_headers.csv",
             env!("CARGO_MANIFEST_DIR"),
@@ -424,10 +415,9 @@ mod tests {
             file.as_ref(),
             Some(CsvParseOptions::default().with_has_header(false)),
             None,
-            io_client,
+            io_client.clone(),
             None,
-        )
-        .await?;
+        )?;
         assert_eq!(
             schema,
             Schema::new(vec![
@@ -436,7 +426,7 @@ mod tests {
                 Field::new("column_3", DataType::Float64),
                 Field::new("column_4", DataType::Float64),
                 Field::new("column_5", DataType::Utf8),
-            ]),
+            ])?,
         );
         assert_eq!(read_stats.total_bytes_read, 328);
         assert_eq!(read_stats.total_records_read, 20);
@@ -444,8 +434,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_csv_schema_local_empty_lines_skipped() -> DaftResult<()> {
+    #[test]
+    fn test_csv_schema_local_empty_lines_skipped() -> DaftResult<()> {
         let file = format!(
             "{}/test/iris_tiny_empty_lines.csv",
             env!("CARGO_MANIFEST_DIR"),
@@ -456,7 +446,7 @@ mod tests {
         let io_client = Arc::new(IOClient::new(io_config.into())?);
 
         let (schema, read_stats) =
-            read_csv_schema(file.as_ref(), None, None, io_client, None).await?;
+            read_csv_schema(file.as_ref(), None, None, io_client.clone(), None)?;
         assert_eq!(
             schema,
             Schema::new(vec![
@@ -465,7 +455,7 @@ mod tests {
                 Field::new("petal.length", DataType::Float64),
                 Field::new("petal.width", DataType::Float64),
                 Field::new("variety", DataType::Utf8),
-            ]),
+            ])?,
         );
         assert_eq!(read_stats.total_bytes_read, 49);
         assert_eq!(read_stats.total_records_read, 3);
@@ -473,16 +463,16 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_csv_schema_local_nulls() -> DaftResult<()> {
-        let file = format!("{}/test/iris_tiny_nulls.csv", env!("CARGO_MANIFEST_DIR"));
+    #[test]
+    fn test_csv_schema_local_nulls() -> DaftResult<()> {
+        let file = format!("{}/test/iris_tiny_nulls.csv", env!("CARGO_MANIFEST_DIR"),);
 
         let mut io_config = IOConfig::default();
         io_config.s3.anonymous = true;
         let io_client = Arc::new(IOClient::new(io_config.into())?);
 
         let (schema, read_stats) =
-            read_csv_schema(file.as_ref(), None, None, io_client, None).await?;
+            read_csv_schema(file.as_ref(), None, None, io_client.clone(), None)?;
         assert_eq!(
             schema,
             Schema::new(vec![
@@ -491,7 +481,7 @@ mod tests {
                 Field::new("petal.length", DataType::Float64),
                 Field::new("petal.width", DataType::Float64),
                 Field::new("variety", DataType::Utf8),
-            ]),
+            ])?,
         );
         assert_eq!(read_stats.total_bytes_read, 82);
         assert_eq!(read_stats.total_records_read, 6);
@@ -499,8 +489,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_csv_schema_local_conflicting_types_utf8_fallback() -> DaftResult<()> {
+    #[test]
+    fn test_csv_schema_local_conflicting_types_utf8_fallback() -> DaftResult<()> {
         let file = format!(
             "{}/test/iris_tiny_conflicting_dtypes.csv",
             env!("CARGO_MANIFEST_DIR"),
@@ -511,7 +501,7 @@ mod tests {
         let io_client = Arc::new(IOClient::new(io_config.into())?);
 
         let (schema, read_stats) =
-            read_csv_schema(file.as_ref(), None, None, io_client, None).await?;
+            read_csv_schema(file.as_ref(), None, None, io_client.clone(), None)?;
         assert_eq!(
             schema,
             Schema::new(vec![
@@ -521,7 +511,7 @@ mod tests {
                 Field::new("petal.length", DataType::Utf8),
                 Field::new("petal.width", DataType::Utf8),
                 Field::new("variety", DataType::Utf8),
-            ]),
+            ])?,
         );
         assert_eq!(read_stats.total_bytes_read, 33);
         assert_eq!(read_stats.total_records_read, 2);
@@ -529,16 +519,16 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_csv_schema_local_max_bytes() -> DaftResult<()> {
-        let file = format!("{}/test/iris_tiny.csv", env!("CARGO_MANIFEST_DIR"));
+    #[test]
+    fn test_csv_schema_local_max_bytes() -> DaftResult<()> {
+        let file = format!("{}/test/iris_tiny.csv", env!("CARGO_MANIFEST_DIR"),);
 
         let mut io_config = IOConfig::default();
         io_config.s3.anonymous = true;
         let io_client = Arc::new(IOClient::new(io_config.into())?);
 
         let (schema, read_stats) =
-            read_csv_schema(file.as_ref(), None, Some(100), io_client, None).await?;
+            read_csv_schema(file.as_ref(), None, Some(100), io_client.clone(), None)?;
         assert_eq!(
             schema,
             Schema::new(vec![
@@ -547,7 +537,7 @@ mod tests {
                 Field::new("petal.length", DataType::Float64),
                 Field::new("petal.width", DataType::Float64),
                 Field::new("variety", DataType::Utf8),
-            ]),
+            ])?,
         );
         // Max bytes doesn't include header, so add 15 bytes to upper bound.
         assert!(
@@ -564,8 +554,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_csv_schema_local_invalid_column_header_mismatch() -> DaftResult<()> {
+    #[test]
+    fn test_csv_schema_local_invalid_column_header_mismatch() -> DaftResult<()> {
         let file = format!(
             "{}/test/iris_tiny_invalid_header_cols_mismatch.csv",
             env!("CARGO_MANIFEST_DIR"),
@@ -575,10 +565,10 @@ mod tests {
         io_config.s3.anonymous = true;
         let io_client = Arc::new(IOClient::new(io_config.into())?);
 
-        let err = read_csv_schema(file.as_ref(), None, None, io_client, None).await;
+        let err = read_csv_schema(file.as_ref(), None, None, io_client.clone(), None);
         assert!(err.is_err());
         let err = err.unwrap_err();
-        assert!(matches!(err, DaftError::CorruptFile(_)), "{}", err);
+        assert!(matches!(err, DaftError::ArrowError(_)), "{}", err);
         assert!(
             err.to_string()
                 .contains("found record with 4 fields, but the previous record has 5 fields"),
@@ -589,8 +579,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_csv_schema_local_invalid_no_header_variable_num_cols() -> DaftResult<()> {
+    #[test]
+    fn test_csv_schema_local_invalid_no_header_variable_num_cols() -> DaftResult<()> {
         let file = format!(
             "{}/test/iris_tiny_invalid_no_header_variable_num_cols.csv",
             env!("CARGO_MANIFEST_DIR"),
@@ -604,13 +594,12 @@ mod tests {
             file.as_ref(),
             Some(CsvParseOptions::default().with_has_header(false)),
             None,
-            io_client,
+            io_client.clone(),
             None,
-        )
-        .await;
+        );
         assert!(err.is_err());
         let err = err.unwrap_err();
-        assert!(matches!(err, DaftError::CorruptFile(_)), "{}", err);
+        assert!(matches!(err, DaftError::ArrowError(_)), "{}", err);
         assert!(
             err.to_string()
                 .contains("found record with 5 fields, but the previous record has 4 fields"),
@@ -622,8 +611,7 @@ mod tests {
     }
 
     #[rstest]
-    #[tokio::test]
-    async fn test_csv_schema_s3(
+    fn test_csv_schema_s3(
         #[values(
             // Uncompressed
             None,
@@ -648,20 +636,20 @@ mod tests {
     ) -> DaftResult<()> {
         let file = format!(
             "s3://daft-public-data/test_fixtures/csv-dev/mvp.csv{}",
-            compression.map_or(String::new(), |ext| format!(".{ext}"))
+            compression.map_or("".to_string(), |ext| format!(".{}", ext))
         );
 
         let mut io_config = IOConfig::default();
         io_config.s3.anonymous = true;
         let io_client = Arc::new(IOClient::new(io_config.into())?);
 
-        let (schema, _) = read_csv_schema(file.as_ref(), None, None, io_client, None).await?;
+        let (schema, _) = read_csv_schema(file.as_ref(), None, None, io_client.clone(), None)?;
         assert_eq!(
             schema,
             Schema::new(vec![
                 Field::new("a", DataType::Int64),
                 Field::new("b", DataType::Utf8)
-            ])
+            ])?
         );
 
         Ok(())

@@ -1,11 +1,15 @@
+#[cfg(feature = "python")]
+use pyo3::{
+    exceptions::PyValueError, prelude::*, types::PyBytes, PyObject, PyTypeInfo, ToPyObject,
+};
+use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter, Result};
 use std::str::FromStr;
+use std::string::ToString;
+
+use crate::impl_bincode_py_state_serialization;
 
 use common_error::{DaftError, DaftResult};
-use common_py_serde::impl_bincode_py_state_serialization;
-use derive_more::Display;
-#[cfg(feature = "python")]
-use pyo3::{exceptions::PyValueError, prelude::*};
-use serde::{Deserialize, Serialize};
 
 /// Supported count modes for Daft's count aggregation.
 ///
@@ -13,17 +17,11 @@ use serde::{Deserialize, Serialize};
 /// | Valid - Count only valid values.
 /// | Null  - Count only null values.
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Clone, Copy, Debug, Display, PartialEq, Eq, Serialize, Deserialize, Hash)]
-#[cfg_attr(
-    feature = "python",
-    pyclass(module = "daft.daft", eq, eq_int, from_py_object)
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[cfg_attr(feature = "python", pyclass(module = "daft.daft"))]
 pub enum CountMode {
-    #[serde(alias = "all")]
     All = 1,
-    #[serde(alias = "valid")]
     Valid = 2,
-    #[serde(alias = "null")]
     Null = 3,
 }
 
@@ -46,8 +44,10 @@ impl CountMode {
 impl_bincode_py_state_serialization!(CountMode);
 
 impl CountMode {
-    pub fn iterator() -> std::slice::Iter<'static, Self> {
-        static COUNT_MODES: [CountMode; 3] = [CountMode::All, CountMode::Valid, CountMode::Null];
+    pub fn iterator() -> std::slice::Iter<'static, CountMode> {
+        use CountMode::*;
+
+        static COUNT_MODES: [CountMode; 3] = [All, Valid, Null];
         COUNT_MODES.iter()
     }
 }
@@ -56,15 +56,24 @@ impl FromStr for CountMode {
     type Err = DaftError;
 
     fn from_str(count_mode: &str) -> DaftResult<Self> {
-        match count_mode.to_lowercase().as_str() {
-            "all" => Ok(Self::All),
-            "valid" => Ok(Self::Valid),
-            "null" => Ok(Self::Null),
+        use CountMode::*;
+
+        match count_mode {
+            "all" => Ok(All),
+            "valid" => Ok(Valid),
+            "null" => Ok(Null),
             _ => Err(DaftError::TypeError(format!(
                 "Count mode {} is not supported; only the following modes are supported: {:?}",
                 count_mode,
-                Self::iterator().as_slice()
+                CountMode::iterator().as_slice()
             ))),
         }
+    }
+}
+
+impl Display for CountMode {
+    fn fmt(&self, f: &mut Formatter) -> Result {
+        // Leverage Debug trait implementation, which will already return the enum variant as a string.
+        write!(f, "{:?}", self)
     }
 }

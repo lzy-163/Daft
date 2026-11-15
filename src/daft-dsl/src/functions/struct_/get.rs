@@ -1,8 +1,14 @@
+use crate::Expr;
+use daft_core::{
+    datatypes::{DataType, Field},
+    schema::Schema,
+    series::Series,
+};
+
+use crate::functions::FunctionExpr;
 use common_error::{DaftError, DaftResult};
-use daft_core::prelude::*;
 
 use super::{super::FunctionEvaluator, StructExpr};
-use crate::{ExprRef, functions::FunctionExpr};
 
 pub(super) struct GetEvaluator {}
 
@@ -11,12 +17,7 @@ impl FunctionEvaluator for GetEvaluator {
         "get"
     }
 
-    fn to_field(
-        &self,
-        inputs: &[ExprRef],
-        schema: &Schema,
-        expr: &FunctionExpr,
-    ) -> DaftResult<Field> {
+    fn to_field(&self, inputs: &[Expr], schema: &Schema, expr: &FunctionExpr) -> DaftResult<Field> {
         match inputs {
             [input] => {
                 let input_field = input.to_field(schema)?;
@@ -29,8 +30,8 @@ impl FunctionEvaluator for GetEvaluator {
                         };
 
                         for f in &fields {
-                            if *f.name == **name {
-                                return Ok(Field::new(name.as_str(), f.dtype.clone()));
+                            if f.name == *name {
+                                return Ok(Field::new(name, f.dtype.clone()));
                             }
                         }
 
@@ -39,7 +40,7 @@ impl FunctionEvaluator for GetEvaluator {
                             name,
                             fields
                                 .iter()
-                                .map(|f| f.name.to_string())
+                                .map(|f| f.name.clone())
                                 .collect::<Vec<String>>()
                         )))
                     }

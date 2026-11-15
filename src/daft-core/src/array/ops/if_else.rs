@@ -1,19 +1,13 @@
+use crate::array::growable::{Growable, GrowableArray};
+use crate::array::ops::full::FullNull;
+use crate::array::{DataArray, FixedSizeListArray, ListArray, StructArray};
+use crate::datatypes::{BooleanArray, DaftPhysicalType};
+use crate::{DataType, IntoSeries, Series};
+use arrow2::array::Array;
 use common_error::DaftResult;
 
 use super::as_arrow::AsArrow;
-#[cfg(feature = "python")]
-use crate::prelude::PythonArray;
-use crate::{
-    array::{
-        DataArray, FixedSizeListArray, ListArray, StructArray, UnionArray,
-        growable::{Growable, GrowableArray},
-        ops::full::FullNull,
-    },
-    datatypes::{BooleanArray, DaftPhysicalType, DataType},
-    series::{IntoSeries, Series},
-};
 
-#[inline(never)]
 fn generic_if_else<T: GrowableArray + FullNull + Clone + IntoSeries>(
     predicate: &BooleanArray,
     name: &str,
@@ -38,6 +32,7 @@ fn generic_if_else<T: GrowableArray + FullNull + Clone + IntoSeries>(
     }
 
     // Build the result using a Growable
+    let predicate = predicate.as_arrow();
     let mut growable = T::make_growable(
         name,
         dtype,
@@ -47,12 +42,12 @@ fn generic_if_else<T: GrowableArray + FullNull + Clone + IntoSeries>(
     );
     // CASE 2: predicate is not broadcastable, and contains nulls
     //
-    // NOTE: we iterate through the predicate+validity which is slightly slower than using a set_slices approach.
+    // NOTE: we iterate through the predicate+validity which is slightly slower than using a SlicesIterator approach.
     // An alternative is to naively apply the raw predicate values (without considering validity), and then applying
     // validity afterwards. However this could use more memory than required, since we copy even values that will
     // later then be considered null.
     if predicate.null_count() > 0 {
-        for (i, pred) in predicate.iter().enumerate() {
+        for (i, pred) in predicate.into_iter().enumerate() {
             match pred {
                 None => {
                     growable.add_nulls(1);
@@ -67,55 +62,62 @@ fn generic_if_else<T: GrowableArray + FullNull + Clone + IntoSeries>(
                 }
             }
         }
+        growable.build()
+
     // CASE 3: predicate is not broadcastable, and does not contain nulls
     } else {
         // Helper to extend the growable, taking into account broadcast semantics
         let (broadcast_lhs, broadcast_rhs) = (lhs_len == 1, rhs_len == 1);
-        let mut extend = |pred: bool, start, len| match (pred, broadcast_lhs, broadcast_rhs) {
-            (true, false, _) => {
-                growable.extend(0, start, len);
-            }
-            (false, _, false) => {
-                growable.extend(1, start, len);
-            }
-            (true, true, _) => {
-                for _ in 0..len {
-                    growable.extend(0, 0, 1);
+        let mut extend = |pred: bool, start, len| {
+            match (pred, broadcast_lhs, broadcast_rhs) {
+                (true, false, _) => {
+                    growable.extend(0, start, len);
                 }
-            }
-            (false, _, true) => {
-                for _ in 0..len {
-                    growable.extend(1, 0, 1);
+                (false, _, false) => {
+                    growable.extend(1, start, len);
                 }
-            }
+                (true, true, _) => {
+                    for _ in 0..len {
+                        growable.extend(0, 0, 1);
+                    }
+                }
+                (false, _, true) => {
+                    for _ in 0..len {
+                        growable.extend(1, 0, 1);
+                    }
+                }
+            };
         };
 
-        // Iterate through the predicate using set_slices(), which is a much faster way of iterating through a bitmap.
-        // set_slices() yields (start, end) ranges of contiguous set bits.
-        let predicate_arrow = predicate.as_arrow()?;
+        // Iterate through the predicate using SlicesIterator, which is a much faster way of iterating through a bitmap
         let mut start_falsy = 0;
-        for (start, end) in predicate_arrow.values().set_slices() {
-            let len = end - start;
+        let mut total_len = 0;
+        for (start, len) in arrow2::bitmap::utils::SlicesIterator::new(predicate.values()) {
             if start != start_falsy {
                 extend(false, start_falsy, start - start_falsy);
-            }
+                total_len += start - start_falsy;
+            };
             extend(true, start, len);
-            start_falsy = end;
+            total_len += len;
+            start_falsy = start + len;
         }
-        if start_falsy != predicate.len() {
-            extend(false, start_falsy, predicate.len() - start_falsy);
+        if total_len != predicate.len() {
+            extend(false, total_len, predicate.len() - total_len);
         }
+        growable.build()
     }
-
-    growable.build()
 }
 
 impl<T> DataArray<T>
 where
     T: DaftPhysicalType,
-    Self: GrowableArray + IntoSeries,
+    DataArray<T>: GrowableArray + IntoSeries,
 {
-    pub fn if_else(&self, other: &Self, predicate: &BooleanArray) -> DaftResult<Self> {
+    pub fn if_else(
+        &self,
+        other: &DataArray<T>,
+        predicate: &BooleanArray,
+    ) -> DaftResult<DataArray<T>> {
         generic_if_else(
             predicate,
             self.name(),
@@ -125,12 +127,12 @@ where
             self.len(),
             other.len(),
         )?
-        .downcast::<Self>()
-        .cloned()
+        .downcast::<DataArray<T>>()
+        .map(|arr| arr.clone())
     }
 }
 
-macro_rules! impl_if_else {
+macro_rules! impl_if_else_nested_array {
     ($arr:ident) => {
         impl<'a> $arr {
             pub fn if_else(
@@ -154,11 +156,6 @@ macro_rules! impl_if_else {
     };
 }
 
-impl_if_else!(ListArray);
-impl_if_else!(FixedSizeListArray);
-impl_if_else!(StructArray);
-
-impl_if_else!(UnionArray);
-
-#[cfg(feature = "python")]
-impl_if_else!(PythonArray);
+impl_if_else_nested_array!(ListArray);
+impl_if_else_nested_array!(FixedSizeListArray);
+impl_if_else_nested_array!(StructArray);

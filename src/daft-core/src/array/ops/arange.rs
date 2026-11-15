@@ -1,9 +1,9 @@
-use common_error::DaftResult;
-
 use crate::{
     array::DataArray,
     datatypes::{DaftNumericType, Int64Array},
 };
+
+use common_error::DaftResult;
 
 impl<T> DataArray<T>
 where
@@ -15,10 +15,11 @@ where
                 "invalid range, start greater than end, {start} vs {end}"
             )));
         }
-        let arr = Int64Array::from_values(name.as_ref(), (start..end).step_by(step));
-
-        let casted_array = arr.cast(&T::get_dtype())?;
-        let downcasted = casted_array.downcast::<Self>()?;
+        let data: Vec<i64> = (start..end).step_by(step).collect();
+        let arrow_array = Box::new(arrow2::array::PrimitiveArray::<i64>::from_vec(data));
+        let data_array = Int64Array::from((name.as_ref(), arrow_array));
+        let casted_array = data_array.cast(&T::get_dtype())?;
+        let downcasted = casted_array.downcast::<DataArray<T>>()?;
         Ok(downcasted.clone())
     }
 }

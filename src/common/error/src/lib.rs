@@ -1,5 +1,3 @@
 mod error;
-mod format;
-pub use error::{DaftError, DaftResult};
-#[cfg(feature = "python")]
-mod python;
+pub use error::DaftError;
+pub use error::DaftResult;

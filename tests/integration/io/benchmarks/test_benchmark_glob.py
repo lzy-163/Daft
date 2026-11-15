@@ -99,7 +99,7 @@ def generate_right_skew_dirs_partitioned_data():
     ]
     other_partition_paths = [
         "/".join(f"part_col_{i}={val}" for i, val in enumerate([first_level_val, *part_vals])) + f"/{i}.parquet"
-        for first_level_val in range(9)
+        for first_level_val in range(0, 9)
         for part_vals in itertools.product([str(i) for i in range(8)], repeat=2)
         for i in range(10)
     ]
@@ -145,18 +145,17 @@ FILE_NAME_GENERATORS = {
 def setup_bucket(request, minio_io_config):
     test_name = request.param
     file_name_generator = FILE_NAME_GENERATORS[test_name]
-    with minio_create_bucket(minio_io_config) as (fs, bucket_name):
+    with minio_create_bucket(minio_io_config, bucket_name=BUCKET) as fs:
         files = file_name_generator()
         print(f"Num files: {len(files)}")
         for name in files:
-            fs.touch(f"{bucket_name}/{name}")
-        yield bucket_name, len(set(files))
+            fs.touch(f"{BUCKET}/{name}")
+        yield len(set(files))
 
 
 @pytest.mark.benchmark(group="glob")
 @pytest.mark.integration()
 def test_benchmark_glob_s3fs(benchmark, setup_bucket, minio_io_config):
-    bucket_name, expected_count = setup_bucket
     fs = s3fs.S3FileSystem(
         key=minio_io_config.s3.key_id,
         password=minio_io_config.s3.access_key,
@@ -164,19 +163,18 @@ def test_benchmark_glob_s3fs(benchmark, setup_bucket, minio_io_config):
     )
     results = benchmark(
         lambda: fs.glob(
-            f"s3://{bucket_name}/**/*.parquet",
+            f"s3://{BUCKET}/**/*.parquet",
             # Can't set page size for s3fs
             # max_items=PAGE_SIZE,
         )
     )
-    assert len(results) == expected_count
+    assert len(results) == setup_bucket
 
 
 @pytest.mark.benchmark(group="glob")
 @pytest.mark.integration()
 @pytest.mark.parametrize("page_size", [100, 1000])
 def test_benchmark_glob_boto3_list(benchmark, setup_bucket, minio_io_config, page_size):
-    bucket_name, expected_count = setup_bucket
     import boto3
 
     s3 = boto3.client(
@@ -196,20 +194,18 @@ def test_benchmark_glob_boto3_list(benchmark, setup_bucket, minio_io_config, pag
                 opts["ContinuationToken"] = continuation_token
 
             response = s3.list_objects_v2(
-                Bucket=bucket_name,
+                Bucket=BUCKET,
                 Prefix="",
                 **opts,
             )
-            data.extend(
-                [{"path": f"s3://{bucket_name}/{d['Key']}", "type": "File"} for d in response.get("Contents", [])]
-            )
+            data.extend([{"path": f"s3://{BUCKET}/{d['Key']}", "type": "File"} for d in response.get("Contents", [])])
             continuation_token = response.get("NextContinuationToken")
             has_next = continuation_token is not None
 
         return data
 
     data = benchmark(f)
-    assert len(data) == expected_count
+    assert len(data) == setup_bucket
 
 
 @pytest.mark.benchmark(group="glob")
@@ -217,13 +213,9 @@ def test_benchmark_glob_boto3_list(benchmark, setup_bucket, minio_io_config, pag
 @pytest.mark.parametrize("fanout_limit", [128, 256])
 @pytest.mark.parametrize("page_size", [100, 1000])
 def test_benchmark_glob_daft(benchmark, setup_bucket, minio_io_config, fanout_limit, page_size):
-    bucket_name, expected_count = setup_bucket
     results = benchmark(
         lambda: io_glob(
-            f"s3://{bucket_name}/**/*.parquet",
-            io_config=minio_io_config,
-            fanout_limit=fanout_limit,
-            page_size=page_size,
+            f"s3://{BUCKET}/**/*.parquet", io_config=minio_io_config, fanout_limit=fanout_limit, page_size=page_size
         )
     )
-    assert len(results) == expected_count
+    assert len(results) == setup_bucket

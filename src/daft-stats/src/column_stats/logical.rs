@@ -1,6 +1,7 @@
 use snafu::ResultExt;
 
 use super::{ColumnRangeStatistics, TruthValue};
+
 use crate::DaftCoreComputeSnafu;
 
 impl std::ops::Not for &ColumnRangeStatistics {
@@ -9,11 +10,6 @@ impl std::ops::Not for &ColumnRangeStatistics {
         match self {
             ColumnRangeStatistics::Missing => Ok(ColumnRangeStatistics::Missing),
             ColumnRangeStatistics::Loaded(lower, upper) => {
-                // If stats are Null-typed (e.g., null_lit() substitution for a missing
-                // column), we can't evaluate NOT — return Missing (conservative).
-                if *lower.data_type() == daft_core::prelude::DataType::Null {
-                    return Ok(ColumnRangeStatistics::Missing);
-                }
                 let new_lower = upper.not().context(DaftCoreComputeSnafu)?;
                 let new_upper = lower.not().context(DaftCoreComputeSnafu)?;
 
@@ -36,7 +32,7 @@ impl std::ops::BitAnd for &ColumnRangeStatistics {
 
         let lt = self.to_truth_value();
         let rt = rhs.to_truth_value();
-        use TruthValue::{False, Maybe, True};
+        use TruthValue::*;
         let nv = match (lt, rt) {
             (False, _) => False,
             (_, False) => False,
@@ -60,7 +56,7 @@ impl std::ops::BitOr for &ColumnRangeStatistics {
         // +-------+-------+-------+------+
         let lt = self.to_truth_value();
         let rt = rhs.to_truth_value();
-        use TruthValue::{False, Maybe, True};
+        use TruthValue::*;
         let nv = match (lt, rt) {
             (False, False) => False,
             (True, _) => True,

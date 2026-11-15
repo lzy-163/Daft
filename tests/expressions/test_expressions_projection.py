@@ -3,9 +3,8 @@ from __future__ import annotations
 import pytest
 
 from daft.expressions import Expression, ExpressionsProjection, col
-from daft.expressions.expressions import _resolved_col
 from daft.expressions.testing import expr_structurally_equal
-from daft.recordbatch import MicroPartition
+from daft.table import MicroPartition
 
 
 def test_expressions_projection_error_dup_name():
@@ -30,6 +29,9 @@ def test_expressions_projection_empty():
     # Test eq
     assert ep == ep
     assert ep != ExpressionsProjection([col("x")])
+
+    # Test required_columns
+    assert ep.required_columns() == set()
 
     # Test to_name_set()
     assert ep.to_name_set() == set()
@@ -56,6 +58,9 @@ def test_expressions_projection():
     # Test eq
     assert ep == ep
     assert ep != ExpressionsProjection([])
+
+    # Test required_columns
+    assert ep.required_columns() == {"x", "y", "z"}
 
     # Test to_name_set()
     assert ep.to_name_set() == {"x", "y", "a"}
@@ -116,9 +121,9 @@ def test_expressions_union_dup_rename():
 
 def test_input_mapping():
     exprs = [
-        _resolved_col("x"),
-        _resolved_col("y") + 1,
-        _resolved_col("z").alias("a"),
+        col("x"),
+        col("y") + 1,
+        col("z").alias("a"),
     ]
     ep = ExpressionsProjection(exprs)
     assert ep.input_mapping() == {

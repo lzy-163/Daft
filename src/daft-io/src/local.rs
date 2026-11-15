@@ -1,28 +1,22 @@
-use std::{
-    any::Any,
-    io::{SeekFrom, Write},
-    ops::Range,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::io::SeekFrom;
+use std::ops::Range;
+use std::path::PathBuf;
 
+use crate::object_io::{self, FileMetadata, LSResult};
+use crate::stats::IOStatsRef;
+
+use super::object_io::{GetResult, ObjectSource};
+use super::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use common_error::DaftError;
-use futures::{StreamExt, TryStreamExt, stream::BoxStream};
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use snafu::{ResultExt, Snafu};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-use super::{
-    InvalidRangeRequestSnafu, Result,
-    object_io::{GetResult, ObjectSource},
-};
-use crate::{
-    FileFormat,
-    object_io::{self, FileMetadata, LSResult},
-    range::GetRange,
-    stats::IOStatsRef,
-};
+use url::ParseError;
 
 /// NOTE: We hardcode this even for Windows
 ///
@@ -30,32 +24,12 @@ use crate::{
 /// as long as there is no "mix" of "\" and "/".
 const PATH_SEGMENT_DELIMITER: &str = "/";
 
-use crate::{local_path_to_file_uri, strip_file_uri_to_path};
-
-pub struct LocalSource {}
+pub(crate) struct LocalSource {}
 
 #[derive(Debug, Snafu)]
 enum Error {
     #[snafu(display("Unable to open file {}: {}", path, source))]
     UnableToOpenFile {
-        path: String,
-        source: std::io::Error,
-    },
-
-    #[snafu(display("Unable to write to file {}: {}", path, source))]
-    UnableToWriteToFile {
-        path: String,
-        source: std::io::Error,
-    },
-
-    #[snafu(display("Unable to delete file {}: {}", path, source))]
-    UnableToDeleteFile {
-        path: String,
-        source: std::io::Error,
-    },
-
-    #[snafu(display("Unable to open file for writing {}: {}", path, source))]
-    UnableToOpenFileForWriting {
         path: String,
         source: std::io::Error,
     },
@@ -86,48 +60,52 @@ enum Error {
     #[snafu(display("Unexpected symlink when processing directory {}: {}", path, source))]
     UnexpectedSymlink { path: String, source: DaftError },
 
+    #[snafu(display("Unable to parse URL \"{}\"", url.to_string_lossy()))]
+    InvalidUrl { url: PathBuf, source: ParseError },
+
     #[snafu(display("Unable to convert URL \"{}\" to local file path", path))]
     InvalidFilePath { path: String },
+
+    #[snafu(display("Attempted to Read Directory as File {}", path))]
+    IsADirectory { path: String },
 }
 
 impl From<Error> for super::Error {
     fn from(error: Error) -> Self {
-        use Error::{
-            UnableToFetchDirectoryEntries, UnableToFetchFileMetadata, UnableToOpenFile,
-            UnableToOpenFileForWriting, UnableToReadBytes, UnableToWriteToFile,
-        };
+        use Error::*;
         match error {
             UnableToOpenFile { path, source } | UnableToFetchDirectoryEntries { path, source } => {
-                use std::io::ErrorKind::NotFound;
+                use std::io::ErrorKind::*;
                 match source.kind() {
-                    NotFound => Self::NotFound {
+                    NotFound => super::Error::NotFound {
                         path,
                         source: source.into(),
                     },
-                    _ => Self::UnableToOpenFile {
+                    _ => super::Error::UnableToOpenFile {
                         path,
                         source: source.into(),
                     },
                 }
             }
             UnableToFetchFileMetadata { path, source } => {
-                use std::io::ErrorKind::{IsADirectory, NotFound};
+                use std::io::ErrorKind::*;
                 match source.kind() {
-                    NotFound | IsADirectory => Self::NotFound {
+                    NotFound | IsADirectory => super::Error::NotFound {
                         path,
                         source: source.into(),
                     },
-                    _ => Self::UnableToOpenFile {
+                    _ => super::Error::UnableToOpenFile {
                         path,
                         source: source.into(),
                     },
                 }
             }
-            UnableToReadBytes { path, source } => Self::UnableToReadBytes { path, source },
-            UnableToWriteToFile { path, source } | UnableToOpenFileForWriting { path, source } => {
-                Self::UnableToWriteToFile { path, source }
-            }
-            _ => Self::Generic {
+            UnableToReadBytes { path, source } => super::Error::UnableToReadBytes { path, source },
+            InvalidUrl { url, source } => super::Error::InvalidUrl {
+                path: url.to_string_lossy().into_owned(),
+                source,
+            },
+            _ => super::Error::Generic {
                 store: super::SourceType::File,
                 source: error.into(),
             },
@@ -137,7 +115,7 @@ impl From<Error> for super::Error {
 
 impl LocalSource {
     pub async fn get_client() -> super::Result<Arc<Self>> {
-        Ok(Self {}.into())
+        Ok(LocalSource {}.into())
     }
 }
 
@@ -148,24 +126,16 @@ pub struct LocalFile {
 
 #[async_trait]
 impl ObjectSource for LocalSource {
-    async fn supports_range(&self, _: &str) -> super::Result<bool> {
-        Ok(true)
-    }
-
     async fn get(
         &self,
         uri: &str,
-        range: Option<GetRange>,
-        io_stats: Option<IOStatsRef>,
+        range: Option<Range<usize>>,
+        _io_stats: Option<IOStatsRef>,
     ) -> super::Result<GetResult> {
-        if let Some(file) = strip_file_uri_to_path(uri) {
-            let size = self.get_size(uri, io_stats).await?;
-            let range = range
-                .map(|r| r.as_range(size))
-                .transpose()
-                .context(InvalidRangeRequestSnafu)?;
+        const LOCAL_PROTOCOL: &str = "file://";
+        if let Some(uri) = uri.strip_prefix(LOCAL_PROTOCOL) {
             Ok(GetResult::File(LocalFile {
-                path: file.into(),
+                path: uri.into(),
                 range,
             }))
         } else {
@@ -173,29 +143,9 @@ impl ObjectSource for LocalSource {
         }
     }
 
-    async fn put(
-        &self,
-        uri: &str,
-        data: bytes::Bytes,
-        _io_stats: Option<IOStatsRef>,
-    ) -> super::Result<()> {
-        if let Some(stripped_uri) = strip_file_uri_to_path(uri) {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true) // truncate file if it already exists...
-                .write(true)
-                .open(stripped_uri)
-                .with_context(|_| UnableToOpenFileForWritingSnafu { path: uri })?;
-            Ok(file
-                .write_all(&data)
-                .with_context(|_| UnableToWriteToFileSnafu { path: uri })?)
-        } else {
-            Err(Error::InvalidFilePath { path: uri.into() }.into())
-        }
-    }
-
     async fn get_size(&self, uri: &str, _io_stats: Option<IOStatsRef>) -> super::Result<usize> {
-        let Some(uri) = strip_file_uri_to_path(uri) else {
+        const LOCAL_PROTOCOL: &str = "file://";
+        let Some(uri) = uri.strip_prefix(LOCAL_PROTOCOL) else {
             return Err(Error::InvalidFilePath { path: uri.into() }.into());
         };
         let meta = tokio::fs::metadata(uri)
@@ -220,7 +170,6 @@ impl ObjectSource for LocalSource {
         _page_size: Option<i32>,
         limit: Option<usize>,
         io_stats: Option<IOStatsRef>,
-        _file_format: Option<FileFormat>,
     ) -> super::Result<BoxStream<'static, super::Result<FileMetadata>>> {
         use crate::object_store_glob::glob;
 
@@ -260,35 +209,7 @@ impl ObjectSource for LocalSource {
         Ok(LSResult {
             files,
             continuation_token: None,
-            not_found_if_empty: false,
         })
-    }
-
-    async fn delete(&self, uri: &str, io_stats: Option<IOStatsRef>) -> super::Result<()> {
-        if let Some(path) = strip_file_uri_to_path(uri) {
-            match tokio::fs::remove_file(path).await {
-                Err(err) => {
-                    use std::io::ErrorKind;
-                    match err.kind() {
-                        ErrorKind::NotFound => Ok(()),
-                        ErrorKind::IsADirectory => Err(super::Error::NotAFile { path: uri.into() }),
-                        _ => Err(Error::UnableToDeleteFile {
-                            path: uri.into(),
-                            source: err,
-                        }
-                        .into()),
-                    }
-                }
-                _ => {
-                    if let Some(is) = io_stats.as_ref() {
-                        is.mark_delete_requests(1);
-                    }
-                    Ok(())
-                }
-            }
-        } else {
-            Err(Error::InvalidFilePath { path: uri.into() }.into())
-        }
     }
 
     async fn iter_dir(
@@ -302,6 +223,7 @@ impl ObjectSource for LocalSource {
             unimplemented!("Prefix-listing is not implemented for local.");
         }
 
+        const LOCAL_PROTOCOL: &str = "file://";
         let uri = if uri.is_empty() {
             std::borrow::Cow::Owned(
                 std::env::current_dir()
@@ -309,7 +231,7 @@ impl ObjectSource for LocalSource {
                     .to_string_lossy()
                     .to_string(),
             )
-        } else if let Some(uri) = strip_file_uri_to_path(uri) {
+        } else if let Some(uri) = uri.strip_prefix(LOCAL_PROTOCOL) {
             std::borrow::Cow::Borrowed(uri)
         } else {
             return Err(Error::InvalidFilePath { path: uri.into() }.into());
@@ -323,7 +245,7 @@ impl ObjectSource for LocalSource {
         if meta.file_type().is_file() {
             // Provided uri points to a file, so only return that file.
             return Ok(futures::stream::iter([Ok(FileMetadata {
-                filepath: local_path_to_file_uri(&uri),
+                filepath: format!("{}{}", LOCAL_PROTOCOL, uri),
                 size: Some(meta.len()),
                 filetype: object_io::FileType::File,
             })])
@@ -358,8 +280,9 @@ impl ObjectSource for LocalSource {
                 })?;
                 Ok(FileMetadata {
                     filepath: format!(
-                        "{}{}",
-                        local_path_to_file_uri(&path),
+                        "{}{}{}",
+                        LOCAL_PROTOCOL,
+                        path,
                         if meta.is_dir() {
                             PATH_SEGMENT_DELIMITER
                         } else {
@@ -377,13 +300,9 @@ impl ObjectSource for LocalSource {
         });
         Ok(file_meta_stream.boxed())
     }
-
-    fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
-    }
 }
 
-pub async fn collect_file(local_file: LocalFile) -> Result<Bytes> {
+pub(crate) async fn collect_file(local_file: LocalFile) -> Result<Bytes> {
     let path = &local_file.path;
     let mut file = tokio::fs::File::open(path)
         .await
@@ -422,15 +341,13 @@ pub async fn collect_file(local_file: LocalFile) -> Result<Bytes> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{default, io::Write};
 
-    use crate::{
-        HttpSource, LocalSource, Result,
-        integrations::test_full_get,
-        local_path_to_file_uri,
-        object_io::{FileMetadata, FileType, ObjectSource},
-    };
+mod tests {
+    use std::io::Write;
+
+    use crate::object_io::{FileMetadata, FileType, ObjectSource};
+    use crate::Result;
+    use crate::{HttpSource, LocalSource};
 
     async fn write_remote_parquet_to_local_file(
         f: &mut tempfile::NamedTempFile,
@@ -438,7 +355,7 @@ mod tests {
         let parquet_file_path = "https://daft-public-data.s3.us-west-2.amazonaws.com/test_fixtures/parquet_small/0dad4c3f-da0d-49db-90d8-98684571391b-0.parquet";
         let parquet_expected_md5 = "929674747af64a98aceaa6d895863bd3";
 
-        let client = HttpSource::get_client(&default::Default::default()).await?;
+        let client = HttpSource::get_client().await?;
         let parquet_file = client.get(parquet_file_path, None, None).await?;
         let bytes = parquet_file.bytes().await?;
         let all_bytes = bytes.as_ref();
@@ -457,7 +374,46 @@ mod tests {
         let parquet_file_path = format!("file://{}", file1.path().to_str().unwrap());
         let client = LocalSource::get_client().await?;
 
-        test_full_get(client, &parquet_file_path, &bytes).await
+        let try_all_bytes = client
+            .get(&parquet_file_path, None, None)
+            .await?
+            .bytes()
+            .await?;
+        assert_eq!(try_all_bytes.len(), bytes.len());
+        assert_eq!(try_all_bytes, bytes);
+
+        let first_bytes = client
+            .get_range(&parquet_file_path, 0..10, None)
+            .await?
+            .bytes()
+            .await?;
+        assert_eq!(first_bytes.len(), 10);
+        assert_eq!(first_bytes.as_ref(), &bytes[..10]);
+
+        let first_bytes = client
+            .get_range(&parquet_file_path, 10..100, None)
+            .await?
+            .bytes()
+            .await?;
+        assert_eq!(first_bytes.len(), 90);
+        assert_eq!(first_bytes.as_ref(), &bytes[10..100]);
+
+        let last_bytes = client
+            .get_range(
+                &parquet_file_path,
+                (bytes.len() - 10)..(bytes.len() + 10),
+                None,
+            )
+            .await?
+            .bytes()
+            .await?;
+        assert_eq!(last_bytes.len(), 10);
+        assert_eq!(last_bytes.as_ref(), &bytes[(bytes.len() - 10)..]);
+
+        let size_from_get_size = client.get_size(parquet_file_path.as_str(), None).await?;
+        assert_eq!(size_from_get_size, bytes.len());
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -469,37 +425,38 @@ mod tests {
         write_remote_parquet_to_local_file(&mut file2).await?;
         let mut file3 = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
         write_remote_parquet_to_local_file(&mut file3).await?;
-        // Build canonical file:// URIs for both input and expected output. Using the
-        // shared helper so this stays in sync with what `iter_dir` emits — POSIX gets
-        // `file:///tmp/...`, Windows gets `file:///C:/Users/...` (three slashes).
-        let dir_path_str = dir.path().to_string_lossy().replace('\\', "/");
-        let dir_path = local_path_to_file_uri(&dir_path_str);
+        let dir_path = format!("file://{}", dir.path().to_string_lossy().replace('\\', "/"));
         let client = LocalSource::get_client().await?;
 
         let ls_result = client.ls(dir_path.as_ref(), true, None, None, None).await?;
         let mut files = ls_result.files.clone();
         // Ensure stable sort ordering of file paths before comparing with expected payload.
         files.sort_by(|a, b| a.filepath.cmp(&b.filepath));
-        let expected_filepath = |file: &tempfile::NamedTempFile| {
-            local_path_to_file_uri(&format!(
-                "{}/{}",
-                dir_path_str,
-                file.path().file_name().unwrap().to_string_lossy(),
-            ))
-        };
         let mut expected = vec![
             FileMetadata {
-                filepath: expected_filepath(&file1),
+                filepath: format!(
+                    "file://{}/{}",
+                    dir.path().to_string_lossy().replace('\\', "/"),
+                    file1.path().file_name().unwrap().to_string_lossy(),
+                ),
                 size: Some(file1.as_file().metadata().unwrap().len()),
                 filetype: FileType::File,
             },
             FileMetadata {
-                filepath: expected_filepath(&file2),
+                filepath: format!(
+                    "file://{}/{}",
+                    dir.path().to_string_lossy().replace('\\', "/"),
+                    file2.path().file_name().unwrap().to_string_lossy(),
+                ),
                 size: Some(file2.as_file().metadata().unwrap().len()),
                 filetype: FileType::File,
             },
             FileMetadata {
-                filepath: expected_filepath(&file3),
+                filepath: format!(
+                    "file://{}/{}",
+                    dir.path().to_string_lossy().replace('\\', "/"),
+                    file3.path().file_name().unwrap().to_string_lossy(),
+                ),
                 size: Some(file3.as_file().metadata().unwrap().len()),
                 filetype: FileType::File,
             },

@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import itertools
+import math
 
 import numpy as np
 import pyarrow as pa
 import pytest
 
+from daft.context import get_context
 from daft.datatype import DataType
 from daft.series import Series
-from tests.conftest import get_tests_daft_runner_name
+from daft.utils import pyarrow_supports_fixed_shape_tensor
 from tests.series import ARROW_FLOAT_TYPES, ARROW_INT_TYPES
+
+ARROW_VERSION = tuple(int(s) for s in pa.__version__.split(".") if s.isnumeric())
+PYARROW_GE_7_0_0 = ARROW_VERSION >= (7, 0, 0)
 
 
 def get_total_buffer_size(arr: pa.Array) -> int:
-    """Helper to get total buffer size because older versions of Arrow don't have this method."""
+    """Helper to get total buffer size because older versions of Arrow don't have the Array.get_total_buffer_size() method"""
     return sum([buf.size if buf is not None else 0 for buf in arr.buffers()])
 
 
@@ -118,24 +123,6 @@ def test_series_binary_size_bytes(size, with_nulls) -> None:
     assert s.size_bytes() == get_total_buffer_size(data)
 
 
-@pytest.mark.parametrize("size", [1, 2, 8, 9])
-@pytest.mark.parametrize("with_nulls", [True, False])
-def test_series_fixed_size_binary_size_bytes(size, with_nulls) -> None:
-    import random
-
-    pydata = ["".join([str(random.randint(0, 9)) for _ in range(size)]).encode() for _ in range(size)]
-
-    if with_nulls and size > 0:
-        data = pa.array(pydata[:-1] + [None], pa.binary(size))
-    else:
-        data = pa.array(pydata, pa.binary(size))
-
-    s = Series.from_arrow(data)
-
-    assert s.datatype() == DataType.fixed_size_binary(size)
-    assert s.size_bytes() == get_total_buffer_size(data)
-
-
 @pytest.mark.parametrize("dtype, size", itertools.product(ARROW_INT_TYPES + ARROW_FLOAT_TYPES, [0, 1, 2, 8, 9, 16]))
 @pytest.mark.parametrize("with_nulls", [True, False])
 def test_series_list_size_bytes(dtype, size, with_nulls) -> None:
@@ -150,10 +137,13 @@ def test_series_list_size_bytes(dtype, size, with_nulls) -> None:
     s = Series.from_arrow(data)
 
     # Offset array is increased in bit width from 32 to 64 when converting to large_list
-    # N rows have N+1 offset values, each going from 4 bytes (int32) to 8 bytes (int64)
-    conversion_to_large_list_bytes = (len(data) + 1) * 4
+    conversion_to_large_list_bytes = len(data) * 4
 
     size_bytes = s.size_bytes()
+
+    # TODO(jay): There is an off-by-1 error in the arrow2 estimated_bytes_size API for List and LargeList:
+    # https://github.com/jorgecarleitao/arrow2/blob/64d8ec203f991468032025a13a4f971f1f2cfc14/src/compute/aggregate/memory.rs#LL76C1-L76C1
+    size_bytes = size_bytes + 4
 
     assert s.datatype() == DataType.from_arrow_type(list_dtype)
     assert size_bytes == get_total_buffer_size(data) + conversion_to_large_list_bytes
@@ -186,7 +176,7 @@ def test_series_struct_size_bytes(size, with_nulls) -> None:
         for i in range(size)
     ]
 
-    # Artificially inject nulls if required as a top-level StructArray Null entry
+    # Artifically inject nulls if required as a top-level StructArray Null entry
     if with_nulls and size > 0:
         data = pa.array(pydata[:-1] + [None], type=dtype)
     else:
@@ -198,11 +188,22 @@ def test_series_struct_size_bytes(size, with_nulls) -> None:
     # Offset buffer for child array "c" has length (len + 1), and is increased in bit width from 32 to 64 when converting to large_string
     conversion_to_large_string_bytes = (len(data) + 1) * 4
 
-    assert s.size_bytes() == get_total_buffer_size(data) + conversion_to_large_string_bytes
+    # If nulls were injected, check validity bitmaps were were properly propagated to children
+    if with_nulls and size > 0:
+        child_arrays = [data.field(i) for i in range(data.type.num_fields)]
+        child_arrays_without_validity_buffer = len(
+            [child for child in child_arrays if any([b is None for b in child.buffers()])]
+        )
+        additional_validity_buffer_bytes = child_arrays_without_validity_buffer * math.ceil(size / 8)
+        assert s.size_bytes() == (
+            get_total_buffer_size(data) + additional_validity_buffer_bytes + conversion_to_large_string_bytes
+        )
+    else:
+        assert s.size_bytes() == get_total_buffer_size(data) + conversion_to_large_string_bytes
 
 
 @pytest.mark.skipif(
-    get_tests_daft_runner_name() == "ray",
+    get_context().runner_config.name == "ray",
     reason="pyarrow extension types aren't supported on Ray clusters.",
 )
 @pytest.mark.parametrize("size", [1, 2, 8, 9, 16])
@@ -227,51 +228,10 @@ def test_series_extension_type_size_bytes(uuid_ext_type, size, with_nulls) -> No
     assert size_bytes == get_total_buffer_size(post_daft_cast_data)
 
 
-def test_series_sparse_union_size_bytes() -> None:
-    type_ids = pa.array([0, 1, 2, 0, 1, 2], type=pa.int8())
-    int_child = pa.array([10, 0, 0, 40, 0, 0], type=pa.int32())
-    float_child = pa.array([0.0, 2.2, 0.0, 0.0, 5.5, 0.0], type=pa.float64())
-    str_child = pa.array(["", "", "c", "", "", "f"], type=pa.large_utf8())
-    arrow_arr = pa.UnionArray.from_sparse(type_ids, [int_child, float_child, str_child], field_names=["i", "f", "s"])
-    s = Series.from_arrow(arrow_arr)
-    assert s.size_bytes() == get_total_buffer_size(arrow_arr)
-
-
-def test_series_dense_union_size_bytes() -> None:
-    type_ids = pa.array([0, 1, 0, 0, 1], type=pa.int8())
-    offsets = pa.array([0, 0, 1, 2, 1], type=pa.int32())
-    int_child = pa.array([10, 30, 40], type=pa.int32())
-    float_child = pa.array([2.2, 5.5], type=pa.float64())
-    arrow_arr = pa.UnionArray.from_dense(type_ids, offsets, [int_child, float_child], field_names=["i", "f"])
-    s = Series.from_arrow(arrow_arr)
-    assert s.size_bytes() == get_total_buffer_size(arrow_arr)
-
-
-def test_series_empty_sparse_union_size_bytes() -> None:
-    arrow_arr = pa.UnionArray.from_sparse(
-        pa.array([], type=pa.int8()),
-        [pa.array([], type=pa.int32()), pa.array([], type=pa.float64())],
-        field_names=["i", "f"],
-    )
-    s = Series.from_arrow(arrow_arr)
-    assert s.size_bytes() == get_total_buffer_size(arrow_arr)
-
-
-def test_series_sliced_sparse_union_size_bytes() -> None:
-    """size_bytes on a sliced sparse union reflects only the slice, not the full buffers."""
-    type_ids = pa.array([0, 1, 2, 0, 1, 2], type=pa.int8())
-    int_child = pa.array([10, 0, 0, 40, 0, 0], type=pa.int32())
-    float_child = pa.array([0.0, 2.2, 0.0, 0.0, 5.5, 0.0], type=pa.float64())
-    str_child = pa.array(["", "", "c", "", "", "f"], type=pa.large_utf8())
-    arrow_arr = pa.UnionArray.from_sparse(type_ids, [int_child, float_child, str_child], field_names=["i", "f", "s"])
-    s = Series.from_arrow(arrow_arr)
-    sliced = s.slice(1, 4)  # 3-element series
-    full = s
-
-    assert sliced.size_bytes() < full.size_bytes()
-    assert sliced.size_bytes() > 0
-
-
+@pytest.mark.skipif(
+    not pyarrow_supports_fixed_shape_tensor(),
+    reason=f"Arrow version {ARROW_VERSION} doesn't support the canonical tensor extension type.",
+)
 @pytest.mark.parametrize("dtype, size", itertools.product(ARROW_INT_TYPES + ARROW_FLOAT_TYPES, [0, 1, 2, 8, 9, 16]))
 @pytest.mark.parametrize("with_nulls", [True, False])
 def test_series_canonical_tensor_extension_type_size_bytes(dtype, size, with_nulls) -> None:

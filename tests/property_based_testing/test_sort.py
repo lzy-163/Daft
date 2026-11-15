@@ -30,13 +30,13 @@ MAX_NUM_SORT_COLS = 3
 
 
 def _is_nan(obj: Any) -> bool:
-    """Checks if an object is a float NaN."""
+    """Checks if an object is a float NaN"""
     return isinstance(obj, float) and math.isnan(obj)
 
 
 @settings(max_examples=int(os.getenv("HYPOTHESIS_MAX_EXAMPLES", 100)), stateful_step_count=8, deadline=None)
 class DataframeSortStateMachine(RuleBasedStateMachine):
-    """Tests sorts in the face of various other operations such as filters, projections etc.
+    """Tests sorts in the face of various other operations such as filters, projections etc
 
     Creates N number of sort key columns named "sort_key_{i}", and one "row_num" column which enumerates the original row number.
 
@@ -58,7 +58,7 @@ class DataframeSortStateMachine(RuleBasedStateMachine):
     @rule(data=data(), num_sort_cols=integers(min_value=1, max_value=MAX_NUM_SORT_COLS))
     @precondition(lambda self: self.df is None)
     def newdataframe(self, data, num_sort_cols):
-        """Start node of the state machine, creates an initial dataframe."""
+        """Start node of the state machine, creates an initial dataframe"""
         self.sort_keys = [f"sort_key_{i}" for i in range(num_sort_cols)]
 
         columns_dict_data = data.draw(
@@ -75,7 +75,7 @@ class DataframeSortStateMachine(RuleBasedStateMachine):
     @rule(data=data())
     @precondition(lambda self: self.df is not None)
     def run_sort(self, data):
-        """Run a sort on the accumulated dataframe plan."""
+        """Run a sort on the accumulated dataframe plan"""
         sort_on = data.draw(permutations(self.sort_keys))
         descending = data.draw(lists(min_size=len(self.sort_keys), max_size=len(self.sort_keys), elements=booleans()))
         self.df = self.df.sort(sort_on, desc=descending)
@@ -84,7 +84,7 @@ class DataframeSortStateMachine(RuleBasedStateMachine):
     @rule()
     @precondition(lambda self: self.sorted_on is not None)
     def collect_after_sort(self):
-        """Optionally runs after any sort step to check that sort is maintained."""
+        """Optionally runs after any sort step to check that sort is maintained"""
         sorted_data = self.df.to_pydict()
         sorted_on_cols = [c for c, _ in self.sorted_on]
         sorted_on_desc = [d for _, d in self.sorted_on]
@@ -108,7 +108,9 @@ class DataframeSortStateMachine(RuleBasedStateMachine):
 
                     # Assert that a >= b, where the ordering is defined as: None > NaN > other values
                     # `continue` checking lex sort if values are equal, but `break` if they are not equal
-                    if a is None and b is None or _is_nan(a) and _is_nan(b):
+                    if a is None and b is None:
+                        continue
+                    elif _is_nan(a) and _is_nan(b):
                         continue
                     elif a is None and _is_nan(b):
                         break
@@ -127,9 +129,9 @@ class DataframeSortStateMachine(RuleBasedStateMachine):
                     assert a is not None and not _is_nan(a)
                     assert b is not None and not _is_nan(b)
 
-                    assert a >= b, (
-                        f"current_val={current_val} vs next_val={next_val} is an invalid sort order for desc={desc}"
-                    )
+                    assert (
+                        a >= b
+                    ), f"current_val={current_val} vs next_val={next_val} is an invalid sort order for desc={desc}"
                     if a != b:
                         break
 
@@ -150,7 +152,7 @@ class DataframeSortStateMachine(RuleBasedStateMachine):
     @rule(data=data())
     @precondition(lambda self: self.df is not None)
     def repartition_df(self, data):
-        """Runs a repartitioning step."""
+        """Runs a repartitioning step"""
         num_partitions = data.draw(
             self.repartition_num_partitions_strategy, label="Number of partitions for repartitioning"
         )
@@ -162,7 +164,7 @@ class DataframeSortStateMachine(RuleBasedStateMachine):
     @rule(data=data())
     @precondition(lambda self: self.df is not None)
     def filter_df(self, data):
-        """Runs a filter on a simple equality predicate on a random column."""
+        """Runs a filter on a simple equality predicate on a random column"""
         assert self.df is not None
         col_name_to_filter = data.draw(sampled_from(self.df.schema().column_names()), label="Column to filter on")
         col_daft_type = self.df.schema()[col_name_to_filter].dtype
@@ -171,7 +173,10 @@ class DataframeSortStateMachine(RuleBasedStateMachine):
         if col_daft_type == DataType.bool():
             self.df = self.df.where(self.df[col_name_to_filter])
         # Reject if filtering on a null column - not a meaningful operation
-        elif col_daft_type == DataType.null() or col_daft_type == DataType.binary():
+        elif col_daft_type == DataType.null():
+            reject()
+        # Reject for binary types because they are not comparable yet (TODO: https://github.com/Eventual-Inc/Daft/issues/688)
+        elif col_daft_type == DataType.binary():
             reject()
         else:
             filter_value = data.draw(generate_data(col_daft_type), label="Filter value")
@@ -180,7 +185,7 @@ class DataframeSortStateMachine(RuleBasedStateMachine):
     @rule(data=data())
     @precondition(lambda self: self.df is not None)
     def project_df(self, data):
-        """Runs a projection on a random column, replacing it."""
+        """Runs a projection on a random column, replacing it"""
         assert self.df is not None
         column_name = data.draw(sampled_from(self.df.schema().column_names()), label="Column to filter on")
         column_daft_type = self.df.schema()[column_name].dtype
@@ -191,7 +196,7 @@ class DataframeSortStateMachine(RuleBasedStateMachine):
             DataType.float64(): lambda e, other: e + other,
             DataType.bool(): lambda e, other: e | other,
             # No meaningful binary operations supported for these yet
-            DataType.date(): lambda e, other: e.year(),
+            DataType.date(): lambda e, other: e.dt.year(),
             DataType.binary(): lambda e, other: e,
             DataType.null(): lambda e, other: e,
         }

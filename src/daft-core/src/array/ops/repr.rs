@@ -1,26 +1,21 @@
-use common_display::table_display::StrValue;
+use base64::Engine;
+
+use crate::{
+    array::{DataArray, FixedSizeListArray, ListArray, StructArray},
+    datatypes::{
+        logical::{
+            DateArray, Decimal128Array, DurationArray, EmbeddingArray, FixedShapeImageArray,
+            FixedShapeTensorArray, ImageArray, MapArray, TensorArray, TimeArray, TimestampArray,
+        },
+        BinaryArray, BooleanArray, DaftNumericType, ExtensionArray, ImageFormat, NullArray,
+        UInt64Array, Utf8Array,
+    },
+    utils::display_table::{display_date32, display_decimal128, display_time64, display_timestamp},
+    with_match_daft_types, DataType, Series,
+};
 use common_error::DaftResult;
 
-#[cfg(feature = "python")]
-use crate::prelude::PythonArray;
-use crate::{
-    array::{DataArray, FixedSizeListArray, ListArray, StructArray, UnionArray, UuidArray},
-    datatypes::{
-        BinaryArray, BooleanArray, DaftNumericType, DataType, Decimal128Array, ExtensionArray,
-        Field, FileArray, FixedSizeBinaryArray, IntervalArray, IntervalValue, NullArray,
-        UInt64Array, Utf8Array,
-        logical::{
-            DateArray, DurationArray, EmbeddingArray, FixedShapeImageArray,
-            FixedShapeSparseTensorArray, FixedShapeTensorArray, ImageArray, MapArray,
-            SparseTensorArray, TensorArray, TimeArray, TimestampArray,
-        },
-    },
-    file::DaftMediaType,
-    series::Series,
-    utils::display::{
-        display_date32, display_decimal128, display_duration, display_time64, display_timestamp,
-    },
-};
+use super::image::AsImageObj;
 
 // Default implementation of str_value: format the value with the given format string.
 macro_rules! impl_array_str_value {
@@ -38,20 +33,8 @@ macro_rules! impl_array_str_value {
 }
 
 impl_array_str_value!(BooleanArray, "{}");
-
-impl ExtensionArray {
-    pub fn str_value(&self, idx: usize) -> DaftResult<String> {
-        if !self.is_valid(idx) {
-            return Ok("None".to_string());
-        }
-        let DataType::Extension(_, inner_dtype, _) = &self.field.dtype else {
-            return Ok(format!("{:?}", self.get(idx)));
-        };
-        let inner_field = Field::new(&*self.field.name, inner_dtype.as_ref().clone());
-        let inner_series = Series::from_arrow(inner_field, self.to_arrow())?;
-        inner_series.str_value_result(idx)
-    }
-}
+impl_array_str_value!(ExtensionArray, "{:?}");
+impl_array_str_value!(DurationArray, "{}");
 
 fn pretty_print_bytes(bytes: &[u8], max_len: usize) -> DaftResult<String> {
     /// influenced by pythons bytes repr
@@ -93,7 +76,7 @@ fn pretty_print_bytes(bytes: &[u8], max_len: usize) -> DaftResult<String> {
         builder.push_str(POSTFIX);
     } else {
         builder.push_str(POSTFIX_TRUNC);
-    }
+    };
 
     Ok(builder)
 }
@@ -122,12 +105,9 @@ impl Utf8Array {
 }
 impl NullArray {
     pub fn str_value(&self, idx: usize) -> DaftResult<String> {
-        assert!(
-            idx < self.len(),
-            "Out of bounds: {} vs len: {}",
-            idx,
-            self.len()
-        );
+        if idx >= self.len() {
+            panic!("Out of bounds: {} vs len: {}", idx, self.len())
+        }
         Ok("None".to_string())
     }
 }
@@ -143,36 +123,19 @@ impl BinaryArray {
         }
     }
 }
-
-impl FixedSizeBinaryArray {
-    pub fn str_value(&self, idx: usize) -> DaftResult<String> {
-        let val = self.get(idx);
-        match val {
-            None => Ok("None".to_string()),
-            Some(v) => {
-                const LEN_TO_TRUNC: usize = 40;
-                pretty_print_bytes(v, LEN_TO_TRUNC)
-            }
-        }
-    }
-}
-
 #[cfg(feature = "python")]
-impl PythonArray {
+impl crate::datatypes::PythonArray {
     pub fn str_value(&self, idx: usize) -> DaftResult<String> {
         use pyo3::prelude::*;
 
         let val = self.get(idx);
 
-        if let Some(val) = val {
-            Ok(Python::attach(|py| {
-                val.bind(py)
-                    .call_method0(pyo3::intern!(py, "__str__"))?
-                    .extract()
-            })?)
-        } else {
-            Ok("None".to_string())
-        }
+        let call_result =
+            Python::with_gil(|py| val.call_method0(py, pyo3::intern!(py, "__str__")))?;
+
+        let extracted = Python::with_gil(|py| call_result.extract(py))?;
+
+        Ok(extracted)
     }
 }
 
@@ -216,34 +179,6 @@ impl TimestampArray {
     }
 }
 
-impl DurationArray {
-    pub fn str_value(&self, idx: usize) -> DaftResult<String> {
-        let res = self.get(idx).map_or_else(
-            || "None".to_string(),
-            |val| -> String {
-                let DataType::Duration(time_unit) = &self.field.dtype else {
-                    panic!("Wrong dtype for DurationArray: {}", self.field.dtype)
-                };
-                display_duration(val, time_unit)
-            },
-        );
-        Ok(res)
-    }
-}
-
-impl IntervalArray {
-    pub fn str_value(&self, idx: usize) -> DaftResult<String> {
-        let res = self.get(idx).map_or_else(
-            || "None".to_string(),
-            |v| -> String {
-                let value: IntervalValue = v.into();
-                format!("{value}")
-            },
-        );
-        Ok(res)
-    }
-}
-
 impl Decimal128Array {
     pub fn str_value(&self, idx: usize) -> DaftResult<String> {
         let res = self.get(idx).map_or_else(
@@ -262,15 +197,14 @@ impl Decimal128Array {
 
 /// Helper that prints a Series as a list ("[e1, e2, e3, ...]")
 fn series_as_list_str(series: &Series) -> DaftResult<String> {
-    let mut s = String::new();
-    s += "[";
-    s += (0..series.len())
-        .map(|i| series.str_value_result(i))
-        .collect::<DaftResult<Vec<String>>>()?
-        .join(", ")
-        .as_str();
-    s += "]";
-    Ok(s)
+    with_match_daft_types!(series.data_type(), |$T| {
+        let arr = series.downcast::<<$T as DaftDataType>::ArrayType>()?;
+        let mut s = String::new();
+        s += "[";
+        s += (0..series.len()).map(|i| arr.str_value(i)).collect::<DaftResult<Vec<String>>>()?.join(", ").as_str();
+        s += "]";
+        Ok(s)
+    })
 }
 
 impl ListArray {
@@ -298,70 +232,15 @@ impl MapArray {
         let val = self.get(idx);
         match val {
             None => Ok("None".to_string()),
-            Some(v) => {
-                let struct_arr = v.struct_()?;
-                let keys = struct_arr.get("key")?;
-                let values = struct_arr.get("value")?;
-                let pairs: Vec<String> = (0..keys.len())
-                    .map(|i| {
-                        let key_str = if matches!(keys.data_type(), DataType::Utf8) {
-                            format!("\"{}\"", keys.str_value(i))
-                        } else {
-                            keys.str_value(i)
-                        };
-                        format!("{}: {}", key_str, values.str_value(i))
-                    })
-                    .collect();
-                Ok(format!("{{{}}}", pairs.join(", ")))
-            }
+            Some(v) => series_as_list_str(&v),
         }
     }
-}
-
-fn sparkline_from_floats(values: &[f32], num_bins: usize) -> String {
-    const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-    if values.is_empty() {
-        return String::new();
-    }
-
-    // Compute bin size (last bin may be smaller)
-    let bin_size = (values.len() as f32 / num_bins as f32).ceil() as usize;
-
-    let mut bins = Vec::with_capacity(num_bins);
-
-    for i in (0..values.len()).step_by(bin_size) {
-        let end = usize::min(i + bin_size, values.len());
-        let slice = &values[i..end];
-        let energy = slice.iter().copied().map(|x| x * x).sum::<f32>() / slice.len() as f32;
-        bins.push(energy.sqrt());
-    }
-
-    // Normalize bins to 0-1
-    let min = bins.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = bins.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let range = (max - min).max(1e-8); // avoid division by 0
-
-    bins.iter()
-        .map(|&v| {
-            let norm = (v - min) / range;
-            let idx = (norm * (SPARK_CHARS.len() as f32 - 1.0)).round() as usize;
-            SPARK_CHARS[idx]
-        })
-        .collect()
 }
 
 impl EmbeddingArray {
     pub fn str_value(&self, idx: usize) -> DaftResult<String> {
         if self.physical.is_valid(idx) {
-            let value = self
-                .get(idx)
-                .expect("str_value should only be called in bounds");
-            let value_casted = value.cast(&DataType::Float32)?;
-            let value_f32 = value_casted.f32()?;
-            let slice = value_f32.as_slice();
-            let sparkline = sparkline_from_floats(slice, 24);
-            Ok(sparkline)
+            Ok("<Embedding>".to_string())
         } else {
             Ok("None".to_string())
         }
@@ -372,44 +251,6 @@ impl ImageArray {
     pub fn str_value(&self, idx: usize) -> DaftResult<String> {
         if self.physical.is_valid(idx) {
             Ok("<Image>".to_string())
-        } else {
-            Ok("None".to_string())
-        }
-    }
-}
-
-impl SparseTensorArray {
-    pub fn str_value(&self, idx: usize) -> DaftResult<String> {
-        // Shapes are always valid, use values array validity
-        let is_valid = self.values_array().nulls().is_none_or(|v| v.is_valid(idx));
-        let shape_element = if is_valid {
-            self.shape_array().get(idx)
-        } else {
-            None
-        };
-        match shape_element {
-            Some(shape) => Ok(format!(
-                "<SparseTensor shape=({})>",
-                shape
-                    .downcast::<UInt64Array>()
-                    .unwrap()
-                    .into_iter()
-                    .map(|dim| match dim {
-                        None => "None".to_string(),
-                        Some(dim) => dim.to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-            None => Ok("None".to_string()),
-        }
-    }
-}
-
-impl FixedShapeSparseTensorArray {
-    pub fn str_value(&self, idx: usize) -> DaftResult<String> {
-        if self.physical.is_valid(idx) {
-            Ok("<FixedShapeSparseTensor>".to_string())
         } else {
             Ok("None".to_string())
         }
@@ -469,7 +310,8 @@ impl StructArray {
                     let fields_to_strs = fields
                         .iter()
                         .zip(self.children.iter())
-                        .map(|(f, s)| Ok(format!("{}: {},\n", f.name.as_ref(), s.str_value(idx))))
+                        .filter(|(f, _)| !f.name.is_empty() && f.dtype != DataType::Null)
+                        .map(|(f, s)| Ok(format!("{}: {},\n", f.name.as_str(), s.str_value(idx)?)))
                         .collect::<DaftResult<Vec<_>>>()?;
                     let mut result = "{".to_string();
                     for line in fields_to_strs {
@@ -486,66 +328,13 @@ impl StructArray {
     }
 }
 
-impl UnionArray {
-    pub fn str_value(&self, idx: usize) -> DaftResult<String> {
-        Ok(self.get_lit(idx).to_string())
-    }
-}
-
-impl<T> FileArray<T>
-where
-    T: DaftMediaType,
-{
-    pub fn str_value(&self, idx: usize) -> DaftResult<String> {
-        Ok(self.get_lit(idx).to_string())
-    }
-}
-
-impl UuidArray {
-    pub fn str_value(&self, idx: usize) -> DaftResult<String> {
-        let val = self.physical.get(idx);
-        match val {
-            None => Ok("None".to_string()),
-            Some(bytes) => {
-                if let Ok(uuid) = uuid::Uuid::from_slice(bytes) {
-                    Ok(uuid.to_string())
-                } else {
-                    Ok("invalid-uuid".to_string())
-                }
-            }
-        }
-    }
-}
-
-// Truncate strings so they do not crash the browser when rendering HTML
-fn truncate_for_html(s: &str) -> String {
-    // Limit string length to 1MB to prevent browser crashes
-    const MAX_HTML_STRING_LEN: usize = 1024 * 1024; // 1MB
-
-    if s.len() > MAX_HTML_STRING_LEN {
-        // Find the last character boundary at or before MAX_HTML_STRING_LEN
-        let mut end_idx = MAX_HTML_STRING_LEN;
-        while !s.is_char_boundary(end_idx) && end_idx > 0 {
-            end_idx -= 1;
-        }
-        format!("{}...", &s[..end_idx])
-    } else {
-        s.to_string()
-    }
-}
-
-// Default implementation of html_value: html escape the str_value with truncation.
+// Default implementation of html_value: html escape the str_value.
 macro_rules! impl_array_html_value {
     ($ArrayT:ty) => {
         impl $ArrayT {
-            pub fn html_value(&self, idx: usize, truncate: bool) -> String {
+            pub fn html_value(&self, idx: usize) -> String {
                 let str_value = self.str_value(idx).unwrap();
-                let truncated = if truncate {
-                    truncate_for_html(&str_value)
-                } else {
-                    str_value
-                };
-                html_escape::encode_text(&truncated)
+                html_escape::encode_text(&str_value)
                     .into_owned()
                     .replace('\n', "<br />")
             }
@@ -553,25 +342,10 @@ macro_rules! impl_array_html_value {
     };
 }
 
-impl Utf8Array {
-    pub fn html_value(&self, idx: usize, truncate: bool) -> String {
-        let str_value = self.str_value(idx).unwrap();
-        let truncated = if truncate {
-            truncate_for_html(&str_value)
-        } else {
-            str_value
-        };
-        html_escape::encode_text(&truncated)
-            .into_owned()
-            .replace('\n', "<br />")
-    }
-}
-
+impl_array_html_value!(Utf8Array);
 impl_array_html_value!(BooleanArray);
 impl_array_html_value!(NullArray);
 impl_array_html_value!(BinaryArray);
-impl_array_html_value!(FixedSizeBinaryArray);
-impl_array_html_value!(UuidArray);
 impl_array_html_value!(ListArray);
 impl_array_html_value!(FixedSizeListArray);
 impl_array_html_value!(MapArray);
@@ -581,51 +355,37 @@ impl_array_html_value!(Decimal128Array);
 impl_array_html_value!(DateArray);
 impl_array_html_value!(TimeArray);
 impl_array_html_value!(DurationArray);
-impl_array_html_value!(IntervalArray);
 impl_array_html_value!(TimestampArray);
 impl_array_html_value!(EmbeddingArray);
-impl_array_html_value!(UnionArray);
 
 #[cfg(feature = "python")]
-impl PythonArray {
-    pub fn html_value(&self, idx: usize, truncate: bool) -> String {
+impl crate::datatypes::PythonArray {
+    pub fn html_value(&self, idx: usize) -> String {
         use pyo3::prelude::*;
 
         let val = self.get(idx);
 
-        let custom_viz_hook_result: Option<String> = Python::attach(|py| {
-            if let Some(val) = val {
-                // Find visualization hooks for this object's class
-                let pyany = val.bind(py);
-                let get_viz_hook = py
-                    .import(pyo3::intern!(py, "daft.viz.html_viz_hooks"))?
-                    .getattr(pyo3::intern!(py, "get_viz_hook"))?;
-                let hook = get_viz_hook.call1((pyany,))?;
+        let custom_viz_hook_result: Option<String> = Python::with_gil(|py| {
+            // Find visualization hooks for this object's class
+            let pyany = val.into_ref(py);
+            let get_viz_hook = py
+                .import("daft.viz.html_viz_hooks")?
+                .getattr("get_viz_hook")?;
+            let hook = get_viz_hook.call1((pyany,))?;
 
-                if hook.is_none() {
-                    Ok(None)
-                } else {
-                    hook.call1((pyany,))?.extract()
-                }
-            } else {
+            if hook.is_none() {
                 Ok(None)
+            } else {
+                hook.call1((pyany,))?.extract()
             }
         })
         .unwrap();
 
         match custom_viz_hook_result {
-            None => {
-                let str_value = self.str_value(idx).unwrap();
-                let truncated = if truncate {
-                    truncate_for_html(&str_value)
-                } else {
-                    str_value
-                };
-                html_escape::encode_text(&truncated)
-                    .into_owned()
-                    .replace('\n', "<br />")
-            }
-            Some(result) => truncate_for_html(&result),
+            None => html_escape::encode_text(&self.str_value(idx).unwrap())
+                .into_owned()
+                .replace('\n', "<br />"),
+            Some(result) => result,
         }
     }
 }
@@ -634,87 +394,73 @@ impl<T> DataArray<T>
 where
     T: DaftNumericType,
 {
-    pub fn html_value(&self, idx: usize, truncate: bool) -> String {
+    pub fn html_value(&self, idx: usize) -> String {
         let str_value = self.str_value(idx).unwrap();
-        let truncated = if truncate {
-            truncate_for_html(&str_value)
-        } else {
-            str_value
-        };
-        html_escape::encode_text(&truncated)
+        html_escape::encode_text(&str_value)
             .into_owned()
             .replace('\n', "<br />")
     }
 }
 
+impl ImageArray {
+    pub fn html_value(&self, idx: usize) -> String {
+        let maybe_image = self.as_image_obj(idx);
+        let str_val = self.str_value(idx).unwrap();
+
+        match maybe_image {
+            None => "None".to_string(),
+            Some(image) => {
+                let thumb = image.fit_to(128, 128);
+                let mut bytes: Vec<u8> = vec![];
+                let mut writer = std::io::BufWriter::new(std::io::Cursor::new(&mut bytes));
+                thumb.encode(ImageFormat::JPEG, &mut writer).unwrap();
+                drop(writer);
+                format!(
+                    "<img style=\"max-height:128px;width:auto\" src=\"data:image/png;base64, {}\" alt=\"{}\" />",
+                    base64::engine::general_purpose::STANDARD.encode(&mut bytes),
+                    str_val,
+                )
+            }
+        }
+    }
+}
+
+impl FixedShapeImageArray {
+    pub fn html_value(&self, idx: usize) -> String {
+        let maybe_image = self.as_image_obj(idx);
+        let str_val = self.str_value(idx).unwrap();
+
+        match maybe_image {
+            None => "None".to_string(),
+            Some(image) => {
+                let thumb = image.fit_to(128, 128);
+                let mut bytes: Vec<u8> = vec![];
+                let mut writer = std::io::BufWriter::new(std::io::Cursor::new(&mut bytes));
+                thumb.encode(ImageFormat::JPEG, &mut writer).unwrap();
+                drop(writer);
+                format!(
+                    "<img style=\"max-height:128px;width:auto\" src=\"data:image/png;base64, {}\" alt=\"{}\" />",
+                    base64::engine::general_purpose::STANDARD.encode(&mut bytes),
+                    str_val,
+                )
+            }
+        }
+    }
+}
+
 impl FixedShapeTensorArray {
-    pub fn html_value(&self, idx: usize, truncate: bool) -> String {
+    pub fn html_value(&self, idx: usize) -> String {
         let str_value = self.str_value(idx).unwrap();
-        let truncated = if truncate {
-            truncate_for_html(&str_value)
-        } else {
-            str_value
-        };
-        html_escape::encode_text(&truncated)
+        html_escape::encode_text(&str_value)
             .into_owned()
             .replace('\n', "<br />")
     }
 }
 
 impl TensorArray {
-    pub fn html_value(&self, idx: usize, truncate: bool) -> String {
+    pub fn html_value(&self, idx: usize) -> String {
         let str_value = self.str_value(idx).unwrap();
-        let truncated = if truncate {
-            truncate_for_html(&str_value)
-        } else {
-            str_value
-        };
-        html_escape::encode_text(&truncated)
-            .into_owned()
-            .replace('\n', "<br />")
-    }
-}
-
-impl SparseTensorArray {
-    pub fn html_value(&self, idx: usize, truncate: bool) -> String {
-        let str_value = self.str_value(idx).unwrap();
-        let truncated = if truncate {
-            truncate_for_html(&str_value)
-        } else {
-            str_value
-        };
-        html_escape::encode_text(&truncated)
-            .into_owned()
-            .replace('\n', "<br />")
-    }
-}
-
-impl FixedShapeSparseTensorArray {
-    pub fn html_value(&self, idx: usize, truncate: bool) -> String {
-        let str_value = self.str_value(idx).unwrap();
-        let truncated = if truncate {
-            truncate_for_html(&str_value)
-        } else {
-            str_value
-        };
-        html_escape::encode_text(&truncated)
-            .into_owned()
-            .replace('\n', "<br />")
-    }
-}
-
-impl<T> FileArray<T>
-where
-    T: DaftMediaType,
-{
-    pub fn html_value(&self, idx: usize, truncate: bool) -> String {
-        let str_value = self.str_value(idx).unwrap();
-        let truncated = if truncate {
-            truncate_for_html(&str_value)
-        } else {
-            str_value
-        };
-        html_escape::encode_text(&truncated)
+        html_escape::encode_text(&str_value)
             .into_owned()
             .replace('\n', "<br />")
     }

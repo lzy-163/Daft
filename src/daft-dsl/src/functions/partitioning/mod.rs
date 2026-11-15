@@ -2,14 +2,15 @@ mod evaluators;
 
 use serde::{Deserialize, Serialize};
 
-use super::FunctionEvaluator;
 use crate::{
-    Expr, ExprRef,
     functions::partitioning::evaluators::{
         DaysEvaluator, HoursEvaluator, IcebergBucketEvaluator, IcebergTruncateEvaluator,
         MonthsEvaluator, YearsEvaluator,
     },
+    Expr,
 };
+
+use super::FunctionEvaluator;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum PartitioningExpr {
@@ -24,61 +25,56 @@ pub enum PartitioningExpr {
 impl PartitioningExpr {
     #[inline]
     pub fn get_evaluator(&self) -> &dyn FunctionEvaluator {
+        use PartitioningExpr::*;
         match self {
-            Self::Years => &YearsEvaluator {},
-            Self::Months => &MonthsEvaluator {},
-            Self::Days => &DaysEvaluator {},
-            Self::Hours => &HoursEvaluator {},
-            Self::IcebergBucket(..) => &IcebergBucketEvaluator {},
-            Self::IcebergTruncate(..) => &IcebergTruncateEvaluator {},
+            Years => &YearsEvaluator {},
+            Months => &MonthsEvaluator {},
+            Days => &DaysEvaluator {},
+            Hours => &HoursEvaluator {},
+            IcebergBucket(..) => &IcebergBucketEvaluator {},
+            IcebergTruncate(..) => &IcebergTruncateEvaluator {},
         }
     }
 }
 
-pub fn days(input: ExprRef) -> ExprRef {
+pub fn days(input: Expr) -> Expr {
     Expr::Function {
         func: super::FunctionExpr::Partitioning(PartitioningExpr::Days),
         inputs: vec![input],
     }
-    .into()
 }
 
-pub fn hours(input: ExprRef) -> ExprRef {
+pub fn hours(input: Expr) -> Expr {
     Expr::Function {
         func: super::FunctionExpr::Partitioning(PartitioningExpr::Hours),
         inputs: vec![input],
     }
-    .into()
 }
 
-pub fn months(input: ExprRef) -> ExprRef {
+pub fn months(input: Expr) -> Expr {
     Expr::Function {
         func: super::FunctionExpr::Partitioning(PartitioningExpr::Months),
         inputs: vec![input],
     }
-    .into()
 }
 
-pub fn years(input: ExprRef) -> ExprRef {
+pub fn years(input: Expr) -> Expr {
     Expr::Function {
         func: super::FunctionExpr::Partitioning(PartitioningExpr::Years),
         inputs: vec![input],
     }
-    .into()
 }
 
-pub fn iceberg_bucket(input: ExprRef, n: i32) -> ExprRef {
+pub fn iceberg_bucket(input: Expr, n: i32) -> Expr {
     Expr::Function {
         func: super::FunctionExpr::Partitioning(PartitioningExpr::IcebergBucket(n)),
         inputs: vec![input],
     }
-    .into()
 }
 
-pub fn iceberg_truncate(input: ExprRef, w: i64) -> ExprRef {
+pub fn iceberg_truncate(input: Expr, w: i64) -> Expr {
     Expr::Function {
         func: super::FunctionExpr::Partitioning(PartitioningExpr::IcebergTruncate(w)),
         inputs: vec![input],
     }
-    .into()
 }

@@ -1,15 +1,15 @@
-use common_error::DaftResult;
-
 use crate::{
     array::DataArray,
     datatypes::{BooleanArray, DaftNumericType, NullArray, UInt64Type, Utf8Array},
 };
+use common_error::DaftResult;
+
+use super::as_arrow::AsArrow;
 
 impl<T> DataArray<T>
 where
     T: DaftNumericType,
 {
-    #[inline(never)]
     pub fn pairwise_compare<F>(
         &self,
         other: &Self,
@@ -21,24 +21,25 @@ where
         let mut left_idx = vec![];
         let mut right_idx = vec![];
 
-        for (i, l) in self.iter().enumerate() {
+        for (i, l) in self.as_arrow().iter().enumerate() {
             if l.is_none() {
                 continue;
             }
-            let l = l.unwrap();
-            for (j, r) in other.iter().enumerate() {
+            let l = *l.unwrap();
+            for (j, r) in other.as_arrow().iter().enumerate() {
                 match r {
-                    None => {}
-                    Some(r) if func(l, r) => {
-                        left_idx.push(i as u64);
-                        right_idx.push(j as u64);
+                    None => continue,
+                    Some(r) => {
+                        if func(l, *r) {
+                            left_idx.push(i as u64);
+                            right_idx.push(j as u64);
+                        }
                     }
-                    _ => {}
                 }
             }
         }
-        let left_series = DataArray::<UInt64Type>::from_vec(self.name(), left_idx);
-        let right_series = DataArray::<UInt64Type>::from_vec(other.name(), right_idx);
+        let left_series = DataArray::from((self.name(), left_idx));
+        let right_series = DataArray::from((other.name(), right_idx));
         Ok((left_series, right_series))
     }
 }
@@ -55,24 +56,25 @@ impl Utf8Array {
         let mut left_idx = vec![];
         let mut right_idx = vec![];
 
-        for (i, l) in self.iter().enumerate() {
+        for (i, l) in self.as_arrow().iter().enumerate() {
             if l.is_none() {
                 continue;
             }
             let l = l.unwrap();
-            for (j, r) in other.iter().enumerate() {
+            for (j, r) in other.as_arrow().iter().enumerate() {
                 match r {
-                    None => {}
-                    Some(r) if func(l, r) => {
-                        left_idx.push(i as u64);
-                        right_idx.push(j as u64);
+                    None => continue,
+                    Some(r) => {
+                        if func(l, r) {
+                            left_idx.push(i as u64);
+                            right_idx.push(j as u64);
+                        }
                     }
-                    _ => {}
                 }
             }
         }
-        let left_series = DataArray::<UInt64Type>::from_vec(self.name(), left_idx);
-        let right_series = DataArray::<UInt64Type>::from_vec(other.name(), right_idx);
+        let left_series = DataArray::from((self.name(), left_idx));
+        let right_series = DataArray::from((other.name(), right_idx));
         Ok((left_series, right_series))
     }
 }
@@ -89,24 +91,25 @@ impl BooleanArray {
         let mut left_idx = vec![];
         let mut right_idx = vec![];
 
-        for (i, l) in self.iter().enumerate() {
+        for (i, l) in self.as_arrow().iter().enumerate() {
             if l.is_none() {
                 continue;
             }
             let l = l.unwrap();
-            for (j, r) in other.iter().enumerate() {
+            for (j, r) in other.as_arrow().iter().enumerate() {
                 match r {
-                    None => {}
-                    Some(r) if func(l, r) => {
-                        left_idx.push(i as u64);
-                        right_idx.push(j as u64);
+                    None => continue,
+                    Some(r) => {
+                        if func(l, r) {
+                            left_idx.push(i as u64);
+                            right_idx.push(j as u64);
+                        }
                     }
-                    _ => {}
                 }
             }
         }
-        let left_series = DataArray::<UInt64Type>::from_vec(self.name(), left_idx);
-        let right_series = DataArray::<UInt64Type>::from_vec(other.name(), right_idx);
+        let left_series = DataArray::from((self.name(), left_idx));
+        let right_series = DataArray::from((other.name(), right_idx));
         Ok((left_series, right_series))
     }
 }
@@ -122,8 +125,8 @@ impl NullArray {
     {
         let left_idx = vec![];
         let right_idx = vec![];
-        let left_series = DataArray::<UInt64Type>::from_vec(self.name(), left_idx);
-        let right_series = DataArray::<UInt64Type>::from_vec(other.name(), right_idx);
+        let left_series = DataArray::from((self.name(), left_idx));
+        let right_series = DataArray::from((other.name(), right_idx));
         Ok((left_series, right_series))
     }
 }

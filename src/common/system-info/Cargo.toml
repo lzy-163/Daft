@@ -1,12 +1,10 @@
 [dependencies]
 pyo3 = {workspace = true, optional = true}
-sysinfo = {workspace = true}
+sysinfo = "0.30.7"
 
 [features]
+default = ["python"]
 python = ["dep:pyo3"]
-
-[lints]
-workspace = true
 
 [package]
 edition = {workspace = true}

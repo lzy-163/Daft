@@ -1,128 +1,117 @@
 use common_error::DaftResult;
-use daft_core::{
-    array::ops::DaftCompare,
-    join::{JoinSide, JoinType},
-};
-use daft_dsl::{expr::bound_expr::BoundExpr, join::infer_join_schema};
-use daft_recordbatch::RecordBatch;
-use daft_stats::TruthValue;
+use daft_core::array::ops::DaftCompare;
+use daft_dsl::Expr;
+use daft_io::IOStatsContext;
+use daft_table::infer_join_schema;
 
 use crate::micropartition::MicroPartition;
 
+use daft_stats::TruthValue;
+
 impl MicroPartition {
-    fn join<F>(
-        &self,
-        right: &Self,
-        left_on: &[BoundExpr],
-        right_on: &[BoundExpr],
-        how: JoinType,
-        table_join: F,
-    ) -> DaftResult<Self>
-    where
-        F: FnOnce(
-            &RecordBatch,
-            &RecordBatch,
-            &[BoundExpr],
-            &[BoundExpr],
-            JoinType,
-        ) -> DaftResult<RecordBatch>,
-    {
-        let join_schema = infer_join_schema(&self.schema, &right.schema, how)?;
-        match (how, self.len(), right.len()) {
-            (JoinType::Inner | JoinType::Left | JoinType::Semi, 0, _)
-            | (JoinType::Inner | JoinType::Right, _, 0)
-            | (JoinType::Outer, 0, 0) => {
-                return Ok(Self::empty(Some(join_schema)));
-            }
-            _ => {}
+    pub fn hash_join(&self, right: &Self, left_on: &[Expr], right_on: &[Expr]) -> DaftResult<Self> {
+        let io_stats = IOStatsContext::new("MicroPartition::hash_join");
+        let join_schema = infer_join_schema(&self.schema, &right.schema, left_on, right_on)?;
+
+        if self.len() == 0 || right.len() == 0 {
+            return Ok(Self::empty(Some(join_schema.into())));
         }
 
-        // TODO(Kevin): short circuits are also possible for other join types
-        if how == JoinType::Inner {
-            let tv = match (&self.statistics, &right.statistics) {
-                (_, None) => TruthValue::Maybe,
-                (None, _) => TruthValue::Maybe,
-                (Some(l), Some(r)) => {
-                    let l_eval_stats = l.eval_expression_list(left_on)?;
-                    let r_eval_stats = r.eval_expression_list(right_on)?;
-                    let mut curr_tv = TruthValue::Maybe;
-                    for (lc, rc) in l_eval_stats.into_iter().zip(&r_eval_stats) {
-                        if lc.equal(rc)?.to_truth_value() == TruthValue::False {
-                            curr_tv = TruthValue::False;
-                            break;
-                        }
+        let tv = match (&self.statistics, &right.statistics) {
+            (_, None) => TruthValue::Maybe,
+            (None, _) => TruthValue::Maybe,
+            (Some(l), Some(r)) => {
+                let l_eval_stats = l.eval_expression_list(left_on, &self.schema)?;
+                let r_eval_stats = r.eval_expression_list(right_on, &right.schema)?;
+                let mut curr_tv = TruthValue::Maybe;
+                for (lc, rc) in l_eval_stats
+                    .columns
+                    .values()
+                    .zip(r_eval_stats.columns.values())
+                {
+                    if let TruthValue::False = lc.equal(rc)?.to_truth_value() {
+                        curr_tv = TruthValue::False;
+                        break;
                     }
-                    curr_tv
                 }
-            };
-            if tv == TruthValue::False {
-                return Ok(Self::empty(Some(join_schema)));
+                curr_tv
             }
+        };
+        if let TruthValue::False = tv {
+            return Ok(Self::empty(Some(join_schema.into())));
         }
 
         // TODO(Clark): Elide concatenations where possible by doing a chunk-aware local table join.
-        let lt = self.concat_or_get()?;
-        let rt = right.concat_or_get()?;
+        let lt = self.concat_or_get(io_stats.clone())?;
+        let rt = right.concat_or_get(io_stats)?;
 
-        match (lt, rt) {
-            (None, _) | (_, None) => Ok(Self::empty(Some(join_schema))),
-            (Some(lt), Some(rt)) => {
-                let joined_table = table_join(&lt, &rt, left_on, right_on, how)?;
-                Ok(Self::new_loaded(
-                    join_schema,
+        match (lt.as_slice(), rt.as_slice()) {
+            ([], _) | (_, []) => Ok(Self::empty(Some(join_schema.into()))),
+            ([lt], [rt]) => {
+                let joined_table = lt.hash_join(rt, left_on, right_on)?;
+                Ok(MicroPartition::new_loaded(
+                    join_schema.into(),
                     vec![joined_table].into(),
                     None,
                 ))
             }
+            _ => unreachable!(),
         }
-    }
-
-    pub fn hash_join(
-        &self,
-        right: &Self,
-        left_on: &[BoundExpr],
-        right_on: &[BoundExpr],
-        null_equals_nulls: Option<Vec<bool>>,
-        how: JoinType,
-    ) -> DaftResult<Self> {
-        let null_equals_nulls = null_equals_nulls.unwrap_or_else(|| vec![false; left_on.len()]);
-
-        let table_join = |lt: &RecordBatch,
-                          rt: &RecordBatch,
-                          lo: &[BoundExpr],
-                          ro: &[BoundExpr],
-                          _how: JoinType| {
-            RecordBatch::hash_join(lt, rt, lo, ro, null_equals_nulls.as_slice(), _how)
-        };
-
-        self.join(right, left_on, right_on, how, table_join)
     }
 
     pub fn sort_merge_join(
         &self,
         right: &Self,
-        left_on: &[BoundExpr],
-        right_on: &[BoundExpr],
-        how: JoinType,
+        left_on: &[Expr],
+        right_on: &[Expr],
         is_sorted: bool,
     ) -> DaftResult<Self> {
-        let table_join = |lt: &RecordBatch,
-                          rt: &RecordBatch,
-                          lo: &[BoundExpr],
-                          ro: &[BoundExpr],
-                          _how: JoinType| {
-            RecordBatch::sort_merge_join(lt, rt, lo, ro, is_sorted)
+        let io_stats = IOStatsContext::new("MicroPartition::sort_merge_join");
+        let join_schema = infer_join_schema(&self.schema, &right.schema, left_on, right_on)?;
+
+        if self.len() == 0 || right.len() == 0 {
+            return Ok(Self::empty(Some(join_schema.into())));
+        }
+
+        let tv = match (&self.statistics, &right.statistics) {
+            (_, None) => TruthValue::Maybe,
+            (None, _) => TruthValue::Maybe,
+            (Some(l), Some(r)) => {
+                let l_eval_stats = l.eval_expression_list(left_on, &self.schema)?;
+                let r_eval_stats = r.eval_expression_list(right_on, &right.schema)?;
+                let mut curr_tv = TruthValue::Maybe;
+                for (lc, rc) in l_eval_stats
+                    .columns
+                    .values()
+                    .zip(r_eval_stats.columns.values())
+                {
+                    if let TruthValue::False = lc.equal(rc)?.to_truth_value() {
+                        curr_tv = TruthValue::False;
+                        break;
+                    }
+                }
+                curr_tv
+            }
         };
+        if let TruthValue::False = tv {
+            return Ok(Self::empty(Some(join_schema.into())));
+        }
 
-        self.join(right, left_on, right_on, how, table_join)
-    }
+        // TODO(Clark): Elide concatenations where possible by doing a chunk-aware local table join.
+        let lt = self.concat_or_get(io_stats.clone())?;
+        let rt = right.concat_or_get(io_stats)?;
 
-    pub fn cross_join(&self, right: &Self, outer_loop_side: JoinSide) -> DaftResult<Self> {
-        let table_join =
-            |lt: &RecordBatch, rt: &RecordBatch, _: &[BoundExpr], _: &[BoundExpr], _: JoinType| {
-                RecordBatch::cross_join(lt, rt, outer_loop_side)
-            };
-
-        self.join(right, &[], &[], JoinType::Inner, table_join)
+        match (lt.as_slice(), rt.as_slice()) {
+            ([], _) | (_, []) => Ok(Self::empty(Some(join_schema.into()))),
+            ([lt], [rt]) => {
+                let joined_table = lt.sort_merge_join(rt, left_on, right_on, is_sorted)?;
+                Ok(MicroPartition::new_loaded(
+                    join_schema.into(),
+                    vec![joined_table].into(),
+                    None,
+                ))
+            }
+            _ => unreachable!(),
+        }
     }
 }

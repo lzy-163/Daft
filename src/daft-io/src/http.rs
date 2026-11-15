@@ -1,51 +1,42 @@
-use std::{
-    any::Any,
-    num::ParseIntError,
-    string::FromUtf8Error,
-    sync::{Arc, LazyLock},
-    time::Duration,
-};
+use std::{num::ParseIntError, ops::Range, string::FromUtf8Error, sync::Arc};
 
 use async_trait::async_trait;
-use common_io_config::HTTPConfig;
-use futures::{TryStreamExt, stream::BoxStream};
+use futures::{stream::BoxStream, TryStreamExt};
+
+use lazy_static::lazy_static;
 use regex::Regex;
-use reqwest::header::ACCEPT_RANGES;
-use reqwest_middleware::{
-    ClientBuilder, ClientWithMiddleware,
-    reqwest::header::{self, CONTENT_LENGTH, RANGE},
-};
-use reqwest_retry::{Jitter, RetryTransientMiddleware, policies::ExponentialBackoff};
+use reqwest::header::{CONTENT_LENGTH, RANGE};
 use snafu::{IntoError, ResultExt, Snafu};
 use url::Position;
 
-use super::object_io::{GetResult, ObjectSource};
 use crate::{
-    FileFormat, InvalidRangeRequestSnafu,
     object_io::{FileMetadata, FileType, LSResult},
-    range::GetRange,
     stats::IOStatsRef,
     stream_utils::io_stats_on_bytestream,
 };
 
+use super::object_io::{GetResult, ObjectSource};
+
 const HTTP_DELIMITER: &str = "/";
 
-static HTML_A_TAG_HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<(a|A)\s+(?:[^>]*?\s+)?(href|HREF)=["'](?P<url>[^"']+)"#).unwrap()
-});
+lazy_static! {
+    // Taken from: https://stackoverflow.com/a/15926317/3821154
+    static ref HTML_A_TAG_HREF_RE: Regex =
+        Regex::new(r#"<(a|A)\s+(?:[^>]*?\s+)?(href|HREF)=["'](?P<url>[^"']+)"#).unwrap();
+}
 
 #[derive(Debug, Snafu)]
 enum Error {
     #[snafu(display("Unable to connect to {}: {}", path, source))]
     UnableToConnect {
         path: String,
-        source: reqwest_middleware::Error,
+        source: reqwest::Error,
     },
 
     #[snafu(display("Unable to open {}: {}", path, source))]
     UnableToOpenFile {
         path: String,
-        source: reqwest_middleware::reqwest::Error,
+        source: reqwest::Error,
     },
 
     #[snafu(display("Unable to determine size of {}", path))]
@@ -54,13 +45,11 @@ enum Error {
     #[snafu(display("Unable to read data from {}: {}", path, source))]
     UnableToReadBytes {
         path: String,
-        source: reqwest_middleware::reqwest::Error,
+        source: reqwest::Error,
     },
 
     #[snafu(display("Unable to create Http Client {}", source))]
-    UnableToCreateClient {
-        source: reqwest_middleware::reqwest::Error,
-    },
+    UnableToCreateClient { source: reqwest::Error },
 
     #[snafu(display("Unable to parse URL: \"{}\"", path))]
     InvalidUrl {
@@ -73,26 +62,25 @@ enum Error {
     ))]
     UnableToParseUtf8Header { path: String, source: FromUtf8Error },
 
-    #[snafu(display("Unable to parse data as Utf8 while reading body for file: {path}. {source}"))]
+    #[snafu(display(
+        "Unable to parse data as Utf8 while reading body for file: {path}. {source}"
+    ))]
     UnableToParseUtf8Body {
         path: String,
-        source: reqwest_middleware::reqwest::Error,
+        source: reqwest::Error,
     },
 
     #[snafu(display(
         "Unable to parse data as Integer while reading header for file: {path}. {source}"
     ))]
     UnableToParseInteger { path: String, source: ParseIntError },
-
-    #[snafu(display("Unable to create HTTP header: {source}"))]
-    UnableToCreateHeader { source: header::InvalidHeaderValue },
 }
 
 /// Finds and retrieves FileMetadata from HTML text
 ///
 /// This function will look for `<a href=***>` tags and return all the links that it finds as
 /// absolute URLs
-fn get_file_metadata_from_html(path: &str, text: &str) -> super::Result<Vec<FileMetadata>> {
+fn _get_file_metadata_from_html(path: &str, text: &str) -> super::Result<Vec<FileMetadata>> {
     let path_url = url::Url::parse(path).with_context(|_| InvalidUrlSnafu { path })?;
     let metas = HTML_A_TAG_HREF_RE
         .captures_iter(text)
@@ -126,7 +114,7 @@ fn get_file_metadata_from_html(path: &str, text: &str) -> super::Result<Vec<File
                     return Ok(None);
                 }
                 _ => (),
-            }
+            };
 
             let filetype = if matched_url.ends_with(HTTP_DELIMITER) {
                 FileType::Directory
@@ -146,147 +134,26 @@ fn get_file_metadata_from_html(path: &str, text: &str) -> super::Result<Vec<File
     Ok(metas.into_iter().flatten().collect())
 }
 
-#[derive(Debug)]
-pub struct HttpSource {
-    pub(crate) client: ClientWithMiddleware,
-}
-
-/// Classify a `reqwest::Error` (returned by `error_for_status` or body
-/// reads) into the typed `super::Error` variants that Daft exposes as
-/// `DaftTransientError` subclasses on the Python side.
-///
-/// We rely exclusively on reqwest's typed predicates (`status()`,
-/// `is_connect()`, `is_timeout()`, ...) rather than inspecting the
-/// `Debug` representation, which is not a stable contract.
-pub(crate) fn classify_reqwest_error(
-    path: String,
-    source: reqwest_middleware::reqwest::Error,
-) -> super::Error {
-    if let Some(status) = source.status() {
-        let code = status.as_u16();
-        if matches!(code, 404 | 410) {
-            return super::Error::NotFound {
-                path,
-                source: source.into(),
-            };
-        }
-        if code == 429 {
-            return super::Error::Throttled {
-                path,
-                source: source.into(),
-            };
-        }
-        if (500..600).contains(&code) {
-            return super::Error::MiscTransient {
-                path,
-                source: source.into(),
-            };
-        }
-    }
-    if source.is_connect() {
-        return super::Error::ConnectTimeout {
-            path,
-            source: source.into(),
-        };
-    }
-    if source.is_timeout() {
-        return super::Error::ReadTimeout {
-            path,
-            source: source.into(),
-        };
-    }
-    if source.is_body() || source.is_decode() {
-        return super::Error::SocketError {
-            path,
-            source: source.into(),
-        };
-    }
-    super::Error::UnableToOpenFile {
-        path,
-        source: source.into(),
-    }
-}
-
-/// Classify a `reqwest_middleware::Error` (returned during `send()`,
-/// before any response was received) into a typed `super::Error`.
-pub(crate) fn classify_middleware_error(
-    path: String,
-    source: reqwest_middleware::Error,
-) -> super::Error {
-    match &source {
-        reqwest_middleware::Error::Reqwest(inner) => {
-            if let Some(status) = inner.status() {
-                let code = status.as_u16();
-                if code == 429 {
-                    return super::Error::Throttled {
-                        path,
-                        source: source.into(),
-                    };
-                }
-                if (500..600).contains(&code) {
-                    return super::Error::MiscTransient {
-                        path,
-                        source: source.into(),
-                    };
-                }
-            }
-            if inner.is_connect() {
-                return super::Error::ConnectTimeout {
-                    path,
-                    source: source.into(),
-                };
-            }
-            if inner.is_timeout() {
-                return super::Error::ReadTimeout {
-                    path,
-                    source: source.into(),
-                };
-            }
-            if inner.is_body() || inner.is_decode() {
-                return super::Error::SocketError {
-                    path,
-                    source: source.into(),
-                };
-            }
-            // Unknown reqwest failures during connection establishment are
-            // still transient from the caller's perspective; surface them
-            // as MiscTransient so that retry logic can pick them up.
-            super::Error::MiscTransient {
-                path,
-                source: source.into(),
-            }
-        }
-        reqwest_middleware::Error::Middleware(_) => super::Error::MiscTransient {
-            path,
-            source: source.into(),
-        },
-    }
+pub(crate) struct HttpSource {
+    client: reqwest::Client,
 }
 
 impl From<Error> for super::Error {
     fn from(error: Error) -> Self {
-        use Error::{UnableToConnect, UnableToDetermineSize, UnableToOpenFile, UnableToReadBytes};
+        use Error::*;
         match error {
-            UnableToOpenFile { path, source } => classify_reqwest_error(path, source),
-            UnableToConnect { path, source } => classify_middleware_error(path, source),
-            UnableToReadBytes { path, source } => {
-                // Stream/body read failures are transient; treat timeouts as
-                // ReadTimeout and everything else as a SocketError so callers
-                // get a DaftTransientError subclass on the Python side.
-                if source.is_timeout() {
-                    Self::ReadTimeout {
-                        path,
-                        source: source.into(),
-                    }
-                } else {
-                    Self::SocketError {
-                        path,
-                        source: source.into(),
-                    }
-                }
-            }
-            UnableToDetermineSize { path } => Self::UnableToDetermineSize { path },
-            _ => Self::Generic {
+            UnableToOpenFile { path, source } => match source.status().map(|v| v.as_u16()) {
+                Some(404) | Some(410) => super::Error::NotFound {
+                    path,
+                    source: source.into(),
+                },
+                None | Some(_) => super::Error::UnableToOpenFile {
+                    path,
+                    source: source.into(),
+                },
+            },
+            UnableToDetermineSize { path } => super::Error::UnableToDetermineSize { path },
+            _ => super::Error::Generic {
                 store: super::SourceType::Http,
                 source: error.into(),
             },
@@ -295,89 +162,32 @@ impl From<Error> for super::Error {
 }
 
 impl HttpSource {
-    pub async fn get_client(config: &HTTPConfig) -> super::Result<Arc<Self>> {
-        let mut default_headers = header::HeaderMap::new();
-        default_headers.append(
-            "user-agent",
-            header::HeaderValue::from_str(config.user_agent.as_str())
-                .context(UnableToCreateHeaderSnafu)?,
-        );
-
-        if let Some(token) = &config.bearer_token {
-            default_headers.append(
-                "Authorization",
-                header::HeaderValue::from_str(&format!("Bearer {}", token.as_string()))
-                    .context(UnableToCreateHeaderSnafu)?,
-            );
+    pub async fn get_client() -> super::Result<Arc<Self>> {
+        Ok(HttpSource {
+            client: reqwest::ClientBuilder::default()
+                .pool_max_idle_per_host(70)
+                .build()
+                .context(UnableToCreateClientSnafu)?,
         }
-
-        let retry_policy = ExponentialBackoff::builder()
-            .base(2)
-            .jitter(Jitter::Bounded)
-            .retry_bounds(
-                Duration::from_millis(config.retry_initial_backoff_ms),
-                Duration::from_mins(1),
-            )
-            .build_with_max_retries(config.num_tries);
-
-        let base_client = reqwest_middleware::reqwest::ClientBuilder::default()
-            .pool_idle_timeout(Duration::from_mins(1))
-            .pool_max_idle_per_host(70)
-            .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
-            .read_timeout(Duration::from_millis(config.read_timeout_ms))
-            .default_headers(default_headers)
-            .build()
-            .context(UnableToCreateClientSnafu)?;
-
-        // reqwest-retry already comes with a default retry strategy that matches http standards
-        // override it only if you need a custom one due to non standard behavior
-        let retry_middleware = RetryTransientMiddleware::new_with_policy(retry_policy)
-            .with_retry_log_level(tracing::Level::DEBUG);
-
-        let client = ClientBuilder::new(base_client)
-            .with(retry_middleware)
-            .build();
-
-        Ok(Self { client }.into())
+        .into())
     }
 }
 
 #[async_trait]
 impl ObjectSource for HttpSource {
-    async fn supports_range(&self, uri: &str) -> super::Result<bool> {
-        let head_res = self
-            .client
-            .head(uri)
-            .send()
-            .await
-            .context(UnableToConnectSnafu::<String> { path: uri.into() })?;
-        let res = head_res
-            .error_for_status()
-            .context(UnableToOpenFileSnafu::<String> { path: uri.into() })?;
-
-        let headers = res.headers();
-
-        let accept_range = headers
-            .get(ACCEPT_RANGES)
-            .map(|v| v.to_str().unwrap_or_default().to_lowercase())
-            .unwrap_or_default();
-
-        Ok(&accept_range == "bytes")
-    }
-
     async fn get(
         &self,
         uri: &str,
-        range: Option<GetRange>,
+        range: Option<Range<usize>>,
         io_stats: Option<IOStatsRef>,
     ) -> super::Result<GetResult> {
         let request = self.client.get(uri);
         let request = match range {
             None => request,
-            Some(range) => {
-                range.validate().context(InvalidRangeRequestSnafu)?;
-                request.header(RANGE, range.to_string())
-            }
+            Some(range) => request.header(
+                RANGE,
+                format!("bytes={}-{}", range.start, range.end.saturating_sub(1)),
+            ),
         };
 
         let response = request
@@ -388,7 +198,7 @@ impl ObjectSource for HttpSource {
             .error_for_status()
             .context(UnableToOpenFileSnafu::<String> { path: uri.into() })?;
         if let Some(is) = io_stats.as_ref() {
-            is.mark_get_requests(1);
+            is.mark_get_requests(1)
         }
         let size_bytes = response.content_length().map(|s| s as usize);
         let stream = response.bytes_stream();
@@ -404,17 +214,7 @@ impl ObjectSource for HttpSource {
             io_stats_on_bytestream(stream, io_stats),
             size_bytes,
             None,
-            None,
         ))
-    }
-
-    async fn put(
-        &self,
-        _uri: &str,
-        _data: bytes::Bytes,
-        _io_stats: Option<IOStatsRef>,
-    ) -> super::Result<()> {
-        todo!("PUTs to HTTP URLs are not yet supported! Please file an issue.");
     }
 
     async fn get_size(&self, uri: &str, io_stats: Option<IOStatsRef>) -> super::Result<usize> {
@@ -428,7 +228,7 @@ impl ObjectSource for HttpSource {
             .context(UnableToOpenFileSnafu::<String> { path: uri.into() })?;
 
         if let Some(is) = io_stats.as_ref() {
-            is.mark_head_requests(1);
+            is.mark_head_requests(1)
         }
 
         let headers = response.headers();
@@ -453,7 +253,6 @@ impl ObjectSource for HttpSource {
         _page_size: Option<i32>,
         limit: Option<usize>,
         io_stats: Option<IOStatsRef>,
-        _file_format: Option<FileFormat>,
     ) -> super::Result<BoxStream<'static, super::Result<FileMetadata>>> {
         use crate::object_store_glob::glob;
 
@@ -484,7 +283,7 @@ impl ObjectSource for HttpSource {
             .error_for_status()
             .with_context(|_| UnableToOpenFileSnafu { path })?;
         if let Some(is) = io_stats.as_ref() {
-            is.mark_list_requests(1);
+            is.mark_list_requests(1)
         }
 
         // Reconstruct the actual path of the request, which may have been redirected via a 301
@@ -498,54 +297,81 @@ impl ObjectSource for HttpSource {
 
         match response.headers().get("content-type") {
             // If the content-type is text/html, we treat the data on this path as a traversable "directory"
-            Some(header_value) if header_value.to_str().is_ok_and(|v| v == "text/html") => {
+            Some(header_value) if header_value.to_str().map_or(false, |v| v == "text/html") => {
                 let text = response
                     .text()
                     .await
-                    .with_context(|_| UnableToParseUtf8BodySnafu { path: path.clone() })?;
-                let file_metadatas = get_file_metadata_from_html(path.as_str(), text.as_str())?;
+                    .with_context(|_| UnableToParseUtf8BodySnafu {
+                        path: path.to_string(),
+                    })?;
+                let file_metadatas = _get_file_metadata_from_html(path.as_str(), text.as_str())?;
                 Ok(LSResult {
                     files: file_metadatas,
                     continuation_token: None,
-                    not_found_if_empty: false,
                 })
             }
             // All other forms of content-type is treated as a raw file
             _ => Ok(LSResult {
                 files: vec![FileMetadata {
-                    filepath: path.clone(),
+                    filepath: path.to_string(),
                     filetype: FileType::File,
                     size: response.content_length(),
                 }],
                 continuation_token: None,
-                not_found_if_empty: false,
             }),
         }
-    }
-
-    fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::default;
 
-    use crate::{HttpSource, Result, integrations::test_full_get, object_io::ObjectSource};
+    use crate::object_io::ObjectSource;
+    use crate::HttpSource;
+    use crate::Result;
 
     #[tokio::test]
     async fn test_full_get_from_http() -> Result<()> {
         let parquet_file_path = "https://daft-public-data.s3.us-west-2.amazonaws.com/test_fixtures/parquet_small/0dad4c3f-da0d-49db-90d8-98684571391b-0.parquet";
         let parquet_expected_md5 = "929674747af64a98aceaa6d895863bd3";
 
-        let client = HttpSource::get_client(&default::Default::default()).await?;
+        let client = HttpSource::get_client().await?;
         let parquet_file = client.get(parquet_file_path, None, None).await?;
         let bytes = parquet_file.bytes().await?;
         let all_bytes = bytes.as_ref();
         let checksum = format!("{:x}", md5::compute(all_bytes));
         assert_eq!(checksum, parquet_expected_md5);
 
-        test_full_get(client, parquet_file_path, &bytes).await
+        let first_bytes = client
+            .get_range(parquet_file_path, 0..10, None)
+            .await?
+            .bytes()
+            .await?;
+        assert_eq!(first_bytes.len(), 10);
+        assert_eq!(first_bytes.as_ref(), &all_bytes[..10]);
+
+        let first_bytes = client
+            .get_range(parquet_file_path, 10..100, None)
+            .await?
+            .bytes()
+            .await?;
+        assert_eq!(first_bytes.len(), 90);
+        assert_eq!(first_bytes.as_ref(), &all_bytes[10..100]);
+
+        let last_bytes = client
+            .get_range(
+                parquet_file_path,
+                (all_bytes.len() - 10)..(all_bytes.len() + 10),
+                None,
+            )
+            .await?
+            .bytes()
+            .await?;
+        assert_eq!(last_bytes.len(), 10);
+        assert_eq!(last_bytes.as_ref(), &all_bytes[(all_bytes.len() - 10)..]);
+
+        let size_from_get_size = client.get_size(parquet_file_path, None).await?;
+        assert_eq!(size_from_get_size, all_bytes.len());
+        Ok(())
     }
 }

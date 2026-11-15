@@ -1,23 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator
-from typing import TypeAlias, TypeVar
+from typing import Generator, TypeVar
 
 import pytest
 
-import daft
-
 pyiceberg = pytest.importorskip("pyiceberg")
 
-
-import requests
 import tenacity
 from pyiceberg.catalog import Catalog, load_catalog
 from pyiceberg.table import Table
 
 T = TypeVar("T")
 
-YieldFixture: TypeAlias = Generator[T, None, None]
+YieldFixture = Generator[T, None, None]
 
 local_tables_names = [
     "test_all_types",
@@ -39,34 +34,19 @@ local_tables_names = [
 ]
 
 
-cloud_tables_names = [
-    "azure.test",
-    # TODO(Kevin): Add more tables from more cloud providers
-]
-
-
-@pytest.fixture(scope="session")
-def local_iceberg_catalog() -> Iterator[tuple[str, Catalog]]:
-    catalog = _load_local_rest_catalog()
-
-    # ensure all tables are available
-    for name in local_tables_names:
-        _load_table(catalog, name)
-
-    catalog_name = "_local_iceberg_catalog"
-    daft.attach_catalog(catalog, alias=catalog_name)
-    yield catalog_name, catalog
-    daft.detach_catalog(alias=catalog_name)
-
-
 @tenacity.retry(
     stop=tenacity.stop_after_delay(60),
-    retry=tenacity.retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+    retry=tenacity.retry_if_exception_type(pyiceberg.exceptions.NoSuchTableError),
     wait=tenacity.wait_fixed(5),
     reraise=True,
 )
-def _load_local_rest_catalog() -> Catalog:
-    return load_catalog(
+def _load_table(catalog, name) -> Table:
+    return catalog.load_table(f"default.{name}")
+
+
+@pytest.fixture(scope="session")
+def local_iceberg_catalog() -> Catalog:
+    cat = load_catalog(
         "local",
         **{
             "type": "rest",
@@ -76,45 +56,15 @@ def _load_local_rest_catalog() -> Catalog:
             "s3.secret-access-key": "password",
         },
     )
+    # ensure all tables are available
+    for name in local_tables_names:
+        _load_table(cat, name)
+
+    return cat
 
 
-@pytest.fixture(scope="session")
-def azure_iceberg_catalog() -> Iterator[tuple[str, Catalog]]:
-    cat = load_catalog(
-        "default",
-        **{
-            "uri": "sqlite:///tests/assets/pyiceberg_catalog.db",
-            "adls.account-name": "dafttestdata",
-        },
-    )
-
-    catalog_name = "_azure_iceberg_catalog"
-    daft.attach_catalog(cat, alias=catalog_name)
-    yield catalog_name, cat
-    daft.detach_catalog(alias=catalog_name)
-    if hasattr(cat, "engine"):
-        cat.engine.dispose()
-
-
-@tenacity.retry(
-    stop=tenacity.stop_after_delay(60),
-    retry=tenacity.retry_if_exception_type(
-        (pyiceberg.exceptions.NoSuchTableError, requests.exceptions.ConnectionError, requests.exceptions.Timeout)
-    ),
-    wait=tenacity.wait_fixed(5),
-    reraise=True,
-)
-def _load_table(catalog, name) -> Table:
-    return catalog.load_table(f"default.{name}")
-
-
-@pytest.fixture(scope="function", params=local_tables_names)
-def local_iceberg_tables(request, local_iceberg_catalog) -> Iterator[str]:
+@pytest.fixture(scope="session", params=local_tables_names)
+def local_iceberg_tables(request, local_iceberg_catalog) -> Table:
     NAMESPACE = "default"
     table_name = request.param
-    yield f"{NAMESPACE}.{table_name}"
-
-
-@pytest.fixture(scope="function", params=cloud_tables_names)
-def azure_iceberg_table(request, azure_iceberg_catalog) -> Iterator[str]:
-    yield request.param
+    return local_iceberg_catalog.load_table(f"{NAMESPACE}.{table_name}")

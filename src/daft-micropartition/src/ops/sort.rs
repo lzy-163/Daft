@@ -1,65 +1,43 @@
 use std::sync::Arc;
 
 use common_error::DaftResult;
-use daft_core::prelude::UInt64Array;
-use daft_dsl::expr::bound_expr::BoundExpr;
-use daft_recordbatch::RecordBatch;
+use daft_core::Series;
+use daft_dsl::Expr;
+use daft_io::IOStatsContext;
+use daft_table::Table;
 
 use crate::micropartition::MicroPartition;
 
 impl MicroPartition {
-    pub fn sort(
-        &self,
-        sort_keys: &[BoundExpr],
-        descending: &[bool],
-        nulls_first: &[bool],
-    ) -> DaftResult<Self> {
-        match self.concat_or_get()? {
-            None => Ok(Self::empty(Some(self.schema.clone()))),
-            Some(single) => {
-                let sorted = single.sort(sort_keys, descending, nulls_first)?;
+    pub fn sort(&self, sort_keys: &[Expr], descending: &[bool]) -> DaftResult<Self> {
+        let io_stats = IOStatsContext::new("MicroPartition::sort");
+
+        let tables = self.concat_or_get(io_stats)?;
+        match tables.as_slice() {
+            [] => Ok(Self::empty(Some(self.schema.clone()))),
+            [single] => {
+                let sorted = single.sort(sort_keys, descending)?;
                 Ok(Self::new_loaded(
                     self.schema.clone(),
                     Arc::new(vec![sorted]),
                     self.statistics.clone(),
                 ))
             }
+            _ => unreachable!(),
         }
     }
 
-    pub fn argsort(
-        &self,
-        sort_keys: &[BoundExpr],
-        descending: &[bool],
-        nulls_first: &[bool],
-    ) -> DaftResult<UInt64Array> {
-        match self.concat_or_get()? {
-            None => {
-                let empty_table = RecordBatch::empty(Some(self.schema.clone()));
-                empty_table.argsort(sort_keys, descending, nulls_first)
-            }
-            Some(single) => single.argsort(sort_keys, descending, nulls_first),
-        }
-    }
+    pub fn argsort(&self, sort_keys: &[Expr], descending: &[bool]) -> DaftResult<Series> {
+        let io_stats = IOStatsContext::new("MicroPartition::argsort");
 
-    pub fn top_n(
-        &self,
-        sort_keys: &[BoundExpr],
-        descending: &[bool],
-        nulls_first: &[bool],
-        limit: usize,
-        offset: Option<usize>,
-    ) -> DaftResult<Self> {
-        match self.concat_or_get()? {
-            None => Ok(Self::empty(Some(self.schema.clone()))),
-            Some(single) => {
-                let sorted = single.top_n(sort_keys, descending, nulls_first, limit, offset)?;
-                Ok(Self::new_loaded(
-                    self.schema.clone(),
-                    Arc::new(vec![sorted]),
-                    self.statistics.clone(),
-                ))
+        let tables = self.concat_or_get(io_stats)?;
+        match tables.as_slice() {
+            [] => {
+                let empty_table = Table::empty(Some(self.schema.clone()))?;
+                empty_table.argsort(sort_keys, descending)
             }
+            [single] => single.argsort(sort_keys, descending),
+            _ => unreachable!(),
         }
     }
 }

@@ -1,97 +1,53 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import sys
 
 from daft.daft import (
     AzureConfig,
-    CosConfig,
     GCSConfig,
-    GooseFSConfig,
-    GravitinoConfig,
-    HdfsConfig,
     IOConfig,
-    HTTPConfig,
     S3Config,
-    S3Credentials,
-    TosConfig,
-    UnityConfig,
-    HuggingFaceConfig,
+    set_io_pool_num_threads,
 )
-from daft.lazy_import import LazyImport
-from daft.io._avro import read_avro
-from daft.io._blob import read_blob
 from daft.io._csv import read_csv
-from daft.io._text import read_text
-from daft.io.delta_lake._deltalake import read_deltalake
-from daft.io.hudi._hudi import read_hudi
-from daft.io.iceberg._iceberg import read_iceberg
-from daft.io.paimon._paimon import read_paimon
+from daft.io._delta_lake import read_delta_lake
+from daft.io._hudi import read_hudi
+from daft.io._iceberg import read_iceberg
 from daft.io._json import read_json
-from daft.io._kafka import read_kafka
 from daft.io._parquet import read_parquet
-from daft.io._orc import read_orc
 from daft.io._sql import read_sql
-from daft.io._warc import read_warc
-from daft.io.huggingface import read_huggingface
-from daft.io._mcap import read_mcap
-from daft.io.webdataset import read_webdataset
-from daft.io._range import _range
-from daft.io._files import from_files
+from daft.io.catalog import DataCatalogTable, DataCatalogType
 from daft.io.file_path import from_glob_path
-from daft.io.sink import DataSink
-from daft.io.source import DataSource, DataSourceTask
-from daft.io.av import read_video_frames
-
-# Lance is lazy-loaded to keep `import daft` fast.
-if TYPE_CHECKING:
-    from daft.io.lance._lance import read_lance
-
-_lance = LazyImport("daft.io.lance")
 
 
-def __getattr__(name: str) -> object:
-    if name == "read_lance":
-        return getattr(_lance, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+def _set_linux_cert_paths():
+    import os
+    import ssl
 
+    paths = ssl.get_default_verify_paths()
+    if paths.cafile:
+        os.environ[paths.openssl_cafile_env] = paths.openssl_cafile
+    if paths.capath:
+        os.environ[paths.openssl_capath_env] = paths.openssl_capath
+
+
+if sys.platform == "linux":
+    _set_linux_cert_paths()
 
 __all__ = [
-    "AzureConfig",
-    "CosConfig",
-    "DataSink",
-    "DataSource",
-    "DataSourceTask",
-    "GCSConfig",
-    "GooseFSConfig",
-    "GravitinoConfig",
-    "HTTPConfig",
-    "HdfsConfig",
-    "HuggingFaceConfig",
+    "read_csv",
+    "read_json",
+    "from_glob_path",
+    "read_parquet",
+    "read_hudi",
+    "read_iceberg",
+    "read_delta_lake",
+    "read_sql",
     "IOConfig",
     "S3Config",
-    "S3Credentials",
-    "TosConfig",
-    "UnityConfig",
-    "_range",
-    "from_files",
-    "from_glob_path",
-    "read_avro",
-    "read_blob",
-    "read_csv",
-    "read_deltalake",
-    "read_hudi",
-    "read_huggingface",
-    "read_iceberg",
-    "read_json",
-    "read_kafka",
-    "read_lance",
-    "read_mcap",
-    "read_orc",
-    "read_paimon",
-    "read_parquet",
-    "read_sql",
-    "read_text",
-    "read_video_frames",
-    "read_warc",
-    "read_webdataset",
+    "AzureConfig",
+    "GCSConfig",
+    "set_io_pool_num_threads",
+    "DataCatalogType",
+    "DataCatalogTable",
 ]
